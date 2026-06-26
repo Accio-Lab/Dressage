@@ -10,10 +10,10 @@ dressage_apply_common_defaults() {
 
   PROXY_HOST="${PROXY_HOST:-0.0.0.0}"
   PROXY_PORT="${PROXY_PORT:-8800}"
-  PROXY_PUBLIC_HOST="${PROXY_PUBLIC_HOST:-${MASTER_ADDR}}"
+  PROXY_PUBLIC_HOST="${PROXY_PUBLIC_HOST:-$(hostname -i)}"
   DRESSAGE_PROXY_URL="${DRESSAGE_PROXY_URL:-http://${PROXY_PUBLIC_HOST}:${PROXY_PORT}}"
 
-  SGLANG_ROUTER_HOST="${SGLANG_ROUTER_HOST:-${MASTER_ADDR}}"
+  SGLANG_ROUTER_HOST="${SGLANG_ROUTER_HOST:-$(hostname -i)}"
   SGLANG_ROUTER_PORT="${SGLANG_ROUTER_PORT:-8000}"
   SGLANG_ROUTER_URL="${SGLANG_ROUTER_URL:-http://${SGLANG_ROUTER_HOST}:${SGLANG_ROUTER_PORT}}"
 
@@ -84,7 +84,7 @@ dressage_validate_proxy_defaults() {
   fi
   if [[ "${SGLANG_ROUTER_URL}" =~ ^https?://(0\.0\.0\.0|\[::\]|::)([:/]|$) ]]; then
     echo "SGLANG_ROUTER_URL is a proxy client target and cannot use a wildcard bind address: ${SGLANG_ROUTER_URL}" >&2
-    echo "Set SGLANG_ROUTER_HOST or SGLANG_ROUTER_URL to a reachable host, e.g. ${MASTER_ADDR}." >&2
+    echo "Set SGLANG_ROUTER_HOST or SGLANG_ROUTER_URL to a reachable host, e.g. ${PROXY_PUBLIC_HOST}." >&2
     exit 1
   fi
 }

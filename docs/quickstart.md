@@ -278,7 +278,7 @@ All Dressage configuration is via environment variables. Here's the complete ref
 
  | Variable | Values | Default | Description |
  | :--------- | :------- | :-------- | :------------ |
- | `DRESSAGE_PROXY_URL` | URL | `http://${PROXY_PUBLIC_HOST}:${PROXY_PORT}` or `http://${MASTER_ADDR}:8800` in scripts | Proxy server endpoint. Must be reachable from sandboxes. |
+ | `DRESSAGE_PROXY_URL` | URL | `http://${PROXY_PUBLIC_HOST}:${PROXY_PORT}` in scripts | Proxy server endpoint. Must be reachable from sandboxes. |
  | `TRAJECTORY_BUILD_MODE` | `concat` \| `last_step` | `concat` in scripts | Script helper passed to proxy `--trajectory-build-mode`. |
  | `TITO_MODEL` | string | `qwen3_5` in scripts | Script helper passed to proxy `--tito-model`. |
  | `DRESSAGE_PROXY_MAX_STEPS_PER_SESSION` | int | `0` (unlimited) | Returns HTTP 400 before the next proxy generation once the session already has this many steps. |
