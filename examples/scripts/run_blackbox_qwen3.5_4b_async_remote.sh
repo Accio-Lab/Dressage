@@ -142,7 +142,6 @@ PERF_ARGS=(
    --recompute-num-layers 1
 
    --use-dynamic-batch-size
-   --calculate-per-token-loss
    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
    --log-probs-chunk-size 1024
 )
