@@ -1,23 +1,18 @@
 #!/bin/bash
 
-# HotpotQA whitebox ASYNC training on Qwen3.5-4B.
+# ALFWorld whitebox PARTIAL ROLLOUT ASYNC training on Qwen3.5-4B.
 # Async mode: 4 GPU train + 4 GPU rollout (separate), no colocate.
 #
-# Layout follows run_blackbox_qwen3.5_4b_async_local.sh (BASE_FOLDER=/root for
-# weights) but swaps in the multi-segment whitebox stack:
-#   - rollout: dressage.recipes.hotpotqa.agent_whitebox.generate (WhiteboxAgent)
-#   - reward : dressage.recipes.hotpotqa.reward (F1 + EM on <answer>...</answer>)
-#   - data   : repo-local jsonl prepared with examples/data/hotpotqa/prepare_hotpotqa.py
+# Layout follows run_hotpotqa_whitebox_agent_qwen3.5_4b_async.sh but swaps in the ALFWorld agent:
+#   - rollout: dressage.recipes.alfworld.agent_whitebox.generate (WhiteboxAgent)
+#   - reward : dressage.recipes.alfworld.reward (success/format/0 from metadata)
+#   - data   : repo-local jsonl prepared with examples/data/alfworld/prepare_alfworld.py
 #
-# Quickstart prerequisites (one-time, see project README):
-#   place Qwen3.5-4B, Qwen3.5-4B_torch_dist, and bge-large-en-v1.5 under /root/
-#   python examples/data/hotpotqa/prepare_hotpotqa.py
-#   python examples/data/hotpotqa/build_corpus.py
-#   python examples/data/hotpotqa/build_index.py --devices cuda:0
-#
-# Search backend: local FAISS+BGE (no external HTTP service needed).
-#   HOTPOTQA_CORPUS_DIR — directory with hpqa_corpus.jsonl + index.bin
-#   HOTPOTQA_EMBEDDING_MODEL — BGE model path for query encoding
+# Quickstart prerequisites (one-time):
+#   place Qwen3.5-4B and Qwen3.5-4B_torch_dist under /root/
+#   pip install alfworld[full]
+#   ALFWORLD_DATA="$(pwd)/examples/data/alfworld/alfworld_data" alfworld-download
+#   python examples/data/alfworld/prepare_alfworld.py
 
 pkill -9 sglang
 sleep 3
@@ -40,6 +35,9 @@ SLIME_ROOT="${SLIME_ROOT:-${REPO_ROOT}/slime}"
 BASE_FOLDER="${BASE_FOLDER:-/root}"
 DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/examples/data}"
 
+export DRESSAGE_WHITEBOX_PARTIAL_ROLLOUT="${DRESSAGE_WHITEBOX_PARTIAL_ROLLOUT:-1}"
+export MAX_PARTIAL_ROLLOUT_PREEMPTS="${MAX_PARTIAL_ROLLOUT_PREEMPTS:-2}"
+
 if [[ ! -f "${SLIME_ROOT}/scripts/models/qwen3.5-4B.sh" ]]; then
   echo "Cannot find slime model config: ${SLIME_ROOT}/scripts/models/qwen3.5-4B.sh" >&2
   echo "Set REPO_ROOT or SLIME_ROOT to match the current checkout layout." >&2
@@ -58,7 +56,7 @@ ROLLOUT_NUM_GPUS=${ROLLOUT_NUM_GPUS:-4}
 RAY_NUM_GPUS_PER_NODE=${RAY_NUM_GPUS_PER_NODE:-8}
 CP_SIZE=${CP_SIZE:-1}
 MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU:-24576}
-CONTEXT_WINDOW=${CONTEXT_WINDOW:-$((MAX_TOKENS_PER_GPU * CP_SIZE))}
+# CONTEXT_WINDOW=${CONTEXT_WINDOW:-$((MAX_TOKENS_PER_GPU * CP_SIZE))}
 SOCKET_IFNAME=${SOCKET_IFNAME:-eth0}
 HOSTFILE=${HOSTFILE:-}
 
@@ -75,9 +73,9 @@ source "${SLIME_ROOT}/scripts/models/qwen3.5-4B.sh"
 # --- Proxy configuration ---
 PROXY_HOST=${PROXY_HOST:-0.0.0.0}
 PROXY_PORT=${PROXY_PORT:-8800}
-PROXY_PUBLIC_HOST=${PROXY_PUBLIC_HOST:-$(hostname -i)}
+PROXY_PUBLIC_HOST=${PROXY_PUBLIC_HOST:-${MASTER_ADDR}}
 DRESSAGE_PROXY_URL=${DRESSAGE_PROXY_URL:-http://${PROXY_PUBLIC_HOST}:${PROXY_PORT}}
-SGLANG_ROUTER_HOST=${SGLANG_ROUTER_HOST:-$(hostname -i)}
+SGLANG_ROUTER_HOST=${SGLANG_ROUTER_HOST:-${MASTER_ADDR}}
 SGLANG_ROUTER_PORT=${SGLANG_ROUTER_PORT:-8000}
 SGLANG_ROUTER_URL=${SGLANG_ROUTER_URL:-http://${SGLANG_ROUTER_HOST}:${SGLANG_ROUTER_PORT}}
 
@@ -88,22 +86,21 @@ CKPT_LOAD=${CKPT_LOAD:-${BASE_FOLDER}/Qwen3.5-4B_slime/}
 CKPT_SAVE=${CKPT_SAVE:-${BASE_FOLDER}/Qwen3.5-4B_slime/}
 
 # --- Training data ---
-PROMPT_DATA=${PROMPT_DATA:-${DATA_ROOT}/hotpotqa/train.jsonl}
+PROMPT_DATA=${PROMPT_DATA:-${DATA_ROOT}/alfworld/train.jsonl}
 
-# --- Local FAISS search backend ---
-HOTPOTQA_CORPUS_DIR=${HOTPOTQA_CORPUS_DIR:-${DATA_ROOT}/hotpotqa/corpus}
-HOTPOTQA_EMBEDDING_MODEL=${HOTPOTQA_EMBEDDING_MODEL:-${BASE_FOLDER}/bge-large-en-v1.5}
-HOTPOTQA_EMBEDDING_DEVICE=${HOTPOTQA_EMBEDDING_DEVICE:-cpu}
-HOTPOTQA_TOPK=${HOTPOTQA_TOPK:-5}
-
-# --- HotpotQA agent loop knobs ---
-HOTPOTQA_MAX_STEPS=${HOTPOTQA_MAX_STEPS:-5}
-HOTPOTQA_MAX_PARALLEL_CALLS=${HOTPOTQA_MAX_PARALLEL_CALLS:-4}
-HOTPOTQA_FORCE_FIRST_SEARCH=${HOTPOTQA_FORCE_FIRST_SEARCH:-1}
-HOTPOTQA_PASSAGE_MAX_CHARS=${HOTPOTQA_PASSAGE_MAX_CHARS:-1200}
-HOTPOTQA_FEEDBACK_RING_SIZE=${HOTPOTQA_FEEDBACK_RING_SIZE:-3}
+# --- ALFWorld agent loop knobs ---
+# Concat-mode rollout: each trajectory is one append-only conversation. 30 steps
+# matches Embodied-Planner-R1 (arXiv 2506.23127) and keeps the worst-case sample
+# total_lengths under the 12288 max-tokens-per-gpu cap (measured: 50 steps at
+# rollout 0 averaged 11394 total tokens with peak ~24k; 30 steps caps the tail
+# at ~18k and still leaves room as the policy learns to explore more).
+ALFWORLD_MAX_STEPS=${ALFWORLD_MAX_STEPS:-30}
+ALFWORLD_MAX_EPISODE_STEPS=${ALFWORLD_MAX_EPISODE_STEPS:-30}
+ALFWORLD_HISTORY_WINDOW=${ALFWORLD_HISTORY_WINDOW:-10}
 
 # --- Model format configuration (proxy + parser) ---
+# ALFWorld now uses tool_call schema (env_step) to mirror the StepPO recipe;
+# the proxy parses tool_call output via the configured backend.
 MODEL_MASK_TYPE=${MODEL_MASK_TYPE:-qwen3_5}
 MODEL_TOOL_CALL_TYPE=${MODEL_TOOL_CALL_TYPE:-qwen3_5}
 TOOL_CALL_PARSE_BACKEND=${TOOL_CALL_PARSE_BACKEND:-sglang_api}
@@ -113,15 +110,12 @@ TRAJECTORY_BUILD_MODE=${TRAJECTORY_BUILD_MODE:-concat}
 TITO_MODEL=${TITO_MODEL:-qwen3_5}
 TOKENIZER_PATH=${TOKENIZER_PATH:-${HF_CHECKPOINT}}
 
-LOG_DIR=${LOG_DIR:-${SCRIPT_DIR}/log/hotpotqa-qwen3.5-4B}
+LOG_DIR=${LOG_DIR:-${SCRIPT_DIR}/log/alfworld-qwen3.5-4B}
 DRESSAGE_TRAJECTORY_PAYLOAD_LOG_DIR=${DRESSAGE_TRAJECTORY_PAYLOAD_LOG_DIR:-${LOG_DIR}/trajectory_payload}
 DRESSAGE_TRAJECTORY_ERROR_LOG_DIR=${DRESSAGE_TRAJECTORY_ERROR_LOG_DIR:-${LOG_DIR}/trajectory_err}
-TERMINAL_LOG_FILE=${TERMINAL_LOG_FILE:-${LOG_DIR}/terminal.log}
 PROXY_LOG_FILE=${PROXY_LOG_FILE:-${LOG_DIR}/dressage-proxy.log}
 PROXY_PID_FILE=${PROXY_PID_FILE:-${LOG_DIR}/dressage-proxy.pid}
 mkdir -p "${LOG_DIR}" "$(dirname "${PROXY_PID_FILE}")" "${DRESSAGE_TRAJECTORY_PAYLOAD_LOG_DIR}" "${DRESSAGE_TRAJECTORY_ERROR_LOG_DIR}"
-exec > >(tee -a "${TERMINAL_LOG_FILE}") 2>&1
-echo "Terminal log: ${TERMINAL_LOG_FILE}"
 
 for TRAJECTORY_LOG_DIR_VAR in DRESSAGE_TRAJECTORY_PAYLOAD_LOG_DIR DRESSAGE_TRAJECTORY_ERROR_LOG_DIR; do
   TRAJECTORY_LOG_DIR="${!TRAJECTORY_LOG_DIR_VAR}"
@@ -141,9 +135,7 @@ fi
 export PYTHONPATH="${REPO_ROOT}:${SLIME_ROOT}:${PYTHONPATH:-}"
 export DRESSAGE_PROXY_URL
 export DRESSAGE_TRAJECTORY_PAYLOAD_LOG_DIR DRESSAGE_TRAJECTORY_ERROR_LOG_DIR
-export HOTPOTQA_CORPUS_DIR HOTPOTQA_EMBEDDING_MODEL HOTPOTQA_EMBEDDING_DEVICE HOTPOTQA_TOPK
-export HOTPOTQA_MAX_STEPS HOTPOTQA_MAX_PARALLEL_CALLS HOTPOTQA_FORCE_FIRST_SEARCH
-export HOTPOTQA_PASSAGE_MAX_CHARS HOTPOTQA_FEEDBACK_RING_SIZE
+export ALFWORLD_MAX_STEPS ALFWORLD_MAX_EPISODE_STEPS ALFWORLD_HISTORY_WINDOW
 
 COMM_ARGS=(
    --rollout-temperature "${ROLLOUT_TEMPERATURE:-1.0}"
@@ -161,10 +153,20 @@ PROXY_ARGS=(
    --reasoning-parse-backend "${REASONING_PARSE_BACKEND}"
    --trajectory-build-mode "${TRAJECTORY_BUILD_MODE}"
    "${COMM_ARGS[@]}"
-   --context-window "${CONTEXT_WINDOW}"
+  #  --context-window "${CONTEXT_WINDOW}"
    --tito-model "${TITO_MODEL}"
    --record-token-versions
+   --mask-nonlast-version-tokens
 )
+
+if [[ "${DRESSAGE_WHITEBOX_PARTIAL_ROLLOUT:-0}" == "1" ]]; then
+  MAX_PARTIAL_ROLLOUT_PREEMPTS=${MAX_PARTIAL_ROLLOUT_PREEMPTS:-2}
+  PROXY_ARGS+=(
+     --dressage-partial-rollout
+     --mask-nonlast-version-tokens
+    #  --max-partial-rollout-preempts "${MAX_PARTIAL_ROLLOUT_PREEMPTS}"
+  )
+fi
 
 CKPT_ARGS=(
    --hf-checkpoint "${HF_CHECKPOINT}"
@@ -172,13 +174,11 @@ CKPT_ARGS=(
   #  --load "${CKPT_LOAD}"
   #  --save "${CKPT_SAVE}"
   #  --save-interval 20
-  #  --no-save-optim
-  #  --no-load-optim
 )
 
 ROLLOUT_ARGS=(
-   --rollout-function-path dressage.rollout.fully_async_rollout.generate_rollout_fully_async
-   --custom-generate-function-path "dressage.recipes.hotpotqa.agent_whitebox.generate"
+   --rollout-function-path dressage.rollout.partial_async_rollout.generate_rollout_partial_async
+   --custom-generate-function-path "dressage.recipes.alfworld.agent_whitebox.generate"
    --custom-rm-path dressage.reward.custom_rm.custom_rm
    --data-source-path dressage.rollout.data_source.DressageDataSource
    --custom-reward-post-process-path dressage.training.reward_post_process.reward_post_process
@@ -193,10 +193,10 @@ ROLLOUT_ARGS=(
    --rollout-shuffle
 
    --num-rollout "${NUM_ROLLOUT:-3000}"
-   --rollout-batch-size "${ROLLOUT_BATCH_SIZE:-32}"
+   --rollout-batch-size "${ROLLOUT_BATCH_SIZE:-16}"
    --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT:-8}"
    --rollout-max-response-len "${ROLLOUT_MAX_RESPONSE_LEN:-4096}"
-   --global-batch-size "${GLOBAL_BATCH_SIZE:-256}"
+   --global-batch-size "${GLOBAL_BATCH_SIZE:-128}"
    --balance-data
 )
 
@@ -228,8 +228,8 @@ GRPO_ARGS=(
    --kl-loss-type low_var_kl
    --entropy-coef 0.00
    --eps-clip 0.2
-   --eps-clip-high 0.2
-   --eps-clip-c 3.0
+   --eps-clip-high 0.28
+   --eps-clip-c 10.0
 )
 
 OPTIMIZER_ARGS=(
@@ -238,19 +238,19 @@ OPTIMIZER_ARGS=(
    --lr-decay-style constant
    --weight-decay 0.01
    --adam-beta1 0.9
-   --adam-beta2 0.999
+   --adam-beta2 0.98
 )
 
 WANDB_ARGS=(
    # --use-wandb
    # --wandb-project slime-dev
-   # --wandb-group hotpotqa-qwen3.5-4B-whitebox-async
+   # --wandb-group alfworld-qwen3.5-4B-whitebox-async
    # --wandb-key ${WANDB_KEY}
 )
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 1
-   --sglang-mem-fraction-static 0.7
+   --sglang-mem-fraction-static 0.5
    --sglang-router-port "${SGLANG_ROUTER_PORT}"
    --router-policy consistent_hashing
 )
@@ -330,16 +330,10 @@ RUNTIME_ENV_JSON=$(cat <<EOF_JSON
     "DRESSAGE_PROXY_URL": "${DRESSAGE_PROXY_URL}",
     "DRESSAGE_TRAJECTORY_PAYLOAD_LOG_DIR": "${DRESSAGE_TRAJECTORY_PAYLOAD_LOG_DIR}",
     "DRESSAGE_TRAJECTORY_ERROR_LOG_DIR": "${DRESSAGE_TRAJECTORY_ERROR_LOG_DIR}",
-    "DRESSAGE_REWARD_MODULES": "dressage.recipes.hotpotqa.reward",
-    "HOTPOTQA_CORPUS_DIR": "${HOTPOTQA_CORPUS_DIR}",
-    "HOTPOTQA_EMBEDDING_MODEL": "${HOTPOTQA_EMBEDDING_MODEL}",
-    "HOTPOTQA_EMBEDDING_DEVICE": "${HOTPOTQA_EMBEDDING_DEVICE}",
-    "HOTPOTQA_TOPK": "${HOTPOTQA_TOPK}",
-    "HOTPOTQA_MAX_STEPS": "${HOTPOTQA_MAX_STEPS}",
-    "HOTPOTQA_MAX_PARALLEL_CALLS": "${HOTPOTQA_MAX_PARALLEL_CALLS}",
-    "HOTPOTQA_FORCE_FIRST_SEARCH": "${HOTPOTQA_FORCE_FIRST_SEARCH}",
-    "HOTPOTQA_PASSAGE_MAX_CHARS": "${HOTPOTQA_PASSAGE_MAX_CHARS}",
-    "HOTPOTQA_FEEDBACK_RING_SIZE": "${HOTPOTQA_FEEDBACK_RING_SIZE}"
+    "DRESSAGE_REWARD_MODULES": "dressage.recipes.alfworld.reward",
+    "ALFWORLD_MAX_STEPS": "${ALFWORLD_MAX_STEPS}",
+    "ALFWORLD_MAX_EPISODE_STEPS": "${ALFWORLD_MAX_EPISODE_STEPS}",
+    "ALFWORLD_HISTORY_WINDOW": "${ALFWORLD_HISTORY_WINDOW}"
   }
 }
 EOF_JSON

@@ -41,6 +41,12 @@ from dressage.rollout.fully_async_rollout import (
     _mark_no_grad_failed,
     _retry_count,
 )
+from dressage.rollout.staleness import (
+    PendingGroup,
+    StalenessGroupFilter,
+    StalenessTracker,
+    config_from_args,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -223,6 +229,7 @@ class PartialAsyncRolloutWorker:
         self._next_group_id = 0
         self._rollout_id_lock = threading.Lock()
         self._current_rollout_id = 0
+        self.staleness = StalenessTracker(config_from_args(args))
 
     def start(self) -> None:
         if self.worker_thread is not None and self.worker_thread.is_alive():
@@ -396,7 +403,7 @@ async def generate_rollout_partial_async_impl(
     n_samples_per_prompt = max(1, _int_attr(args, "n_samples_per_prompt", 1))
     max_retries = int(os.environ.get("DRESSAGE_ROLLOUT_MAX_RETRIES", "2"))
     completed_by_id: dict[int, CompletedGroup] = {}
-    data: list[list[Any]] = []
+    data: list[PendingGroup] = []
     dropped_failed_groups = 0
     staleness_rejected_groups = 0
     staleness_rejected_samples = 0
@@ -412,6 +419,10 @@ async def generate_rollout_partial_async_impl(
     )
     drain_final_worker = _should_drain_worker_on_rollout(args, rollout_id)
     drained_completed_groups = 0
+    staleness_filter = StalenessGroupFilter(
+        tracker=worker.staleness,
+        rollout_name="partial",
+    )
 
     logger.info(
         "starting Dressage partial async rollout: rollout_id=%s target_groups=%s "
@@ -424,8 +435,19 @@ async def generate_rollout_partial_async_impl(
     )
 
     while len(data) < target_groups:
-        for completed in worker.get_completed_groups():
+        completed_groups = worker.get_completed_groups()
+        advanced_version = staleness_filter.observe_completed(completed_groups)
+        if advanced_version and data:
+            previous_count = len(data)
+            data = staleness_filter.filter_pending(data, logger)
+            if len(data) != previous_count:
+                last_progress_time = time.time()
+
+        for completed in completed_groups:
             completed_by_id[completed.group_id] = completed
+
+        if advanced_version:
+            last_progress_time = time.time()
 
         for group_id in list(completed_by_id.keys()):
             if len(data) >= target_groups:
@@ -473,8 +495,11 @@ async def generate_rollout_partial_async_impl(
             else:
                 group = completed.result
 
+            if not staleness_filter.keep_group(group_id, group, logger):
+                last_progress_time = time.time()
+                continue
             _annotate_returned_group(group, group_id=group_id, rollout_id=rollout_id)
-            data.append(group)
+            data.append(PendingGroup(group_id=group_id, samples=group))
             last_progress_time = time.time()
 
         now = time.time()
@@ -514,11 +539,15 @@ async def generate_rollout_partial_async_impl(
                 len(drained),
             )
 
-    data = sorted(data, key=lambda group: getattr(group[0], "index", 0))
+    data_groups = [group.samples for group in data]
+    data_groups = sorted(data_groups, key=lambda group: getattr(group[0], "index", 0))
     if not _allow_empty_train_batch() and not any(
-        _group_has_trainable_tokens(group) for group in data
+        _group_has_trainable_tokens(group) for group in data_groups
     ):
-        summaries = [_group_failure_summary(group) for group in data[: min(3, len(data))]]
+        summaries = [
+            _group_failure_summary(group)
+            for group in data_groups[: min(3, len(data_groups))]
+        ]
         raise RuntimeError(
             "Dressage partial async rollout produced no trainable samples; "
             "refusing to train on failed placeholder samples. "
@@ -529,15 +558,16 @@ async def generate_rollout_partial_async_impl(
     from dressage.rollout.multi_segment import compute_multi_segment_metrics
 
     metrics: dict[str, Any] = compute_multi_segment_metrics(
-        [sample for group in data for sample in group]
+        [sample for group in data_groups for sample in group]
     )
+    metrics.update(staleness_filter.metrics_for_groups(data_groups))
     metrics.update({
         "dressage/partial_rollout_target_groups": target_groups,
         "dressage/partial_rollout_target_samples": target_groups * n_samples_per_prompt,
         "dressage/partial_rollout_full_groups": full_groups,
         "dressage/partial_rollout_full_samples": full_groups * n_samples_per_prompt,
-        "dressage/partial_rollout_returned_groups": len(data),
-        "dressage/partial_rollout_returned_samples": sum(len(group) for group in data),
+        "dressage/partial_rollout_returned_groups": len(data_groups),
+        "dressage/partial_rollout_returned_samples": sum(len(group) for group in data_groups),
         "dressage/partial_rollout_retried_groups": retried_groups,
         "dressage/partial_rollout_failed_groups": dropped_failed_groups,
         "dressage/partial_rollout_dropped_failed_groups": dropped_failed_groups,
@@ -548,8 +578,8 @@ async def generate_rollout_partial_async_impl(
         "dressage/partial_rollout_drained_completed_groups": drained_completed_groups,
     })
     if RolloutFnTrainOutput is not None:
-        return RolloutFnTrainOutput(samples=data, metrics=metrics)
-    return data
+        return RolloutFnTrainOutput(samples=data_groups, metrics=metrics)
+    return data_groups
 
 
 def generate_rollout_partial_async(

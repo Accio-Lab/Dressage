@@ -152,6 +152,7 @@ PROXY_ARGS=(
    "${COMM_ARGS[@]}"
   #  --context-window "${CONTEXT_WINDOW}"
    --tito-model "${TITO_MODEL}"
+   --record-token-versions
 )
 
 CKPT_ARGS=(
@@ -242,6 +243,7 @@ SGLANG_ARGS=(
 )
 
 MISC_ARGS=(
+   --custom-config-path "${SCRIPT_DIR}/default/dressage_staleness.yaml"
    --attention-dropout 0.0
    --hidden-dropout 0.0
    --accumulate-allreduce-grads-in-fp32

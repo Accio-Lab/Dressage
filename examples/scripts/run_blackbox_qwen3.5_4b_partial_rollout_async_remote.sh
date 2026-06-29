@@ -189,6 +189,7 @@ SGLANG_ARGS=(
 )
 
 MISC_ARGS=(
+   --custom-config-path "${SCRIPT_DIR}/default/dressage_staleness.yaml"
    --attention-dropout 0.0
    --hidden-dropout 0.0
    --accumulate-allreduce-grads-in-fp32
