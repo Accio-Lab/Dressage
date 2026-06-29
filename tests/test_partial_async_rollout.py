@@ -322,3 +322,82 @@ def test_partial_async_rollout_drains_worker_after_final_rollout(monkeypatch):
     assert partial_async_rollout._GLOBAL_PARTIAL_WORKER is None
     assert output.metrics["dressage/partial_rollout_final_worker_drain"] == 1
     assert output.metrics["dressage/partial_rollout_drained_completed_groups"] >= 1
+
+
+def test_partial_async_rollout_drops_stale_group_by_trajectory(monkeypatch):
+    async def fake_generate_and_rm_group(args, group, sampling_params, evaluation=False):
+        del args, sampling_params, evaluation
+        for sample in group:
+            sample.status = SampleLike.Status.COMPLETED
+            sample.reward = 1.0
+            sample.tokens = [1, 2]
+            sample.response_length = 1
+            sample.loss_mask = [1]
+            sample.rollout_log_probs = [-0.1]
+        return group
+
+    monkeypatch.setattr(partial_async_rollout, "generate_and_rm_group", fake_generate_and_rm_group)
+    monkeypatch.setattr(partial_async_rollout, "GenerateState", None)
+    monkeypatch.setenv("DRESSAGE_ASYNC_MAX_ACTIVE_GROUPS", "3")
+    monkeypatch.setenv("DRESSAGE_PARTIAL_ROLLOUT_TARGET_GROUPS", "2")
+
+    stale_group = [
+        SampleLike(index=0, metadata={"parent_traj_id": "traj-old", "dressage_end_token_version": "old"}),
+    ]
+    data = DataBuffer([
+        stale_group,
+        [SampleLike(index=1, metadata={"parent_traj_id": "traj-new-1", "dressage_end_token_version": "new"})],
+        [SampleLike(index=2, metadata={"parent_traj_id": "traj-new-2", "dressage_end_token_version": "new"})],
+    ])
+    args = SimpleNamespace(
+        rollout_batch_size=3,
+        n_samples_per_prompt=1,
+        global_batch_size=2,
+        dressage_staleness_keep_versions=1,
+    )
+
+    result = _samples(partial_async_rollout.generate_rollout_partial_async(args, 0, data))
+
+    assert all(isinstance(group, list) for group in result)
+    assert [[sample.index for sample in group] for group in result] == [[1], [2]]
+
+
+def test_partial_async_rollout_returns_staleness_metrics(monkeypatch):
+    async def fake_generate_and_rm_group(args, group, sampling_params, evaluation=False):
+        del args, sampling_params, evaluation
+        for sample in group:
+            sample.status = SampleLike.Status.COMPLETED
+            sample.reward = 1.0
+            sample.tokens = [1, 2]
+            sample.response_length = 1
+            sample.loss_mask = [1]
+            sample.rollout_log_probs = [-0.1]
+        return group
+
+    class TrainOutput:
+        def __init__(self, samples, metrics=None):
+            self.samples = samples
+            self.metrics = metrics or {}
+
+    monkeypatch.setattr(partial_async_rollout, "generate_and_rm_group", fake_generate_and_rm_group)
+    monkeypatch.setattr(partial_async_rollout, "GenerateState", None)
+    monkeypatch.setattr(partial_async_rollout, "RolloutFnTrainOutput", TrainOutput)
+    monkeypatch.setenv("DRESSAGE_PARTIAL_ROLLOUT_TARGET_GROUPS", "1")
+
+    data = DataBuffer([[
+        SampleLike(index=0, metadata={"parent_traj_id": "long", "segment_index": 0, "dressage_end_token_version": "old"}),
+        SampleLike(index=1, metadata={"parent_traj_id": "long", "segment_index": 1, "dressage_end_token_version": "middle"}),
+        SampleLike(index=2, metadata={"parent_traj_id": "short", "dressage_end_token_version": "new"}),
+    ]])
+    args = SimpleNamespace(
+        rollout_batch_size=1,
+        n_samples_per_prompt=1,
+        global_batch_size=1,
+        dressage_staleness_keep_versions=3,
+    )
+
+    output = partial_async_rollout.generate_rollout_partial_async(args, 0, data)
+
+    assert all(isinstance(group, list) for group in output.samples)
+    assert output.metrics["staleness/current_version_index"] == 1.0
+    assert output.metrics["staleness/version_gap_mean"] == pytest.approx(0.5)

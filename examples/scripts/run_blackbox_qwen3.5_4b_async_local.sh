@@ -101,6 +101,7 @@ PROXY_ARGS=(
    --trajectory-build-model "${TRAJECTORY_BUILD_MODEL}"
    "${COMM_ARGS[@]}"
    --context-window "${CONTEXT_WINDOW}"
+   --record-token-versions
 )
 
 CKPT_ARGS=(
@@ -196,6 +197,7 @@ SGLANG_ARGS=(
 )
 
 MISC_ARGS=(
+   --custom-config-path "${SCRIPT_DIR}/default/dressage_staleness.yaml"
    --attention-dropout 0.0
    --hidden-dropout 0.0
    --accumulate-allreduce-grads-in-fp32

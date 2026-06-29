@@ -40,6 +40,12 @@ from dressage.rollout.multi_segment import (
     compute_multi_segment_metrics,
     mark_aborted_no_grad,
 )
+from dressage.rollout.staleness import (
+    PendingGroup,
+    StalenessGroupFilter,
+    StalenessTracker,
+    config_from_args,
+)
 
 
 @dataclass
@@ -277,6 +283,7 @@ class AsyncRolloutWorker:
         self.running = True
         self.worker_thread: threading.Thread | None = None
         self._next_group_id = 0
+        self.staleness = StalenessTracker(config_from_args(args))
 
     def start(self) -> None:
         if self.worker_thread is not None and self.worker_thread.is_alive():
@@ -408,13 +415,17 @@ def _increment_retry(group: list[Any]) -> None:
         sample.remove_sample = False
 
 
-async def generate_rollout_async(args: Any, rollout_id: int, data_buffer: Any) -> list[list[Any]]:
+async def generate_rollout_async(
+    args: Any,
+    rollout_id: int,
+    data_buffer: Any,
+) -> tuple[list[list[Any]], dict[str, float]]:
     del rollout_id
     worker = get_global_worker(args, data_buffer)
     target_data_size = int(getattr(args, "rollout_batch_size", 1))
     max_retries = int(os.environ.get("DRESSAGE_ROLLOUT_MAX_RETRIES", "2"))
     completed_by_id: dict[int, CompletedGroup] = {}
-    data: list[list[Any]] = []
+    data: list[PendingGroup] = []
     dropped_failed_groups = 0
     dropped_failure_summaries: list[str] = []
     last_progress_time = time.time()
@@ -425,10 +436,25 @@ async def generate_rollout_async(args: Any, rollout_id: int, data_buffer: Any) -
             str(max(target_data_size * 10, 100)),
         )
     )
+    staleness_filter = StalenessGroupFilter(
+        tracker=worker.staleness,
+        rollout_name="fully",
+    )
 
     while len(data) < target_data_size:
-        for completed in worker.get_completed_groups():
+        completed_groups = worker.get_completed_groups()
+        advanced_version = staleness_filter.observe_completed(completed_groups)
+        if advanced_version and data:
+            previous_count = len(data)
+            data = staleness_filter.filter_pending(data, logger)
+            if len(data) != previous_count:
+                last_progress_time = time.time()
+
+        for completed in completed_groups:
             completed_by_id[completed.group_id] = completed
+
+        if advanced_version:
+            last_progress_time = time.time()
 
         for group_id in list(completed_by_id.keys()):
             if len(data) >= target_data_size:
@@ -465,7 +491,12 @@ async def generate_rollout_async(args: Any, rollout_id: int, data_buffer: Any) -
                 last_progress_time = time.time()
                 continue
             else:
-                data.append(completed.result)
+                group = completed.result
+
+            if not staleness_filter.keep_group(group_id, group, logger):
+                last_progress_time = time.time()
+                continue
+            data.append(PendingGroup(group_id=group_id, samples=group))
             last_progress_time = time.time()
 
         now = time.time()
@@ -480,13 +511,14 @@ async def generate_rollout_async(args: Any, rollout_id: int, data_buffer: Any) -
         if len(data) < target_data_size:
             await asyncio.sleep(0.01)
 
-    data = sorted(data, key=lambda group: getattr(group[0], "index", 0))
+    data_groups = [group.samples for group in data]
+    data_groups = sorted(data_groups, key=lambda group: getattr(group[0], "index", 0))
     if not _allow_empty_train_batch() and not any(
-        _group_has_trainable_tokens(group) for group in data
+        _group_has_trainable_tokens(group) for group in data_groups
     ):
         summaries = [
             _group_failure_summary(group)
-            for group in data[: min(3, len(data))]
+            for group in data_groups[: min(3, len(data_groups))]
         ]
         raise RuntimeError(
             "Dressage fully async rollout produced no trainable samples; "
@@ -495,7 +527,7 @@ async def generate_rollout_async(args: Any, rollout_id: int, data_buffer: Any) -
             "Set DRESSAGE_ALLOW_EMPTY_TRAIN_BATCH=1 to keep the previous behavior."
         )
 
-    return data
+    return data_groups, staleness_filter.metrics_for_groups(data_groups)
 
 
 def generate_rollout_fully_async(
@@ -506,10 +538,11 @@ def generate_rollout_fully_async(
 ):
     if evaluation:
         raise ValueError("Dressage fully async rollout does not support evaluation mode")
-    data = run(generate_rollout_async(args, rollout_id, data_buffer))
+    data, staleness_metrics = run(generate_rollout_async(args, rollout_id, data_buffer))
     metrics: dict[str, Any] = compute_multi_segment_metrics(
         [sample for group in data for sample in group]
     )
+    metrics.update(staleness_metrics)
     if RolloutFnTrainOutput is None:
         return data
     return RolloutFnTrainOutput(samples=data, metrics=metrics)
