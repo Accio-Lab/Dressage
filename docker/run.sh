@@ -3,8 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." >/dev/null 2>&1 && pwd)"
-VERSION="${VERSION:-v0.1.0}"
-IMAGE_NAME="${IMAGE_NAME:-dressage:${VERSION}}"
+source "${SCRIPT_DIR}/image_tag.sh"
 
 HOST_CHECKPOINT_DIR="${HOST_CHECKPOINT_DIR:-${BASE_FOLDER:-${HOME}/models}}"
 CONTAINER_CHECKPOINT_DIR="${CONTAINER_CHECKPOINT_DIR:-${HOST_CHECKPOINT_DIR}}"
@@ -23,6 +22,8 @@ env_args=(
   -e "DRESSAGE_BLACKBOX_BWRAP_BIN=bwrap"
   -e "OPENCODE_BIN=/usr/local/bin/opencode"
   -e "OPENCLAW_BIN=/usr/local/bin/openclaw"
+  -e "CLAUDE_CODE_BIN=/usr/local/bin/claude"
+  -e "CODEX_BIN=/usr/local/bin/codex"
 )
 
 if [[ -d "${HOST_CHECKPOINT_DIR}" ]]; then
@@ -41,5 +42,5 @@ docker run --rm -it \
   "${mount_args[@]}" \
   "${env_args[@]}" \
   -w /root/Dressage \
-  "${IMAGE_NAME}" \
+  "${DRESSAGE_IMAGE_NAME}" \
   "$@"

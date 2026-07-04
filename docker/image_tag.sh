@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+
+# Shared image-name resolution for the Dressage Docker scripts.
+IMAGE_REPOSITORY="${IMAGE_REPOSITORY:-huang3eng/dressage}"
+
+if [[ -n "${IMAGE_NAME:-}" ]]; then
+  DRESSAGE_IMAGE_NAME="${IMAGE_NAME}"
+  DRESSAGE_IMAGE_REPOSITORY="${IMAGE_REPOSITORY}"
+  DRESSAGE_IMAGE_TAG="${IMAGE_TAG:-${VERSION:-}}"
+  DRESSAGE_LATEST_IMAGE_NAME="${IMAGE_REPOSITORY}:latest"
+else
+  if [[ -n "${IMAGE_TAG:-}" ]]; then
+    DRESSAGE_IMAGE_TAG="${IMAGE_TAG}"
+  elif [[ -n "${VERSION:-}" ]]; then
+    DRESSAGE_IMAGE_TAG="${VERSION}"
+  else
+    IMAGE_TAG_DATE="${IMAGE_TAG_DATE:-$(date -u +%Y%m%d)}"
+    IMAGE_TAG_SUFFIX="${IMAGE_TAG_SUFFIX:-a}"
+    DRESSAGE_IMAGE_TAG="nightly-dev-${IMAGE_TAG_DATE}${IMAGE_TAG_SUFFIX}"
+  fi
+
+  DRESSAGE_IMAGE_REPOSITORY="${IMAGE_REPOSITORY}"
+  DRESSAGE_IMAGE_NAME="${DRESSAGE_IMAGE_REPOSITORY}:${DRESSAGE_IMAGE_TAG}"
+  DRESSAGE_LATEST_IMAGE_NAME="${DRESSAGE_IMAGE_REPOSITORY}:latest"
+fi

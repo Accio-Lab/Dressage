@@ -8,7 +8,7 @@
 
 BlackboxServer is a bundled HTTP adapter service that **decouples the Dressage rollout manager from concrete agentic backends**. It sits inside sandboxes, manages exactly **one backend agent process** and **one active session at a time**, and transparently proxies all LLM calls back through the Dressage inference proxy.
 
-The key insight: agent frameworks like `opencode` and `openclaw` each have their own CLI interfaces, configuration formats, and communication protocols. BlackboxServer provides a **uniform HTTP interface** that the paddock can drive regardless of which backend is behind it. This is what makes it possible to swap agent frameworks with a single environment variable.
+The key insight: agent frameworks like `opencode`, `openclaw`, Claude Code, and Codex each have their own CLI interfaces, configuration formats, and communication protocols. BlackboxServer provides a **uniform HTTP interface** that the paddock can drive regardless of which backend is behind it. This is what makes it possible to swap agent frameworks with a single environment variable.
 
 ```text
 blackbox_dispatch (rollout hook)
@@ -19,7 +19,7 @@ BlackboxServer :23456 (inside sandbox)
         │  one active session at a time
         │  in-process LLM proxy → Dressage Proxy
         ▼
-opencode serve / openclaw gateway / …
+opencode serve / openclaw gateway / claude -p / codex exec / …
         │  agent makes LLM calls
         │  proxy injects session headers
         ▼
@@ -31,7 +31,7 @@ Dressage Proxy → ⚡ SGLang Router
 
 ## ✨ Key Features
 
-- **Multi-Backend Support** — Pluggable adapter pattern supports `opencode` (code-editing agent via `opencode serve`), `openclaw` (OpenClaw Gateway via `/v1/chat/completions`), and future backends. Adding a new backend means implementing a single `BackendAdapter` class with `initialize`, `send_message`, `abort_session`, `health`, and `capabilities` methods; `pause` / `resume` can be overridden when the backend supports them.
+- **Multi-Backend Support** — Pluggable adapter pattern supports `opencode` (code-editing agent via `opencode serve`), `openclaw` (OpenClaw Gateway via `/v1/chat/completions`), `claude_code` (Claude Code headless CLI via Anthropic Messages), and `codex` (Codex CLI via `codex exec --json`). Adding a new backend means implementing a single `BackendAdapter` class with `initialize`, `send_message`, `abort_session`, `health`, and `capabilities` methods; `pause` / `resume` can be overridden when the backend supports them.
 - **In-Process LLM Proxy** — Every BlackboxServer instance runs a lightweight HTTP proxy that intercepts all outgoing LLM calls from the backend agent. This proxy injects session headers (`X-Session-Id`, `X-Instance-Id`, `X-Turn-Id`), routing keys, and partial rollout markers transparently. The agent never knows its calls are being recorded.
 - **Turn Idempotency** — Each turn is identified by a `(turn_id, messages_hash)` tuple. Retrying the same turn with the same messages returns cached responses. Retrying with different messages returns `409 Conflict`. This makes the protocol safe for network retries without duplicating agent work.
 - **Register & Rebind** — Registration is idempotent: calling `POST /v1/rollout/register` with the same parameters while the server is ready is a no-op. If parameters change, the server returns `409 Conflict` while active or desynced sessions still exist; only after no open sessions remain can it tear down and re-initialize with the new configuration.
@@ -44,7 +44,8 @@ Dressage Proxy → ⚡ SGLang Router
  | :-------- | :------- | :------------ | :------------- |
  | `opencode` | Implemented | Code-editing agent | Spawns `opencode serve` as a subprocess. Sends tasks via `/api/chat` endpoint. Agent writes code, runs tests, iterates. |
  | `openclaw` | Implemented | OpenClaw Gateway agent | Connects to OpenClaw Gateway's `/v1/chat/completions`. Agent uses OpenClaw's tool ecosystem for complex tasks. |
- | `claude_code` | Known but unavailable | Claude Code agent | Reserved adapter name; returns `501 Not Implemented`. |
+ | `claude_code` | Implemented | Claude Code agent | Runs `claude -p --output-format stream-json --verbose`; proxy bridges Anthropic Messages to OpenAI-compatible chat completions. |
+ | `codex` | Implemented | Codex CLI coding agent | Runs `codex exec --json`; the adapter writes an isolated `CODEX_HOME/config.toml` with a Chat Completions custom provider pointing at the in-process proxy. |
 
 ### Adding a New Backend
 
@@ -337,6 +338,8 @@ curl http://127.0.0.1:23456/v1/status | python -m json.tool
  | `BBS_RUNTIME_HEALTH_CHECK_RETRY_DELAY` | `0.5` | Delay between runtime health-check retries |
  | `OPENCODE_BIN` | `opencode` | Path to the `opencode` binary |
  | `OPENCLAW_BIN` | `openclaw` | Path to the `openclaw` binary |
+ | `CLAUDE_CODE_BIN` | `claude` | Path to the Claude Code binary |
+ | `CODEX_BIN` | `codex` | Path to the Codex CLI binary |
 
 </details>
 
@@ -362,6 +365,9 @@ When BlackboxServer registration is built through Dressage paddock defaults, `DR
  | **One server = one agent** | For parallel rollout, deploy one BlackboxServer per sandbox slot. The bwrap pool does this automatically. |
  | **One bound session** | The LLM proxy holds a single turn context — multiple concurrent sessions would corrupt turn attribution. |
  | **No inline system prompts** | System prompts are configured via `system_prompt_file` at registration time, not in per-turn messages. |
+ | **Claude Code uses Anthropic Messages** | The `claude_code` adapter points Claude Code at the in-process proxy, which accepts `/v1/messages`, forwards OpenAI-compatible `/v1/chat/completions` to Dressage, and converts responses back. |
+ | **Codex uses isolated local state** | The `codex` adapter sets sandbox-local `CODEX_HOME` / `CODEX_SQLITE_HOME`, removes inherited Codex/OpenAI auth env vars, and does not mount host `~/.codex`. |
+ | **Codex defaults to full access inside the outer sandbox** | The `codex` backend defaults to `sandbox_mode=danger-full-access` and `approval_policy=never`; use it only inside Dressage's sandbox boundary or override `backend_options` for a stricter mode. |
  | **Rebinding conflicts while open** | Changing registration parameters returns `409 Conflict` while active or desynced sessions still exist. Rebind only proceeds after no open sessions remain. |
  | **Desynced is terminal** | A desynced session cannot accept new turns. Abort and create a fresh session. |
  | **Timeouts are generous** | Default 16-minute backend timeout accommodates complex coding tasks. Adjust for your workload. |
@@ -378,7 +384,8 @@ blackbox_server/
 │   ├── base.py                #   Abstract BackendAdapter interface
 │   ├── opencode.py            #   opencode adapter (subprocess management)
 │   ├── openclaw.py            #   openclaw adapter (gateway client)
-│   ├── claude_code.py         #   claude_code stub (501 Not Implemented)
+│   ├── claude_code.py         #   Claude Code CLI adapter
+│   ├── codex.py               #   Codex CLI adapter
 │   └── factory.py             #   Adapter factory (type → class mapping)
 ├── core/                   # Server logic
 │   ├── server.py              #   BlackboxServer core (register, rebind, health)

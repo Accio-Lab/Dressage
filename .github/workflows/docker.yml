@@ -1,0 +1,132 @@
+name: Docker
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Full Docker tag to publish, for example nightly-dev-20260704b
+        required: false
+        type: string
+      tag_suffix:
+        description: Single-letter suffix for today's nightly-dev tag
+        required: false
+        type: string
+      push_latest:
+        description: Also publish huang3eng/dressage:latest
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+concurrency:
+  group: docker-publish-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'Accio-Lab/Dressage'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Resolve image tags
+        id: meta
+        shell: bash
+        env:
+          IMAGE_REPOSITORY: huang3eng/dressage
+          INPUT_IMAGE_TAG: ${{ github.event.inputs.image_tag || '' }}
+          INPUT_TAG_SUFFIX: ${{ github.event.inputs.tag_suffix || '' }}
+          INPUT_PUSH_LATEST: ${{ github.event.inputs.push_latest || 'true' }}
+        run: |
+          set -euo pipefail
+
+          tag_date="$(date -u +%Y%m%d)"
+
+          if [[ -n "${INPUT_IMAGE_TAG}" ]]; then
+            image_tag="${INPUT_IMAGE_TAG}"
+          else
+            if [[ -n "${INPUT_TAG_SUFFIX}" ]]; then
+              if [[ ! "${INPUT_TAG_SUFFIX}" =~ ^[a-z]$ ]]; then
+                echo "tag_suffix must be a single lowercase letter a-z" >&2
+                exit 1
+              fi
+              suffix="${INPUT_TAG_SUFFIX}"
+            else
+              namespace="${IMAGE_REPOSITORY%%/*}"
+              repository="${IMAGE_REPOSITORY#*/}"
+              tags_url="https://hub.docker.com/v2/repositories/${namespace}/${repository}/tags?page_size=100&name=nightly-dev-${tag_date}"
+              tags_json="$(curl -fsSL "${tags_url}")"
+              existing_suffixes="$(
+                TAGS_JSON="${tags_json}" python - "${tag_date}" <<'PY'
+          import json
+          import os
+          import re
+          import sys
+
+          data = json.loads(os.environ["TAGS_JSON"])
+          tag_date = sys.argv[1]
+          pattern = re.compile(rf"^nightly-dev-{re.escape(tag_date)}([a-z])$")
+          suffixes = sorted(
+              match.group(1)
+              for item in data.get("results", [])
+              for match in [pattern.match(item.get("name", ""))]
+              if match
+          )
+          print("\n".join(suffixes))
+          PY
+              )"
+
+              suffix=""
+              for candidate in {a..z}; do
+                if ! grep -qx "${candidate}" <<<"${existing_suffixes}"; then
+                  suffix="${candidate}"
+                  break
+                fi
+              done
+              if [[ -z "${suffix}" ]]; then
+                echo "all nightly-dev-${tag_date}[a-z] Docker tags already exist; set image_tag manually" >&2
+                exit 1
+              fi
+            fi
+            image_tag="nightly-dev-${tag_date}${suffix}"
+          fi
+
+          {
+            echo "image_repository=${IMAGE_REPOSITORY}"
+            echo "image_tag=${image_tag}"
+            echo "push_latest=${INPUT_PUSH_LATEST}"
+            echo "tags<<EOF"
+            echo "${IMAGE_REPOSITORY}:${image_tag}"
+            if [[ "${INPUT_PUSH_LATEST}" == "true" ]]; then
+              echo "${IMAGE_REPOSITORY}:latest"
+            fi
+            echo "EOF"
+          } >>"${GITHUB_OUTPUT}"
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          build-args: |
+            DRESSAGE_BASE_PLATFORM=linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}

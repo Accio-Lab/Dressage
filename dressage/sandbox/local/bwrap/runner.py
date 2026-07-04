@@ -43,6 +43,20 @@ _SLOT_MARKER_KEYS = (
     "DRESSAGE_BLACKBOX_SLOT_PORT",
 )
 
+_BLACKBOX_BACKEND_BINARY_ENV_KEYS = (
+    "OPENCODE_BIN",
+    "OPENCLAW_BIN",
+    "CLAUDE_CODE_BIN",
+    "CODEX_BIN",
+)
+
+_BLACKBOX_BACKEND_BINARIES = (
+    "opencode",
+    "openclaw",
+    "claude",
+    "codex",
+)
+
 
 def _env_bool(name: str, default: bool) -> bool:
     value = os.environ.get(name)
@@ -119,7 +133,7 @@ def _pythonpath_mounts() -> list[Path]:
 
 
 def _common_user_tool_roots() -> tuple[Path, ...]:
-    """Common local tool dirs used by opencode/openclaw installations."""
+    """Common local tool dirs used by blackbox backend installations."""
     home = Path.home()
     return (
         home / ".opencode",
@@ -132,7 +146,7 @@ def _default_readonly_mounts(python_bin: str | None = None) -> tuple[Path, ...]:
     """Host paths needed for Python, source modules, and installed tools.
 
     bubblewrap starts from an empty root. Besides common system directories,
-    include current Python, PYTHONPATH entries, resolved opencode/openclaw
+    include current Python, PYTHONPATH entries, resolved blackbox backend CLI
     launcher roots, and common user install roots when they exist. This makes
     the successful bwrap runtime shape the default rather than something every
     training script must re-export manually.
@@ -152,10 +166,10 @@ def _default_readonly_mounts(python_bin: str | None = None) -> tuple[Path, ...]:
     candidates.extend(_pythonpath_mounts())
     candidates.extend(_common_user_tool_roots())
 
-    for env_name in ("OPENCODE_BIN", "OPENCLAW_BIN"):
+    for env_name in _BLACKBOX_BACKEND_BINARY_ENV_KEYS:
         _append_existing_mount_root(candidates, os.environ.get(env_name))
 
-    for binary in ("opencode", "openclaw"):
+    for binary in _BLACKBOX_BACKEND_BINARIES:
         resolved = shutil.which(binary)
         if not resolved:
             continue

@@ -11,7 +11,8 @@ import socket
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
-from uuid import NAMESPACE_URL, uuid4, uuid5
+from urllib.parse import urlparse
+from uuid import NAMESPACE_URL, uuid5
 
 import httpx
 import uvicorn
@@ -28,11 +29,9 @@ from blackbox_server.adapters.base import (
 from blackbox_server.core.models import (
     AdapterResponse,
     BindingContext,
-    FunctionCall,
     Message,
     ProxyOptions,
     SessionContext,
-    ToolCall,
     TraceEvent,
     TurnContext,
     TurnUsage,
@@ -42,7 +41,18 @@ from blackbox_server.proxy.rollout_llm_proxy import RolloutLLMProxy
 
 
 LOGGER = logging.getLogger(__name__)
-_CLAUDE_CODE_STDOUT_STREAM_LIMIT = 100 * 1024 * 1024
+_CODEX_STDOUT_STREAM_LIMIT = 100 * 1024 * 1024
+
+_CODEX_INHERITED_AUTH_ENV_KEYS = (
+    "CODEX_ACCESS_TOKEN",
+    "CODEX_API_KEY",
+    "CODEX_HOME",
+    "CODEX_SQLITE_HOME",
+    "OPENAI_API_KEY",
+    "OPENAI_ORG_ID",
+    "OPENAI_ORGANIZATION",
+    "OPENAI_PROJECT",
+)
 
 
 class _BackgroundUvicornServer(uvicorn.Server):
@@ -52,178 +62,115 @@ class _BackgroundUvicornServer(uvicorn.Server):
         yield
 
 
-class ClaudeCodeModelOptions(BaseModel):
+class CodexModelOptions(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str = Field(default="proxy-model", min_length=1)
     name: str = Field(default="Dressage Proxy", min_length=1)
-    supported_capabilities: list[str] = Field(
-        default_factory=lambda: [
-            "thinking",
-            "adaptive_thinking",
-            "interleaved_thinking",
-        ]
-    )
 
 
-class ClaudeCodeGatewayOptions(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    auth_token: str = "blackbox-local"
-
-
-class ClaudeCodeThinkingOptions(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    enabled: bool = True
-    interleaved: bool = True
-    budget_tokens: int | None = Field(default=None, gt=0)
-
-
-class ClaudeCodeCompactionOptions(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    auto: bool = True
-    auto_compact_pct_override: int | None = Field(default=None, ge=1, le=100)
-
-
-class ClaudeCodeCompatOptions(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    disable_prompt_caching: bool = True
-    disable_nonessential_traffic: bool = True
-
-
-class ClaudeCodeSubagentsOptions(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    enabled: bool = False
-
-
-_CLAUDE_CODE_INHERITED_GATEWAY_ENV_KEYS = (
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "ANTHROPIC_BASE_URL",
-    "ANTHROPIC_CUSTOM_HEADERS",
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "CLAUDE_CONFIG_DIR",
-    "CLAUDE_CODE_TMPDIR",
-)
-
-
-class ClaudeCodeBackendOptions(BaseModel):
+class CodexBackendOptions(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     executable: str | None = None
-    model: ClaudeCodeModelOptions = Field(default_factory=ClaudeCodeModelOptions)
-    max_turns: int = Field(default=20, gt=0)
-    permission_mode: Literal[
-        "acceptEdits",
-        "auto",
-        "bypassPermissions",
-        "default",
-        "dontAsk",
-        "plan",
-    ] = "default"
-    setting_sources: str = "user"
-    system_prompt_mode: Literal["append", "replace", "claude_md", "none"] = "append"
-    gateway: ClaudeCodeGatewayOptions = Field(default_factory=ClaudeCodeGatewayOptions)
-    thinking: ClaudeCodeThinkingOptions = Field(
-        default_factory=ClaudeCodeThinkingOptions
+    model: CodexModelOptions = Field(default_factory=CodexModelOptions)
+    model_provider_id: str = Field(
+        default="dressage_proxy",
+        min_length=1,
+        pattern=r"^[A-Za-z0-9_-]+$",
     )
-    compaction: ClaudeCodeCompactionOptions = Field(
-        default_factory=ClaudeCodeCompactionOptions
-    )
-    compat: ClaudeCodeCompatOptions = Field(default_factory=ClaudeCodeCompatOptions)
-    subagents: ClaudeCodeSubagentsOptions = Field(
-        default_factory=ClaudeCodeSubagentsOptions
-    )
+    sandbox_mode: Literal[
+        "read-only",
+        "workspace-write",
+        "danger-full-access",
+    ] = "danger-full-access"
+    approval_policy: Literal["untrusted", "on-request", "never"] = "never"
+    skip_git_repo_check: bool = True
+    ignore_rules: bool = True
+    web_search: Literal["disabled", "cached", "live"] = "disabled"
     proxy: ProxyOptions = Field(default_factory=ProxyOptions)
 
     def resolved_executable(self) -> str:
-        return self.executable or os.getenv("CLAUDE_CODE_BIN") or "claude"
+        return self.executable or os.getenv("CODEX_BIN") or "codex"
 
 
 @dataclass(frozen=True)
-class ClaudeCodeSessionState:
-    backend_session_id: str
+class CodexSessionState:
+    backend_session_id: str | None
     resume: bool
 
 
-class ClaudeCodeConfigCompiler:
+@dataclass(frozen=True)
+class CodexRunResult:
+    outputs: list[Message]
+    trace_events: list[TraceEvent]
+    usage: TurnUsage
+    backend_session_id: str | None
+
+
+class CodexConfigCompiler:
     def __init__(
         self,
         *,
-        options: ClaudeCodeBackendOptions,
-        settings_path: Path,
+        options: CodexBackendOptions,
+        config_path: Path,
         system_prompt_path: Path | None = None,
     ) -> None:
         self.options = options
-        self.settings_path = settings_path
+        self.config_path = config_path
         self.system_prompt_path = system_prompt_path
 
-    def build_settings(self) -> dict[str, Any]:
-        deny: list[str] = []
-        if not self.options.subagents.enabled:
-            deny.append("Agent")
+    def build_config(self, proxy_port: int) -> str:
+        lines = [
+            f"model = {_toml_string(self.options.model.id)}",
+            f"model_provider = {_toml_string(self.options.model_provider_id)}",
+            f"approval_policy = {_toml_string(self.options.approval_policy)}",
+            f"sandbox_mode = {_toml_string(self.options.sandbox_mode)}",
+            f"web_search = {_toml_string(self.options.web_search)}",
+            "check_for_update_on_startup = false",
+            'cli_auth_credentials_store = "file"',
+            "",
+        ]
+        if self.system_prompt_path is not None:
+            try:
+                prompt_text = self.system_prompt_path.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise BackendProtocolError(
+                    f"Could not read Codex system prompt: {exc}"
+                ) from exc
+            lines.append(f"developer_instructions = {_toml_string(prompt_text)}")
+            lines.append("")
 
-        settings: dict[str, Any] = {
-            "autoCompactEnabled": self.options.compaction.auto,
-            "permissions": {
-                "allow": [
-                    "Bash(*)",
-                    "Read(*)",
-                    "Edit(*)",
-                    "Write(*)",
-                    "WebSearch",
-                    "WebFetch",
-                    "Glob",
-                    "Grep",
-                    "LS",
-                    "NotebookRead",
-                    "NotebookEdit",
-                    "TodoWrite",
-                    "Task"
-                ],
-                "deny": deny,
-            },
-            "env": {},
-        }
-        env = settings["env"]
-        if self.options.compat.disable_prompt_caching:
-            env["DISABLE_PROMPT_CACHING"] = "1"
-        if self.options.compat.disable_nonessential_traffic:
-            env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
-        if not self.options.thinking.enabled:
-            env["CLAUDE_CODE_DISABLE_THINKING"] = "1"
-            env["MAX_THINKING_TOKENS"] = "0"
-        elif self.options.thinking.budget_tokens is not None:
-            env["MAX_THINKING_TOKENS"] = str(self.options.thinking.budget_tokens)
-        if self.options.thinking.interleaved is False:
-            env["DISABLE_INTERLEAVED_THINKING"] = "1"
-        if self.options.compaction.auto_compact_pct_override is not None:
-            env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = str(
-                self.options.compaction.auto_compact_pct_override
-            )
-        return settings
+        lines.extend(
+            [
+                "[analytics]",
+                "enabled = false",
+                "",
+                "[feedback]",
+                "enabled = false",
+                "",
+                f"[model_providers.{self.options.model_provider_id}]",
+                f"name = {_toml_string(self.options.model.name)}",
+                f"base_url = {_toml_string(f'http://127.0.0.1:{proxy_port}/v1')}",
+                'wire_api = "responses"',
+                "",
+            ]
+        )
+        return "\n".join(lines)
 
-    def build_env(self, proxy_port: int, runtime_dir: Path) -> dict[str, str]:
+    def build_env(self, runtime_dir: Path) -> dict[str, str]:
         env = os.environ.copy()
-        for key in _CLAUDE_CODE_INHERITED_GATEWAY_ENV_KEYS:
+        for key in _CODEX_INHERITED_AUTH_ENV_KEYS:
             env.pop(key, None)
+        codex_home = runtime_dir / "home" / ".codex"
+        sqlite_home = runtime_dir / "home" / ".codex-sqlite"
         env.update(
             {
                 "HOME": str(runtime_dir / "home"),
-                "CLAUDE_CONFIG_DIR": str(runtime_dir / "home" / ".claude"),
-                "CLAUDE_CODE_TMPDIR": str(runtime_dir / "tmp"),
+                "CODEX_HOME": str(codex_home),
+                "CODEX_SQLITE_HOME": str(sqlite_home),
                 "TMPDIR": str(runtime_dir / "tmp"),
-                "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{proxy_port}",
-                "ANTHROPIC_AUTH_TOKEN": self.options.gateway.auth_token,
-                "ANTHROPIC_CUSTOM_MODEL_OPTION": self.options.model.id,
-                "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": self.options.model.name,
-                "ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES": ",".join(
-                    self.options.model.supported_capabilities
-                ),
+                "RUST_LOG": env.get("RUST_LOG", "error"),
             }
         )
         return {str(key): str(value) for key, value in env.items()}
@@ -231,53 +178,45 @@ class ClaudeCodeConfigCompiler:
     def build_cli_args(
         self,
         user_text: str,
-        session_state: ClaudeCodeSessionState,
+        session_state: CodexSessionState,
     ) -> list[str]:
-        args = [
-            self.options.resolved_executable(),
-            "-p",
-            user_text,
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--model",
-            self.options.model.id,
-            "--max-turns",
-            str(self.options.max_turns),
-            "--permission-mode",
-            self.options.permission_mode,
-            "--settings",
-            str(self.settings_path),
-            "--setting-sources",
-            self.options.setting_sources,
-        ]
+        args = [self.options.resolved_executable(), "exec"]
         if session_state.resume:
-            args.extend(["--resume", session_state.backend_session_id])
-        else:
-            args.extend(["--session-id", session_state.backend_session_id])
-
-        if self.system_prompt_path is not None and self.options.system_prompt_mode in {
-            "append",
-            "replace",
-        }:
-            try:
-                prompt_text = self.system_prompt_path.read_text(encoding="utf-8")
-            except OSError as exc:
+            if not session_state.backend_session_id:
                 raise BackendProtocolError(
-                    f"Could not read Claude Code system prompt: {exc}"
-                ) from exc
-            if self.options.system_prompt_mode == "append":
-                args.extend(["--append-system-prompt", prompt_text])
-            else:
-                args.extend(["--system-prompt", prompt_text])
+                    "codex resume requested without a backend_session_id."
+                )
+            args.extend(["resume", session_state.backend_session_id])
+        args.extend(
+            [
+                "--json",
+                "--model",
+                self.options.model.id,
+                "--sandbox",
+                self.options.sandbox_mode,
+                "--config",
+                f"approval_policy={_toml_string(self.options.approval_policy)}",
+                "--config",
+                f'model_provider="{self.options.model_provider_id}"',
+                "--config",
+                f"web_search={_toml_string(self.options.web_search)}",
+                "--config",
+                f"log_dir={_toml_string(str(self.config_path.parent / 'log'))}",
+            ]
+        )
+        if self.options.skip_git_repo_check:
+            args.append("--skip-git-repo-check")
+        if self.options.ignore_rules:
+            args.append("--ignore-rules")
+        args.append(user_text)
         return args
 
 
-class ClaudeCodeAdapter(BackendAdapter):
+class CodexAdapter(BackendAdapter):
     def __init__(self) -> None:
         self._binding_context: BindingContext | None = None
-        self._options: ClaudeCodeBackendOptions | None = None
-        self._compiler: ClaudeCodeConfigCompiler | None = None
+        self._options: CodexBackendOptions | None = None
+        self._compiler: CodexConfigCompiler | None = None
         self._proxy: RolloutLLMProxy | None = None
         self._proxy_port: int | None = None
         self._proxy_server: uvicorn.Server | None = None
@@ -290,33 +229,30 @@ class ClaudeCodeAdapter(BackendAdapter):
     async def initialize(self, binding_context: BindingContext) -> None:
         self._binding_context = binding_context
         options = self._parse_options(binding_context.binding.backend_options)
-        _validate_claude_code_runtime_options(options)
         self._options = options
         runtime_dir = Path(binding_context.binding.runtime_dir)
         self._prepare_runtime_dirs(runtime_dir)
-        system_prompt_path = self._prepare_system_prompt(binding_context, options)
+        system_prompt_path = self._prepare_system_prompt(binding_context)
         await self._start_proxy(binding_context, options)
         assert self._proxy_port is not None
-        settings_path = runtime_dir / "home" / ".claude" / "settings.json"
-        self._compiler = ClaudeCodeConfigCompiler(
+        config_path = runtime_dir / "home" / ".codex" / "config.toml"
+        self._compiler = CodexConfigCompiler(
             options=options,
-            settings_path=settings_path,
+            config_path=config_path,
             system_prompt_path=system_prompt_path,
         )
-        settings_path.write_text(
-            json.dumps(self._compiler.build_settings(), ensure_ascii=False, indent=2),
+        config_path.write_text(
+            self._compiler.build_config(self._proxy_port),
             encoding="utf-8",
         )
         run_dir = runtime_dir / "run"
         run_dir.mkdir(parents=True, exist_ok=True)
-        (run_dir / "claude_code.settings").write_text(
-            str(settings_path), encoding="utf-8"
-        )
+        (run_dir / "codex.config").write_text(str(config_path), encoding="utf-8")
         executable = options.resolved_executable()
         if self._resolve_executable(executable) is None:
             await self.shutdown()
             raise BackendProcessError(
-                f"claude code binary not found. Set CLAUDE_CODE_BIN or install Claude Code. ({executable})"
+                f"codex binary not found. Set CODEX_BIN or install Codex CLI. ({executable})"
             )
 
     async def send_message(
@@ -327,50 +263,41 @@ class ClaudeCodeAdapter(BackendAdapter):
     ) -> AdapterResponse:
         deadline = asyncio.get_running_loop().time() + turn_context.deadline_seconds
         if not await self.health():
-            raise BackendProcessError("claude_code backend is not healthy.")
+            raise BackendProcessError("codex backend is not healthy.")
         if len(new_messages) != 1:
-            raise BackendProtocolError(
-                "claude_code adapter expects exactly one input message."
-            )
+            raise BackendProtocolError("codex adapter expects exactly one input message.")
         message = new_messages[0]
         if message.role != "user":
-            raise BackendProtocolError(
-                "claude_code adapter only accepts a user message."
-            )
+            raise BackendProtocolError("codex adapter only accepts a user message.")
         if message.content is None or not message.content.strip():
-            raise BackendProtocolError(
-                "claude_code adapter requires non-empty user content."
-            )
+            raise BackendProtocolError("codex adapter requires non-empty user content.")
 
         had_backend_session = session_context.backend_session_id is not None
-        backend_session_id = (
+        target_backend_session_id = (
             session_context.backend_session_id or self._stable_backend_session_id()
         )
-        session_state = ClaudeCodeSessionState(
-            backend_session_id=backend_session_id,
+        session_state = CodexSessionState(
+            backend_session_id=session_context.backend_session_id,
             resume=had_backend_session,
         )
 
         if self._proxy is not None:
             await self._proxy.open_turn(
-                turn_context.turn_id, backend_session_id=backend_session_id
+                turn_context.turn_id,
+                backend_session_id=target_backend_session_id,
             )
 
         success = False
         try:
             task = asyncio.create_task(
-                self._run_claude_turn(
+                self._run_codex_turn(
                     user_text=message.content,
                     turn_context=turn_context,
                     session_state=session_state,
                 )
             )
             try:
-                (
-                    outputs,
-                    trace_events,
-                    usage,
-                ) = await self._await_backend_task_or_proxy_max_steps(
+                result = await self._await_backend_task_or_proxy_max_steps(
                     task,
                     session_context=session_context,
                     proxy=self._proxy,
@@ -379,6 +306,12 @@ class ClaudeCodeAdapter(BackendAdapter):
                 await self._raise_if_proxy_context_overflow()
                 await self._raise_if_proxy_rollout_invalidated()
                 await self._raise_with_proxy_failed_upstream(exc)
+            if result.backend_session_id:
+                target_backend_session_id = result.backend_session_id
+                if self._proxy is not None:
+                    await self._proxy.update_turn_backend_session(
+                        target_backend_session_id
+                    )
             if self._proxy is not None:
                 await self._proxy.drain_turn(
                     timeout=self._remaining_timeout(
@@ -387,13 +320,13 @@ class ClaudeCodeAdapter(BackendAdapter):
                 )
                 await self._raise_if_proxy_context_overflow()
                 await self._raise_if_proxy_rollout_invalidated()
-            session_context.backend_session_id = backend_session_id
+            session_context.backend_session_id = target_backend_session_id
             success = True
             return AdapterResponse(
-                outputs=outputs,
-                trace_events=trace_events,
-                usage=usage,
-                backend_session_id=backend_session_id,
+                outputs=result.outputs,
+                trace_events=result.trace_events,
+                usage=result.usage,
+                backend_session_id=target_backend_session_id,
             )
         finally:
             if self._proxy is not None:
@@ -482,19 +415,19 @@ class ClaudeCodeAdapter(BackendAdapter):
                     handle.close()
                 setattr(self, handle_name, None)
 
-    def _parse_options(
-        self, backend_options: dict[str, Any]
-    ) -> ClaudeCodeBackendOptions:
+    def _parse_options(self, backend_options: dict[str, Any]) -> CodexBackendOptions:
         try:
-            return ClaudeCodeBackendOptions.model_validate(backend_options)
+            return CodexBackendOptions.model_validate(backend_options)
         except Exception as exc:
             raise BackendProtocolError(
-                f"Invalid claude_code backend_options: {exc}"
+                f"Invalid codex backend_options: {exc}"
             ) from exc
 
     def _prepare_runtime_dirs(self, runtime_dir: Path) -> None:
         for path in (
-            runtime_dir / "home" / ".claude",
+            runtime_dir / "home" / ".codex",
+            runtime_dir / "home" / ".codex" / "log",
+            runtime_dir / "home" / ".codex-sqlite",
             runtime_dir / "workspace",
             runtime_dir / "logs",
             runtime_dir / "run",
@@ -506,7 +439,6 @@ class ClaudeCodeAdapter(BackendAdapter):
     def _prepare_system_prompt(
         self,
         binding_context: BindingContext,
-        options: ClaudeCodeBackendOptions,
     ) -> Path | None:
         if binding_context.binding.system_prompt is None:
             return None
@@ -514,41 +446,33 @@ class ClaudeCodeAdapter(BackendAdapter):
         target = Path(binding_context.binding.system_prompt.runtime_file)
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
-        if options.system_prompt_mode == "claude_md":
-            claude_md = (
-                Path(binding_context.binding.runtime_dir) / "workspace" / "CLAUDE.md"
-            )
-            claude_md.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
-            return None
-        if options.system_prompt_mode == "none":
-            return None
         return target
 
-    async def _run_claude_turn(
+    async def _run_codex_turn(
         self,
         *,
         user_text: str,
         turn_context: TurnContext,
-        session_state: ClaudeCodeSessionState,
-    ) -> tuple[list[Message], list[TraceEvent], TurnUsage]:
+        session_state: CodexSessionState,
+    ) -> CodexRunResult:
         if (
             self._binding_context is None
             or self._options is None
             or self._compiler is None
         ):
-            raise BackendProcessError("claude_code adapter has not been initialized.")
+            raise BackendProcessError("codex adapter has not been initialized.")
         if self._proxy_port is None:
             raise BackendProcessError("rollout proxy has not been initialized.")
         runtime_dir = Path(self._binding_context.binding.runtime_dir)
         logs_dir = runtime_dir / "logs"
         workspace_dir = runtime_dir / "workspace"
         if self._stdout_handle is None:
-            self._stdout_handle = open(logs_dir / "claude_code.stdout.log", "ab")
+            self._stdout_handle = open(logs_dir / "codex.stdout.log", "ab")
         if self._stderr_handle is None:
-            self._stderr_handle = open(logs_dir / "claude_code.stderr.log", "ab")
+            self._stderr_handle = open(logs_dir / "codex.stderr.log", "ab")
 
         args = self._compiler.build_cli_args(user_text, session_state)
-        env = self._compiler.build_env(self._proxy_port, runtime_dir)
+        env = self._compiler.build_env(runtime_dir)
         try:
             process = await asyncio.create_subprocess_exec(
                 *args,
@@ -556,20 +480,21 @@ class ClaudeCodeAdapter(BackendAdapter):
                 env=env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=self._stderr_handle,
-                limit=_CLAUDE_CODE_STDOUT_STREAM_LIMIT,
+                limit=_CODEX_STDOUT_STREAM_LIMIT,
                 start_new_session=True,
             )
         except FileNotFoundError as exc:
             raise BackendProcessError(
-                f"claude code binary not found. Set CLAUDE_CODE_BIN or install Claude Code. ({args[0]})"
+                f"codex binary not found. Set CODEX_BIN or install Codex CLI. ({args[0]})"
             ) from exc
         self._process = process
         self._process_group_id = process.pid
-        (runtime_dir / "run" / "claude_code.pid").write_text(
+        (runtime_dir / "run" / "codex.pid").write_text(
             str(process.pid), encoding="utf-8"
         )
 
         events: list[dict[str, Any]] = []
+        parse_error: str | None = None
         assert process.stdout is not None
         try:
             async for raw_line in process.stdout:
@@ -580,10 +505,16 @@ class ClaudeCodeAdapter(BackendAdapter):
                     continue
                 try:
                     event = json.loads(line)
-                except json.JSONDecodeError:
-                    event = {"type": "stdout", "text": line}
-                if isinstance(event, dict):
-                    events.append(event)
+                except json.JSONDecodeError as exc:
+                    parse_error = f"invalid codex JSONL: {exc}; line={line[:1000]}"
+                    break
+                if not isinstance(event, dict):
+                    parse_error = f"invalid codex JSONL event type: {type(event).__name__}"
+                    break
+                events.append(event)
+            if parse_error is not None:
+                await self._terminate_active_process()
+                raise BackendTransportError(parse_error)
             returncode = await process.wait()
         finally:
             if self._process is process:
@@ -594,17 +525,17 @@ class ClaudeCodeAdapter(BackendAdapter):
             stderr_tail = self._stderr_tail()
             stdout_tail = self._stdout_tail()
             raise BackendTransportError(
-                _build_claude_code_exit_error_message(
+                _build_codex_exit_error_message(
                     returncode,
                     stderr_tail=stderr_tail,
                     stdout_tail=stdout_tail,
                     events=events,
                 )
             )
-        return convert_claude_code_stream_events(turn_context.turn_id, events)
+        return convert_codex_jsonl_events(turn_context.turn_id, events)
 
     async def _start_proxy(
-        self, binding_context: BindingContext, options: ClaudeCodeBackendOptions
+        self, binding_context: BindingContext, options: CodexBackendOptions
     ) -> None:
         bound_session_id = binding_context.binding.bound_session_id
         bound_instance_id = binding_context.binding.bound_instance_id
@@ -613,7 +544,7 @@ class ClaudeCodeAdapter(BackendAdapter):
         )
         self._proxy_port = self._find_free_port()
         LOGGER.info(
-            "starting rollout proxy on port %d, upstream_origin=%s, router_api_path=%s",
+            "starting codex rollout proxy on port %d, upstream_origin=%s, router_api_path=%s",
             self._proxy_port,
             upstream_origin,
             binding_context.binding.router_api_path,
@@ -656,11 +587,9 @@ class ClaudeCodeAdapter(BackendAdapter):
             except httpx.HTTPError:
                 pass
             await asyncio.sleep(0.1)
-        raise BackendProcessError("Timed out waiting for rollout proxy startup.")
+        raise BackendProcessError("Timed out waiting for codex rollout proxy startup.")
 
     def _resolve_upstream_origin(self, router_base_url: str) -> str:
-        from urllib.parse import urlparse
-
         raw = router_base_url
         if "://" not in raw:
             raw = f"http://{raw}"
@@ -671,13 +600,11 @@ class ClaudeCodeAdapter(BackendAdapter):
 
     def _stable_backend_session_id(self) -> str:
         if self._binding_context is None:
-            raise BackendProcessError(
-                "claude_code binding context has not been initialized."
-            )
+            raise BackendProcessError("codex binding context has not been initialized.")
         binding = self._binding_context.binding
         return str(
             uuid5(
-                NAMESPACE_URL, f"{binding.bound_instance_id}:{binding.bound_session_id}"
+                NAMESPACE_URL, f"codex:{binding.bound_instance_id}:{binding.bound_session_id}"
             )
         )
 
@@ -772,7 +699,7 @@ class ClaudeCodeAdapter(BackendAdapter):
         path = (
             Path(self._binding_context.binding.runtime_dir)
             / "logs"
-            / "claude_code.stderr.log"
+            / "codex.stderr.log"
         )
         return _tail_file(path, max_chars=max_chars)
 
@@ -782,7 +709,7 @@ class ClaudeCodeAdapter(BackendAdapter):
         path = (
             Path(self._binding_context.binding.runtime_dir)
             / "logs"
-            / "claude_code.stdout.log"
+            / "codex.stdout.log"
         )
         return _tail_file(path, max_chars=max_chars)
 
@@ -799,6 +726,10 @@ class ClaudeCodeAdapter(BackendAdapter):
         return shutil.which(executable)
 
 
+def _toml_string(value: str) -> str:
+    return json.dumps(str(value), ensure_ascii=False)
+
+
 def _tail_file(path: Path, *, max_chars: int = 2000) -> str | None:
     if not path.exists():
         return None
@@ -810,104 +741,36 @@ def _tail_file(path: Path, *, max_chars: int = 2000) -> str | None:
     return text or None
 
 
-def _validate_claude_code_runtime_options(options: ClaudeCodeBackendOptions) -> None:
-    if options.permission_mode != "bypassPermissions":
-        return
-    geteuid = getattr(os, "geteuid", None)
-    if not callable(geteuid):
-        return
-    if geteuid() != 0:
-        return
-    raise BackendProtocolError(
-        "claude_code permission_mode=bypassPermissions cannot run as root/sudo. "
-        "Use permission_mode=default or permission_mode=acceptEdits, or run BlackboxServer as a non-root user."
-    )
-
-
-def _claude_code_stderr_remediation(stderr_tail: str | None) -> str | None:
-    if not stderr_tail:
-        return None
-    lower_tail = stderr_tail.lower()
-    remediations: list[str] = []
-    if "requires --verbose" in lower_tail and "stream-json" in lower_tail:
-        remediations.append(
-            "pass --verbose whenever --output-format=stream-json is used"
-        )
-    if (
-        "dangerously-skip-permissions" in lower_tail
-        or "cannot be used with root/sudo" in lower_tail
-    ):
-        remediations.append(
-            "use permission_mode=default/acceptEdits or run BlackboxServer as a non-root user"
-        )
-    if (
-        "anthropic_api_key" in lower_tail
-        or "claude_code_oauth_token" in lower_tail
-        or "authentication" in lower_tail
-        or "unauthorized" in lower_tail
-        or "401" in lower_tail
-    ):
-        remediations.append(
-            "verify the Claude Code gateway token and clear inherited Anthropic/Claude auth environment"
-        )
-    if not remediations:
-        return None
-    return "; ".join(remediations)
-
-
-def _build_claude_code_exit_error_message(
+def _build_codex_exit_error_message(
     returncode: int,
     *,
     stderr_tail: str | None,
     stdout_tail: str | None,
     events: list[dict[str, Any]],
 ) -> str:
-    parts = [f"claude_code exited with code {returncode}"]
-    event_error = _claude_code_stream_error_summary(events)
+    parts = [f"codex exited with code {returncode}"]
+    event_error = _codex_stream_error_summary(events)
     if event_error:
-        parts.append(f"stream-json error: {event_error}")
+        parts.append(f"jsonl error: {event_error}")
     if stderr_tail:
         parts.append(f"stderr tail: {stderr_tail}")
     if stdout_tail:
         parts.append(f"stdout tail: {stdout_tail}")
-    remediation = _claude_code_stderr_remediation(stderr_tail)
-    if remediation:
-        parts.append(f"remediation: {remediation}")
     return "; ".join(parts)
 
 
-def _claude_code_stream_error_summary(
+def _codex_stream_error_summary(
     events: list[dict[str, Any]], *, max_chars: int = 1200
 ) -> str | None:
     summaries: list[str] = []
     for event in events[-20:]:
-        if not isinstance(event, dict):
-            continue
         event_type = str(event.get("type") or "")
-        if event_type == "result" and event.get("is_error"):
-            value = (
-                event.get("result")
-                or event.get("error")
-                or event.get("message")
-                or event
-            )
-            summaries.append(f"result={_compact_jsonish(value, max_chars=400)}")
-            continue
-        if event_type in {"error", "stderr"}:
+        if event_type in {"turn.failed", "error"}:
             summaries.append(_compact_jsonish(event, max_chars=400))
             continue
-        for key in ("error", "stderr"):
-            value = event.get(key)
-            if value:
-                summaries.append(f"{key}={_compact_jsonish(value, max_chars=400)}")
-        message = event.get("message")
-        if isinstance(message, dict):
-            for key in ("error", "stderr"):
-                value = message.get(key)
-                if value:
-                    summaries.append(
-                        f"message.{key}={_compact_jsonish(value, max_chars=400)}"
-                    )
+        error = event.get("error")
+        if error:
+            summaries.append(f"error={_compact_jsonish(error, max_chars=400)}")
     if not summaries:
         return None
     summary = " | ".join(summaries)
@@ -930,126 +793,127 @@ def _compact_jsonish(value: Any, *, max_chars: int) -> str:
     return text[:max_chars] + "...(truncated)"
 
 
-def convert_claude_code_stream_events(
+def convert_codex_jsonl_events(
     turn_id: str,
     events: list[dict[str, Any]],
-) -> tuple[list[Message], list[TraceEvent], TurnUsage]:
+) -> CodexRunResult:
     trace_events: list[TraceEvent] = []
-    outputs: list[Message] = []
+    output_parts: list[str] = []
+    reasoning_parts: list[str] = []
     usage = TurnUsage()
-    result_text: str | None = None
+    backend_session_id: str | None = None
+    tool_calls = 0
     seq = 0
 
     for event in events:
         seq += 1
+        event_type = str(event.get("type") or "event")
         trace_events.append(
             TraceEvent(
                 turn_id=turn_id,
                 seq=seq,
-                source="claude_code",
-                event_type=str(event.get("type") or "event"),
+                source="codex",
+                event_type=event_type,
                 payload=event,
                 created_at=utcnow(),
             )
         )
-        event_usage = _usage_from_event(event)
-        usage.total_tokens += event_usage.total_tokens
-        usage.input_tokens += event_usage.input_tokens
-        usage.output_tokens += event_usage.output_tokens
-        usage.reasoning_tokens += event_usage.reasoning_tokens
-        usage.tool_calls += event_usage.tool_calls
 
-        if event.get("type") == "result":
-            if event.get("is_error"):
-                raise BackendTransportError(
-                    str(
-                        event.get("result")
-                        or event.get("error")
-                        or "Claude Code failed."
-                    )
-                )
-            if event.get("result") is not None:
-                result_text = str(event.get("result"))
-            if event.get("num_turns") is not None:
-                with contextlib.suppress(TypeError, ValueError):
-                    usage.steps = max(usage.steps, int(event["num_turns"]))
+        if event_type == "thread.started":
+            thread_id = event.get("thread_id")
+            if thread_id:
+                backend_session_id = str(thread_id)
             continue
 
-        message = event.get("message")
-        if isinstance(message, dict):
-            converted = _messages_from_claude_message(message)
-            outputs.extend(converted)
-            if converted:
-                usage.steps += 1
+        if event_type in {"turn.failed", "error"}:
+            raise BackendTransportError(_codex_event_error_message(event))
 
-    if not outputs and result_text is not None:
-        outputs.append(Message(role="assistant", content=result_text))
-    if not outputs:
-        raise BackendProtocolError(
-            "claude_code stream-json output contained no assistant output."
-        )
+        if event_type == "turn.completed":
+            event_usage = _usage_from_codex_event(event)
+            usage.total_tokens = event_usage.total_tokens
+            usage.input_tokens = event_usage.input_tokens
+            usage.output_tokens = event_usage.output_tokens
+            usage.reasoning_tokens = event_usage.reasoning_tokens
+            usage.steps = max(usage.steps, 1)
+            continue
+
+        item = event.get("item")
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "")
+        if event_type == "item.completed" and item_type == "agent_message":
+            text = item.get("text")
+            if text is not None:
+                output_parts.append(str(text))
+        elif event_type == "item.completed" and item_type == "reasoning":
+            text = (
+                item.get("text")
+                or item.get("summary")
+                or item.get("content")
+                or item.get("message")
+            )
+            if text is not None:
+                reasoning_parts.append(str(text))
+        elif event_type == "item.completed" and item_type in {
+            "command_execution",
+            "mcp_tool_call",
+            "tool_call",
+            "web_search",
+        }:
+            tool_calls += 1
+
+    if not output_parts:
+        raise BackendProtocolError("codex JSONL output contained no assistant output.")
     if usage.total_tokens == 0:
         usage.total_tokens = usage.input_tokens + usage.output_tokens
-    return outputs, trace_events, usage
-
-
-def _messages_from_claude_message(message: dict[str, Any]) -> list[Message]:
-    if message.get("role") != "assistant":
-        return []
-    content = message.get("content")
-    if not isinstance(content, list):
-        if isinstance(content, str) and content:
-            return [Message(role="assistant", content=content)]
-        return []
-    text_parts: list[str] = []
-    reasoning_parts: list[str] = []
-    tool_calls: list[ToolCall] = []
-    for block in content:
-        if not isinstance(block, dict):
-            continue
-        block_type = block.get("type")
-        if block_type == "text" and block.get("text") is not None:
-            text_parts.append(str(block["text"]))
-        elif block_type in {"thinking", "redacted_thinking"}:
-            thinking = block.get("thinking") or block.get("text") or block.get("data")
-            if thinking is not None:
-                reasoning_parts.append(str(thinking))
-        elif block_type == "tool_use":
-            tool_input = block.get("input")
-            if not isinstance(tool_input, str):
-                tool_input = json.dumps(tool_input or {}, ensure_ascii=False)
-            tool_calls.append(
-                ToolCall(
-                    id=str(block.get("id") or f"call_{uuid4().hex[:8]}"),
-                    function=FunctionCall(
-                        name=str(block.get("name") or "tool"),
-                        arguments=tool_input,
-                    ),
-                )
+    usage.tool_calls = tool_calls
+    return CodexRunResult(
+        outputs=[
+            Message(
+                role="assistant",
+                content="\n".join(output_parts),
+                reasoning_content="\n".join(reasoning_parts)
+                if reasoning_parts
+                else None,
             )
-    return [
-        Message(
-            role="assistant",
-            content="\n".join(text_parts) if text_parts else None,
-            reasoning_content="\n".join(reasoning_parts) if reasoning_parts else None,
-            tool_calls=tool_calls or None,
-        )
-    ]
+        ],
+        trace_events=trace_events,
+        usage=usage,
+        backend_session_id=backend_session_id,
+    )
 
 
-def _usage_from_event(event: dict[str, Any]) -> TurnUsage:
+def _usage_from_codex_event(event: dict[str, Any]) -> TurnUsage:
     raw_usage = event.get("usage")
     if not isinstance(raw_usage, dict):
-        message = event.get("message")
-        raw_usage = message.get("usage") if isinstance(message, dict) else {}
-    if not isinstance(raw_usage, dict):
         raw_usage = {}
-    input_tokens = int(raw_usage.get("input_tokens", 0) or 0)
-    output_tokens = int(raw_usage.get("output_tokens", 0) or 0)
-    cache_read = int(raw_usage.get("cache_read_input_tokens", 0) or 0)
-    cache_create = int(raw_usage.get("cache_creation_input_tokens", 0) or 0)
+    input_tokens = _int_or_zero(raw_usage.get("input_tokens"))
+    output_tokens = _int_or_zero(raw_usage.get("output_tokens"))
+    reasoning_tokens = _int_or_zero(raw_usage.get("reasoning_output_tokens"))
+    total_tokens = _int_or_zero(raw_usage.get("total_tokens"))
+    if total_tokens == 0:
+        total_tokens = input_tokens + output_tokens
     return TurnUsage(
-        total_tokens=input_tokens + output_tokens + cache_read + cache_create,
-        input_tokens=input_tokens + cache_read + cache_create,
+        total_tokens=total_tokens,
+        input_tokens=input_tokens,
         output_tokens=output_tokens,
+        reasoning_tokens=reasoning_tokens,
     )
+
+
+def _int_or_zero(value: Any) -> int:
+    if value is None or isinstance(value, bool):
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _codex_event_error_message(event: dict[str, Any]) -> str:
+    value = event.get("error") or event.get("message") or event
+    if isinstance(value, dict):
+        message = value.get("message") or value.get("error") or value.get("detail")
+        if message:
+            return str(message)
+    return _compact_jsonish(value, max_chars=1200)

@@ -196,6 +196,64 @@ def test_default_readonly_mounts_include_common_user_tool_roots(monkeypatch, tmp
     assert fake_home / ".local" in config.readonly_mounts
 
 
+def test_default_readonly_mounts_include_codex_bin_symlink_target(
+    monkeypatch,
+    tmp_path,
+):
+    usr_bin = tmp_path / "usr" / "local" / "bin"
+    codex_root = tmp_path / "opt" / "codex"
+    codex_bin = codex_root / "bin" / "codex"
+    usr_bin.mkdir(parents=True)
+    codex_bin.parent.mkdir(parents=True)
+    codex_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+    codex_bin.chmod(0o755)
+    (usr_bin / "codex").symlink_to(codex_bin)
+    monkeypatch.setenv("CODEX_BIN", str(usr_bin / "codex"))
+    monkeypatch.delenv("DRESSAGE_BLACKBOX_READONLY_MOUNTS", raising=False)
+
+    config = LocalSandboxRunnerConfig.from_env()
+
+    assert tmp_path / "usr" / "local" in config.readonly_mounts
+    assert codex_root in config.readonly_mounts
+
+
+def test_default_readonly_mounts_include_claude_code_bin_target(
+    monkeypatch,
+    tmp_path,
+):
+    fake_home = tmp_path / "home"
+    claude_bin = fake_home / ".claude" / "local" / "claude"
+    claude_bin.parent.mkdir(parents=True)
+    claude_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CODE_BIN", str(claude_bin))
+    monkeypatch.delenv("DRESSAGE_BLACKBOX_READONLY_MOUNTS", raising=False)
+
+    config = LocalSandboxRunnerConfig.from_env()
+
+    assert fake_home / ".claude" / "local" in config.readonly_mounts
+
+
+def test_default_readonly_mounts_include_backend_binary_found_on_path(
+    monkeypatch,
+    tmp_path,
+):
+    usr_bin = tmp_path / "usr" / "local" / "bin"
+    codex_root = tmp_path / "opt" / "codex"
+    codex_bin = codex_root / "bin" / "codex"
+    usr_bin.mkdir(parents=True)
+    codex_bin.parent.mkdir(parents=True)
+    codex_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+    codex_bin.chmod(0o755)
+    (usr_bin / "codex").symlink_to(codex_bin)
+    monkeypatch.setenv("PATH", str(usr_bin))
+    monkeypatch.delenv("CODEX_BIN", raising=False)
+    monkeypatch.delenv("DRESSAGE_BLACKBOX_READONLY_MOUNTS", raising=False)
+
+    config = LocalSandboxRunnerConfig.from_env()
+
+    assert codex_root in config.readonly_mounts
+
+
 def test_bubblewrap_readonly_mount_preserves_symlink(tmp_path):
     target = tmp_path / "real"
     target.mkdir()

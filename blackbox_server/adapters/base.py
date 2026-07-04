@@ -224,6 +224,8 @@ class BackendAdapter(ABC):
     ) -> Any:
         if proxy is None:
             return await task
+        if not hasattr(proxy, "wait_for_max_steps_error"):
+            return await task
 
         max_steps_task = asyncio.create_task(proxy.wait_for_max_steps_error())
         try:
