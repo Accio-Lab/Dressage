@@ -1240,7 +1240,7 @@ def test_main_process_exits_cleanly_on_sigint(tmp_path: Path):
     )
     proc = subprocess.Popen(
         [sys.executable, "-m", "blackbox_server.main"],
-        cwd=str(Path(__file__).resolve().parents[1]),
+        cwd=str(Path(__file__).resolve().parents[2]),
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
