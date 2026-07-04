@@ -7,8 +7,8 @@ Dressage, and the standalone `dressage-blackbox-server` package from
 
 Dressage's default dependencies include E2B support, Ray `2.55.1`, and
 transformers `5.3.0`. The current default installer outputs are opencode
-`1.17.4`, OpenClaw `2026.6.6`, Claude Code `2.1.191`, and the latest Codex CLI
-from the official installer.
+`1.17.4`, OpenClaw `2026.6.6`, Claude Code `2.1.191`, and Codex CLI
+`0.142.5`.
 
 ## Build
 
@@ -115,6 +115,11 @@ python -c "import transformers; print(transformers.__version__)"
 python -c "import e2b; print('e2b ok')"
 blackbox-server --help
 ```
+
+The Docker image pins Codex CLI to `0.142.5`.
+
+The canonical blackbox backend entrypoints are all exposed under
+`/usr/local/bin`: `opencode`, `openclaw`, `claude`, and `codex`.
 
 The Codex blackbox backend runs with a sandbox-local `CODEX_HOME` created by
 BlackboxServer. Do not mount host `~/.codex` into blackbox slots; that directory

@@ -241,5 +241,10 @@ def test_docker_scripts_include_codex_binary_env() -> None:
     run_script = (_REPO_ROOT / "docker" / "run.sh").read_text(encoding="utf-8")
 
     assert "CODEX_BIN=/usr/local/bin/codex" in dockerfile
+    assert "ARG CODEX_VERSION=0.142.5" in dockerfile
     assert "chatgpt.com/codex/install.sh" in dockerfile
+    assert '--release "${CODEX_VERSION}"' in dockerfile
+    assert "/usr/local/bin/codex --version | grep -F \"${CODEX_VERSION}\"" in dockerfile
+    assert "npm install --global" not in dockerfile
+    assert "@openai/codex" not in dockerfile
     assert '-e "CODEX_BIN=/usr/local/bin/codex"' in run_script

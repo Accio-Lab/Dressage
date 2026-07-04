@@ -6,6 +6,7 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ARG OPENCODE_VERSION=1.17.4
 ARG OPENCLAW_VERSION=2026.6.6
 ARG CLAUDE_CODE_VERSION=2.1.191
+ARG CODEX_VERSION=0.142.5
 
 ENV DEBIAN_FRONTEND=noninteractive \
     HOME=/root \
@@ -47,16 +48,17 @@ RUN curl -fsSL https://claude.ai/install.sh | bash -s "${CLAUDE_CODE_VERSION}" &
     /usr/local/bin/claude --version && \
     test "$(/usr/local/bin/claude --version | awk '{print $1}')" = "${CLAUDE_CODE_VERSION}"
 
-RUN mkdir -p /opt/codex && \
-    curl -fsSL https://chatgpt.com/codex/install.sh | \
-      CODEX_NON_INTERACTIVE=1 CODEX_HOME=/opt/codex CODEX_INSTALL_DIR=/usr/local/bin sh && \
+RUN curl -fsSL https://chatgpt.com/codex/install.sh | \
+      CODEX_NON_INTERACTIVE=1 CODEX_INSTALL_DIR=/usr/local/bin sh -s -- --release "${CODEX_VERSION}" && \
     codex_resolved="$(command -v codex)" && \
-    codex_target="$(readlink -f "${codex_resolved}")" && \
-    if [[ "${codex_target}" != "${codex_resolved}" ]]; then \
-      cp "${codex_target}" /usr/local/bin/codex-standalone && \
-      ln -sf /usr/local/bin/codex-standalone /usr/local/bin/codex; \
+    codex_real="$(readlink -f "${codex_resolved}")" && \
+    if [[ "${codex_real}" != "/usr/local/bin/codex" || -L /usr/local/bin/codex ]]; then \
+      rm -f /usr/local/bin/codex && \
+      install -m 0755 "${codex_real}" /usr/local/bin/codex; \
     fi && \
-    /usr/local/bin/codex --version
+    test -x /usr/local/bin/codex && \
+    test ! -L /usr/local/bin/codex && \
+    /usr/local/bin/codex --version | grep -F "${CODEX_VERSION}"
 
 WORKDIR /root/Dressage
 COPY . /root/Dressage

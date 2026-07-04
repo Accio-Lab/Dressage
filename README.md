@@ -21,7 +21,7 @@ Dressage lets you train diverse types of LLM agents that use real tools — like
 
 ## 📢 News
 
-- **[2026/07/04]**  Dressage supports [Claude Code](https://github.com/anthropics/claude-code) and [Codex](https://github.com/openai/codex), and you can train multiple agents/harnesses in a single [script](examples/scripts/run_blackbox_qwen3.5_4b_async_local.sh).
+- **[2026/07/04]**  Supports [Claude Code](https://github.com/anthropics/claude-code) and [Codex](https://github.com/openai/codex), and you can train multiple agents in a single [script](https://github.com/huang3eng/Dressage/blob/main/examples/scripts/run_blackbox_qwen3.5_4b_async_local.sh).
 - **[2026/06/30]**  Released [whitebox agent training curves](dressage/recipes/README.md) and [true staleness control](docs/staleness.md).
 - **[2026/06/20]**  **Dressage is now open source!**
 
