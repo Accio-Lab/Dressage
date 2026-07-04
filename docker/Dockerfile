@@ -5,7 +5,7 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 ARG OPENCODE_VERSION=1.17.4
 ARG OPENCLAW_VERSION=2026.6.6
-ARG CLAUDE_CODE_CHANNEL=stable
+ARG CLAUDE_CODE_VERSION=2.1.191
 
 ENV DEBIAN_FRONTEND=noninteractive \
     HOME=/root \
@@ -14,7 +14,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     DRESSAGE_BLACKBOX_BWRAP_BIN=bwrap \
     OPENCODE_BIN=/usr/local/bin/opencode \
     OPENCLAW_BIN=/usr/local/bin/openclaw \
-    CLAUDE_CODE_BIN=/usr/local/bin/claude
+    CLAUDE_CODE_BIN=/usr/local/bin/claude \
+    CODEX_BIN=/usr/local/bin/codex
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -33,7 +34,7 @@ RUN curl -fsSL https://openclaw.ai/install.sh | bash -s -- --version "${OPENCLAW
     ln -sf "${openclaw_resolved}" /usr/local/bin/openclaw && \
     /usr/local/bin/openclaw --version
 
-RUN curl -fsSL https://claude.ai/install.sh | bash -s "${CLAUDE_CODE_CHANNEL}" && \
+RUN curl -fsSL https://claude.ai/install.sh | bash -s "${CLAUDE_CODE_VERSION}" && \
     claude_resolved="$(command -v claude || true)" && \
     if [[ -z "${claude_resolved}" && -x "${HOME}/.local/bin/claude" ]]; then \
       claude_resolved="${HOME}/.local/bin/claude"; \
@@ -43,7 +44,19 @@ RUN curl -fsSL https://claude.ai/install.sh | bash -s "${CLAUDE_CODE_CHANNEL}" &
     fi && \
     test -n "${claude_resolved}" && \
     ln -sf "${claude_resolved}" /usr/local/bin/claude && \
-    /usr/local/bin/claude --version
+    /usr/local/bin/claude --version && \
+    test "$(/usr/local/bin/claude --version | awk '{print $1}')" = "${CLAUDE_CODE_VERSION}"
+
+RUN mkdir -p /opt/codex && \
+    curl -fsSL https://chatgpt.com/codex/install.sh | \
+      CODEX_NON_INTERACTIVE=1 CODEX_HOME=/opt/codex CODEX_INSTALL_DIR=/usr/local/bin sh && \
+    codex_resolved="$(command -v codex)" && \
+    codex_target="$(readlink -f "${codex_resolved}")" && \
+    if [[ "${codex_target}" != "${codex_resolved}" ]]; then \
+      cp "${codex_target}" /usr/local/bin/codex-standalone && \
+      ln -sf /usr/local/bin/codex-standalone /usr/local/bin/codex; \
+    fi && \
+    /usr/local/bin/codex --version
 
 WORKDIR /root/Dressage
 COPY . /root/Dressage

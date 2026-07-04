@@ -40,6 +40,12 @@ def test_claude_code_dynamic_defaults_include_proxy_temperature() -> None:
     assert options["proxy"]["default_temperature"] == 0.7
 
 
+def test_codex_dynamic_defaults_include_proxy_temperature() -> None:
+    options = merge_backend_options("codex", {}, args=_args(0.7))
+
+    assert options["proxy"]["default_temperature"] == 0.7
+
+
 def test_claude_code_static_defaults_include_proxy_model() -> None:
     options = merge_backend_options("claude_code", None)
 
@@ -47,6 +53,19 @@ def test_claude_code_static_defaults_include_proxy_model() -> None:
     assert options["model"]["name"] == "Dressage Proxy"
     assert options["system_prompt_mode"] == "append"
     assert options["gateway"]["auth_token"] == "blackbox-local"
+
+
+def test_codex_static_defaults_include_proxy_model_and_permissions() -> None:
+    options = merge_backend_options("codex", None)
+
+    assert options["model"]["id"] == "proxy-model"
+    assert options["model"]["name"] == "Dressage Proxy"
+    assert options["model_provider_id"] == "dressage_proxy"
+    assert options["sandbox_mode"] == "danger-full-access"
+    assert options["approval_policy"] == "never"
+    assert options["skip_git_repo_check"] is True
+    assert options["ignore_rules"] is True
+    assert options["web_search"] == "disabled"
 
 
 def test_explicit_proxy_temperature_override_wins() -> None:
@@ -156,10 +175,12 @@ def test_blackbox_max_steps_env_is_added_to_proxy_options(monkeypatch) -> None:
     opencode = merge_backend_options("opencode", {}, args=_args())
     openclaw = merge_backend_options("openclaw", {}, args=_args())
     claude_code = merge_backend_options("claude_code", {}, args=_args())
+    codex = merge_backend_options("codex", {}, args=_args())
 
     assert opencode["proxy"]["max_steps"] == 37
     assert openclaw["proxy"]["max_steps"] == 37
     assert claude_code["proxy"]["max_steps"] == 37
+    assert codex["proxy"]["max_steps"] == 37
 
 
 def test_explicit_proxy_max_steps_override_wins(monkeypatch) -> None:
@@ -213,3 +234,12 @@ def test_blackbox_ray_scripts_forward_blackbox_env_in_runtime_env() -> None:
             '"${DRESSAGE_BLACKBOX_COMPACT_THRESHOLD}"'
             in text
         ), f"{path} does not forward compact threshold through Ray runtime_env"
+
+
+def test_docker_scripts_include_codex_binary_env() -> None:
+    dockerfile = (_REPO_ROOT / "docker" / "Dockerfile").read_text(encoding="utf-8")
+    run_script = (_REPO_ROOT / "docker" / "run.sh").read_text(encoding="utf-8")
+
+    assert "CODEX_BIN=/usr/local/bin/codex" in dockerfile
+    assert "chatgpt.com/codex/install.sh" in dockerfile
+    assert '-e "CODEX_BIN=/usr/local/bin/codex"' in run_script

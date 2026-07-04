@@ -3,7 +3,7 @@
 
 **Dressage** is an agentic reinforcement learning training framework built on top of [slime](https://github.com/THUDM/slime). It bridges the gap between policy rollouts, sandboxed tool execution, and training data conversion through a shared proxy and paddock layer.
 
-Dressage lets you train diverse types of LLM agents that use real tools — like code editors, shell commands, file I/O, retrieval APIs — with full RL gradient flow. Both **whitebox** (Python tool loops) and **blackbox** (HTTP agents like `opencode`, `openclaw`, and `claude_code`) paradigms are supported through a unified interface.
+Dressage lets you train diverse types of LLM agents that use real tools — like code editors, shell commands, file I/O, retrieval APIs — with full RL gradient flow. Both **whitebox** (Python tool loops) and **blackbox** (HTTP agents like `opencode`, `openclaw`, `claude_code`, and `codex`) paradigms are supported through a unified interface.
 
 ## Table of Contents
 
@@ -21,6 +21,7 @@ Dressage lets you train diverse types of LLM agents that use real tools — like
 
 ## 📢 News
 
+- **[2026/07/04]**  Dressage supports [Claude Code](https://github.com/anthropics/claude-code) and [Codex](https://github.com/openai/codex), and you can train multiple agents/harnesses in a single [script](examples/scripts/run_blackbox_qwen3.5_4b_async_local.sh).
 - **[2026/06/30]**  Released [whitebox agent training curves](dressage/recipes/README.md) and [true staleness control](docs/staleness.md).
 - **[2026/06/20]**  **Dressage is now open source!**
 
@@ -31,7 +32,7 @@ Dressage introduces several key innovations for agentic RL:
 
 ### Any Agent, Any Sandbox
 
-Dressage separates agent semantics from execution placement. Whitebox Python tool loops, blackbox HTTP agents such as `opencode`, `openclaw`, and `claude_code`, local bubblewrap pools, and remote E2B sandboxes all converge on the same proxy-to-training path.
+Dressage separates agent semantics from execution placement. Whitebox Python tool loops, blackbox HTTP agents such as `opencode`, `openclaw`, `claude_code`, and `codex`, local bubblewrap pools, and remote E2B sandboxes all converge on the same proxy-to-training path.
 
 ### Token-Wise Control
 
@@ -138,7 +139,7 @@ dressage/
 
 blackbox_server/
 ├── api/                   # FastAPI route handlers
-├── adapters/              # Backend adapters (opencode, openclaw, claude_code)
+├── adapters/              # Backend adapters (opencode, openclaw, claude_code, codex)
 ├── core/                  # Server logic, models, monitoring
 ├── proxy/                 # In-process LLM proxy with session headers
 ├── store/                 # In-memory session store
@@ -169,7 +170,7 @@ Two pluggable isolation backends, swapped via a single environment variable. **L
 
 ### [BlackboxServer](docs/blackbox-server.md): Unified HTTP Adapter
 
-Bundled HTTP adapter service that decouples the rollout manager from concrete agentic backends. Sits inside sandboxes, manages exactly one backend agent process and one active session at a time, and transparently proxies all LLM calls back through the Dressage inference proxy. Supports `opencode`, `openclaw`, and `claude_code` through a pluggable adapter pattern. Features turn idempotency, register-and-rebind, and background health monitoring.
+Bundled HTTP adapter service that decouples the rollout manager from concrete agentic backends. Sits inside sandboxes, manages exactly one backend agent process and one active session at a time, and transparently proxies all LLM calls back through the Dressage inference proxy. Supports `opencode`, `openclaw`, `claude_code`, and `codex` through a pluggable adapter pattern. Features turn idempotency, register-and-rebind, and background health monitoring.
 
 ### [Rollout Hooks](docs/rollout.md): Slime Integration
 
@@ -206,7 +207,7 @@ docker/build.sh    # Build the image
 docker/run.sh      # Run with --gpus all --network host --ipc host --privileged
 ```
 
-The image includes bubblewrap, opencode, openclaw, Claude Code, Dressage, and BlackboxServer. `--privileged` is required for bubblewrap inside containers. See [docker/README.md](docker/README.md) for details.
+The image includes bubblewrap, opencode, openclaw, Claude Code, Codex CLI, Dressage, and BlackboxServer. `--privileged` is required for bubblewrap inside containers. See [docker/README.md](docker/README.md) for details.
 
 ## 👥 Team
 
@@ -248,6 +249,7 @@ Contributions are welcome! If you have suggestions for new features, performance
 - When bumping the slime submodule, diff `convert_samples.py` against upstream `slime/ray/rollout.py`
 - TITO currently supports `qwen3_5` only — contributions for additional model templates welcome
 - The `claude_code` adapter runs Claude Code headless through the BlackboxServer Anthropic Messages bridge.
+- The `codex` adapter runs `codex exec --json` with an isolated sandbox-local `CODEX_HOME`, points Codex at the in-process Dressage proxy, and does not mount host `~/.codex` credentials.
 
 ## 🙏 Acknowledgements
 
@@ -262,4 +264,4 @@ Dressage is built by the **Alibaba Accio** team. We gratefully acknowledge:
 
 This project is licensed under the Apache License 2.0 — see the [LICENSE](LICENSE) file for details.
 
-The Docker setup can install `opencode`, `openclaw`, and Claude Code using their public install scripts. Those tools are not source code distributed by this repository; review their upstream licenses before redistribution.
+The Docker setup can install `opencode`, `openclaw`, Claude Code, and Codex CLI using their public install scripts. Those tools are not source code distributed by this repository; review their upstream licenses before redistribution.

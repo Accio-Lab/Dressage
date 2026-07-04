@@ -379,13 +379,17 @@ class RolloutLLMProxy:
     def _is_anthropic_messages(self, method: str, path: str) -> bool:
         return method.upper() == "POST" and f"/{path}".rstrip("/").endswith("/messages")
 
+    def _is_openai_responses(self, method: str, path: str) -> bool:
+        return method.upper() == "POST" and f"/{path}".rstrip("/").endswith("/responses")
+
     async def _handle_proxy(self, request: Request, path: str) -> Response:
         is_chat = self._is_chat_completion(request.method, path)
         is_anthropic = self._is_anthropic_messages(request.method, path)
-        is_model_request = is_chat or is_anthropic
+        is_responses = self._is_openai_responses(request.method, path)
+        is_model_request = is_chat or is_anthropic or is_responses
         upstream_url = (
             self._openai_chat_completions_upstream_url()
-            if is_anthropic
+            if is_anthropic or is_responses
             else self._join_upstream(path, request.url.query)
         )
 
@@ -395,6 +399,7 @@ class RolloutLLMProxy:
         original_stream = False
         original_chat_request: dict[str, Any] | None = None
         original_anthropic_request: dict[str, Any] | None = None
+        original_responses_request: dict[str, Any] | None = None
         parsed_body: Any = None
 
         if body_bytes:
@@ -414,6 +419,11 @@ class RolloutLLMProxy:
                 body_json = self._anthropic_messages_to_openai_chat_completion(original_anthropic_request)
                 original_stream = bool(original_anthropic_request.get("stream", False))
                 is_streaming = original_stream
+            elif is_responses:
+                original_responses_request = dict(parsed_body)
+                body_json = self._openai_responses_to_chat_completion(original_responses_request)
+                original_stream = bool(original_responses_request.get("stream", False))
+                is_streaming = original_stream
             else:
                 body_json = parsed_body
         elif is_model_request and parsed_body is not None:
@@ -423,12 +433,13 @@ class RolloutLLMProxy:
             )
 
         LOGGER.info(
-            "[PROXY REQUEST] %s /%s -> %s (is_chat=%s, is_anthropic=%s, stream=%s)",
+            "[PROXY REQUEST] %s /%s -> %s (is_chat=%s, is_anthropic=%s, is_responses=%s, stream=%s)",
             request.method,
             path,
             upstream_url,
             is_chat,
             is_anthropic,
+            is_responses,
             original_stream,
         )
         LOGGER.info("[PROXY REQUEST] Body content: %s", self._preview_bytes(body_bytes, limit=1000))
@@ -486,7 +497,12 @@ class RolloutLLMProxy:
                 "stream_options" in body_json,
             )
 
-            original_request = original_anthropic_request if is_anthropic else original_chat_request
+            if is_anthropic:
+                original_request = original_anthropic_request
+            elif is_responses:
+                original_request = original_responses_request
+            else:
+                original_request = original_chat_request
             if body_json != original_request:
                 body_bytes = json.dumps(body_json, ensure_ascii=False).encode("utf-8")
                 LOGGER.info("[PROXY REQUEST] Final body size: %d bytes", len(body_bytes))
@@ -525,6 +541,15 @@ class RolloutLLMProxy:
                 headers,
                 snapshot,
             )
+        if is_responses and is_streaming:
+            LOGGER.info("[PROXY REQUEST] Using OpenAI Responses streaming proxy")
+            return await self._stream_openai_responses_proxy(
+                upstream_url,
+                body_bytes,
+                headers,
+                snapshot,
+                original_responses_request or {},
+            )
         if is_anthropic:
             LOGGER.info("[PROXY REQUEST] Using Anthropic plain proxy")
             return await self._plain_anthropic_messages_proxy(
@@ -533,6 +558,16 @@ class RolloutLLMProxy:
                 body_bytes,
                 headers,
                 snapshot,
+            )
+        if is_responses:
+            LOGGER.info("[PROXY REQUEST] Using OpenAI Responses plain proxy")
+            return await self._plain_openai_responses_proxy(
+                request.method,
+                upstream_url,
+                body_bytes,
+                headers,
+                snapshot,
+                original_responses_request or {},
             )
         LOGGER.info("[PROXY REQUEST] Using plain proxy")
         return await self._plain_proxy(
@@ -812,6 +847,76 @@ class RolloutLLMProxy:
             if snapshot is not None and snapshot.scope is not None:
                 await self._mark_request_finished(snapshot.scope)
 
+    async def _plain_openai_responses_proxy(
+        self,
+        method: str,
+        url: str,
+        body: bytes,
+        headers: dict[str, str],
+        snapshot: _TurnSnapshot | None,
+        original_request: dict[str, Any],
+    ) -> Response:
+        assert self._client is not None
+        try:
+            response = await self._send_plain_request(method, url, body, headers)
+            if response.status_code >= 400:
+                self._log_upstream_error(
+                    url=url,
+                    status_code=response.status_code,
+                    response_headers=dict(response.headers),
+                    response_body=response.content,
+                    retried=False,
+                )
+                if snapshot is not None and snapshot.scope is not None:
+                    await self._record_context_overflow_error(
+                        snapshot.scope,
+                        status_code=response.status_code,
+                        response_body=response.content,
+                    )
+                    if await self._record_rollout_invalidated_error(
+                        snapshot.scope,
+                        status_code=response.status_code,
+                        response_body=response.content,
+                    ):
+                        return self._synthetic_openai_response()
+                await self._record_failed_upstream_error(
+                    snapshot,
+                    url=url,
+                    status_code=response.status_code,
+                    request_headers=headers,
+                    request_body=body,
+                    response_headers=dict(response.headers),
+                    response_body=response.content,
+                )
+            response_headers = dict(response.headers)
+            response_headers.pop("content-encoding", None)
+            response_headers.pop("transfer-encoding", None)
+            response_headers.pop("content-length", None)
+            if response.status_code >= 400:
+                return Response(
+                    content=response.content,
+                    status_code=response.status_code,
+                    headers=response_headers,
+                )
+
+            try:
+                payload = response.json()
+            except json.JSONDecodeError:
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            responses_payload = self._chat_completion_to_openai_response(payload, original_request)
+            response_headers["content-type"] = "application/json"
+            return Response(
+                content=json.dumps(responses_payload, ensure_ascii=False).encode("utf-8"),
+                status_code=response.status_code,
+                headers=response_headers,
+                media_type="application/json",
+            )
+        finally:
+            if snapshot is not None and snapshot.scope is not None:
+                await self._mark_request_finished(snapshot.scope)
+
     async def _plain_proxy(
         self,
         method: str,
@@ -1008,6 +1113,85 @@ class RolloutLLMProxy:
         async def _forward():
             try:
                 async for event in self._iter_anthropic_events_from_openai_stream(upstream_response):
+                    yield event
+            finally:
+                await upstream_response.aclose()
+                if snapshot is not None and snapshot.scope is not None:
+                    await self._mark_request_finished(snapshot.scope)
+
+        return StreamingResponse(
+            _forward(),
+            status_code=upstream_response.status_code,
+            media_type="text/event-stream",
+        )
+
+    async def _stream_openai_responses_proxy(
+        self,
+        url: str,
+        body: bytes,
+        headers: dict[str, str],
+        snapshot: _TurnSnapshot | None,
+        original_request: dict[str, Any],
+    ) -> Response:
+        assert self._client is not None
+        try:
+            upstream_response = await self._send_stream_request(url, body, headers)
+        except Exception:
+            if snapshot is not None and snapshot.scope is not None:
+                await self._mark_request_finished(snapshot.scope)
+            raise
+
+        if upstream_response.status_code >= 400:
+            error_body = await upstream_response.aread()
+            response_headers = dict(upstream_response.headers)
+            response_headers.pop("content-encoding", None)
+            response_headers.pop("transfer-encoding", None)
+            response_headers.pop("content-length", None)
+            self._log_upstream_error(
+                url=url,
+                status_code=upstream_response.status_code,
+                response_headers=dict(upstream_response.headers),
+                response_body=error_body,
+                retried=False,
+            )
+            if snapshot is not None and snapshot.scope is not None:
+                await self._record_context_overflow_error(
+                    snapshot.scope,
+                    status_code=upstream_response.status_code,
+                    response_body=error_body,
+                )
+                if await self._record_rollout_invalidated_error(
+                    snapshot.scope,
+                    status_code=upstream_response.status_code,
+                    response_body=error_body,
+                ):
+                    await upstream_response.aclose()
+                    await self._mark_request_finished(snapshot.scope)
+                    return self._synthetic_openai_response_stream_response()
+            await self._record_failed_upstream_error(
+                snapshot,
+                url=url,
+                status_code=upstream_response.status_code,
+                request_headers=headers,
+                request_body=body,
+                response_headers=dict(upstream_response.headers),
+                response_body=error_body,
+            )
+            await upstream_response.aclose()
+            if snapshot is not None and snapshot.scope is not None:
+                await self._mark_request_finished(snapshot.scope)
+            return Response(
+                content=error_body,
+                status_code=upstream_response.status_code,
+                headers=response_headers,
+            )
+
+        async def _forward():
+            try:
+                async for event in self._iter_openai_response_events_from_chat_stream(
+                    upstream_response,
+                    original_request,
+                ):
                     yield event
             finally:
                 await upstream_response.aclose()
@@ -1361,6 +1545,41 @@ class RolloutLLMProxy:
         )
 
     @staticmethod
+    def _synthetic_openai_response() -> Response:
+        payload = {
+            "id": "resp-rollout-invalidated",
+            "object": "response",
+            "status": "completed",
+            "model": "proxy-model",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": ""}],
+                }
+            ],
+            "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        }
+        return Response(
+            content=json.dumps(payload).encode("utf-8"),
+            status_code=200,
+            media_type="application/json",
+        )
+
+    @staticmethod
+    def _synthetic_openai_response_stream_response() -> StreamingResponse:
+        async def _events():
+            async for event in _openai_response_stream_events_for_text(
+                response_id="resp-rollout-invalidated",
+                model="proxy-model",
+                text="",
+                usage={"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            ):
+                yield event
+
+        return StreamingResponse(_events(), status_code=200, media_type="text/event-stream")
+
+    @staticmethod
     def _synthetic_anthropic_message_response() -> Response:
         payload = {
             "id": "msg_rollout_invalidated",
@@ -1408,6 +1627,146 @@ class RolloutLLMProxy:
             yield _anthropic_sse("message_stop", {"type": "message_stop"})
 
         return StreamingResponse(_events(), status_code=200, media_type="text/event-stream")
+
+    def _openai_responses_to_chat_completion(self, payload: dict[str, Any]) -> dict[str, Any]:
+        system_parts: list[str] = []
+        instructions = _openai_responses_content_to_text(payload.get("instructions"))
+        if instructions:
+            system_parts.append(instructions)
+        input_system_parts, messages = _openai_responses_input_to_chat_messages(payload.get("input"))
+        system_parts.extend(input_system_parts)
+        if system_parts:
+            messages.insert(0, {"role": "system", "content": "\n\n".join(system_parts)})
+
+        result: dict[str, Any] = {
+            "model": payload.get("model") or "proxy-model",
+            "messages": messages,
+            "stream": bool(payload.get("stream", False)),
+        }
+        for source, target in (
+            ("max_output_tokens", "max_tokens"),
+            ("temperature", "temperature"),
+            ("top_p", "top_p"),
+            ("parallel_tool_calls", "parallel_tool_calls"),
+        ):
+            if source in payload:
+                result[target] = payload[source]
+        tools = _openai_responses_tools_to_chat_tools(payload.get("tools"))
+        if tools:
+            result["tools"] = tools
+        tool_choice = _openai_responses_tool_choice_to_chat(payload.get("tool_choice"))
+        if tool_choice is not None:
+            result["tool_choice"] = tool_choice
+        return result
+
+    def _chat_completion_to_openai_response(
+        self,
+        payload: dict[str, Any],
+        original_request: dict[str, Any],
+    ) -> dict[str, Any]:
+        choice = _first_openai_choice(payload)
+        message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+        assert isinstance(message, dict)
+        output: list[dict[str, Any]] = []
+        text = _openai_responses_content_to_text(message.get("content"))
+        if text or not isinstance(message.get("tool_calls"), list):
+            output.append(_openai_response_message_item(text))
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list):
+            output.extend(_openai_tool_calls_to_response_items(tool_calls))
+        return {
+            "id": str(payload.get("id") or "resp_proxy"),
+            "object": "response",
+            "status": "completed",
+            "model": str(payload.get("model") or original_request.get("model") or "proxy-model"),
+            "output": output,
+            "usage": _openai_usage_to_response_usage(payload.get("usage")),
+        }
+
+    async def _iter_openai_response_events_from_chat_stream(
+        self,
+        upstream_response: httpx.Response,
+        original_request: dict[str, Any],
+    ):
+        response_id = "resp_proxy_stream"
+        item_id = "msg_proxy_stream"
+        model = str(original_request.get("model") or "proxy-model")
+        text_parts: list[str] = []
+        usage: dict[str, int] | None = None
+
+        yield _openai_response_sse(
+            "response.created",
+            {
+                "type": "response.created",
+                "response": _openai_response_payload(
+                    response_id=response_id,
+                    model=model,
+                    text="",
+                    usage=None,
+                    status="in_progress",
+                    include_output=False,
+                ),
+            },
+        )
+        yield _openai_response_sse(
+            "response.output_item.added",
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": _openai_response_message_item("", status="in_progress", item_id=item_id),
+            },
+        )
+        yield _openai_response_sse(
+            "response.content_part.added",
+            {
+                "type": "response.content_part.added",
+                "item_id": item_id,
+                "output_index": 0,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": ""},
+            },
+        )
+
+        async for payload_text in _iter_openai_sse_payloads(upstream_response):
+            if payload_text == "[DONE]":
+                break
+            try:
+                chunk = json.loads(payload_text)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(chunk, dict):
+                continue
+            if chunk.get("model"):
+                model = str(chunk["model"])
+            if isinstance(chunk.get("usage"), dict):
+                usage = _openai_usage_to_response_usage(chunk.get("usage"))
+            choice = _first_openai_choice(chunk)
+            delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+            assert isinstance(delta, dict)
+            content = delta.get("content")
+            if content:
+                text = str(content)
+                text_parts.append(text)
+                yield _openai_response_sse(
+                    "response.output_text.delta",
+                    {
+                        "type": "response.output_text.delta",
+                        "item_id": item_id,
+                        "output_index": 0,
+                        "content_index": 0,
+                        "delta": text,
+                    },
+                )
+
+        final_text = "".join(text_parts)
+        async for event in _openai_response_stream_completion_events(
+            response_id=response_id,
+            item_id=item_id,
+            model=model,
+            text=final_text,
+            usage=usage or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        ):
+            yield event
 
     def _anthropic_messages_to_openai_chat_completion(self, payload: dict[str, Any]) -> dict[str, Any]:
         system_parts: list[str] = []
@@ -1608,6 +1967,336 @@ class RolloutLLMProxy:
 
 def _anthropic_sse(event: str, payload: dict[str, Any]) -> bytes:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
+
+
+def _openai_response_sse(event: str, payload: dict[str, Any]) -> bytes:
+    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
+
+
+def _openai_responses_content_to_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if not isinstance(item, dict):
+                parts.append(str(item))
+                continue
+            item_type = item.get("type")
+            if item_type in {"input_text", "output_text", "text"} and item.get("text") is not None:
+                parts.append(str(item["text"]))
+            elif item.get("text") is not None:
+                parts.append(str(item["text"]))
+            elif item.get("output") is not None:
+                parts.append(str(item["output"]))
+            else:
+                parts.append(json.dumps(item, ensure_ascii=False))
+        return "\n".join(part for part in parts if part)
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _openai_responses_input_to_chat_messages(value: Any) -> tuple[list[str], list[dict[str, Any]]]:
+    if value is None:
+        return [], []
+    if isinstance(value, str):
+        return [], [{"role": "user", "content": value}]
+    if not isinstance(value, list):
+        return [], [{"role": "user", "content": _openai_responses_content_to_text(value)}]
+
+    system_parts: list[str] = []
+    messages: list[dict[str, Any]] = []
+    for item in value:
+        if isinstance(item, str):
+            messages.append({"role": "user", "content": item})
+            continue
+        if not isinstance(item, dict):
+            messages.append({"role": "user", "content": _openai_responses_content_to_text(item)})
+            continue
+        item_type = item.get("type")
+        if item_type == "function_call":
+            messages.append(_openai_response_function_call_to_chat_message(item))
+        elif item_type == "function_call_output":
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": str(item.get("call_id") or item.get("id") or "call_proxy"),
+                    "content": _openai_responses_content_to_text(item.get("output")),
+                }
+            )
+        elif item_type == "message" or item.get("role") is not None:
+            role = str(item.get("role") or "user").lower()
+            content = _openai_responses_content_to_text(item.get("content"))
+            if role in {"developer", "system"}:
+                if content:
+                    system_parts.append(content)
+                continue
+            if role not in {"user", "assistant", "tool"}:
+                role = "user"
+            messages.append(
+                {
+                    "role": role,
+                    "content": content,
+                }
+            )
+        else:
+            messages.append({"role": "user", "content": json.dumps(item, ensure_ascii=False)})
+    return system_parts, messages
+
+
+def _openai_response_function_call_to_chat_message(item: dict[str, Any]) -> dict[str, Any]:
+    arguments = item.get("arguments")
+    if not isinstance(arguments, str):
+        arguments = json.dumps(arguments or {}, ensure_ascii=False)
+    return {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": str(item.get("call_id") or item.get("id") or "call_proxy"),
+                "type": "function",
+                "function": {
+                    "name": str(item.get("name") or "tool"),
+                    "arguments": arguments,
+                },
+            }
+        ],
+    }
+
+
+def _openai_responses_tools_to_chat_tools(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    tools: list[dict[str, Any]] = []
+    for tool in value:
+        if not isinstance(tool, dict) or tool.get("type") != "function":
+            continue
+        raw_function = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        if not isinstance(raw_function, dict):
+            continue
+        function: dict[str, Any] = {
+            "name": str(raw_function.get("name") or "tool"),
+            "description": str(raw_function.get("description") or ""),
+            "parameters": raw_function.get("parameters") or {"type": "object", "properties": {}},
+        }
+        if "strict" in raw_function:
+            function["strict"] = raw_function["strict"]
+        tools.append({"type": "function", "function": function})
+    return tools
+
+
+def _openai_responses_tool_choice_to_chat(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, dict):
+        return None
+    if value.get("type") == "function":
+        function = value.get("function") if isinstance(value.get("function"), dict) else value
+        if isinstance(function, dict) and function.get("name"):
+            return {"type": "function", "function": {"name": str(function["name"])}}
+    return None
+
+
+def _openai_response_message_item(
+    text: str,
+    *,
+    status: str = "completed",
+    item_id: str = "msg_proxy",
+) -> dict[str, Any]:
+    return {
+        "id": item_id,
+        "type": "message",
+        "status": status,
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": text}],
+    }
+
+
+def _openai_response_payload(
+    *,
+    response_id: str,
+    model: str,
+    text: str,
+    usage: dict[str, int] | None,
+    status: str,
+    item_id: str = "msg_proxy",
+    include_output: bool = True,
+) -> dict[str, Any]:
+    return {
+        "id": response_id,
+        "object": "response",
+        "status": status,
+        "model": model,
+        "output": [_openai_response_message_item(text, status=status, item_id=item_id)]
+        if include_output
+        else [],
+        "usage": usage,
+    }
+
+
+def _openai_tool_calls_to_response_items(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    items: list[dict[str, Any]] = []
+    for index, tool_call in enumerate(value):
+        if not isinstance(tool_call, dict):
+            continue
+        function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+        if not isinstance(function, dict):
+            function = {}
+        call_id = str(tool_call.get("id") or f"call_proxy_{index}")
+        arguments = function.get("arguments")
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments or {}, ensure_ascii=False)
+        items.append(
+            {
+                "type": "function_call",
+                "id": f"fc_{call_id}",
+                "call_id": call_id,
+                "name": str(function.get("name") or "tool"),
+                "arguments": arguments,
+                "status": "completed",
+            }
+        )
+    return items
+
+
+def _openai_usage_to_response_usage(value: Any) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    input_tokens = int(value.get("prompt_tokens", value.get("input_tokens", 0)) or 0)
+    output_tokens = int(value.get("completion_tokens", value.get("output_tokens", 0)) or 0)
+    total_tokens = int(value.get("total_tokens", input_tokens + output_tokens) or 0)
+    if total_tokens <= 0:
+        total_tokens = input_tokens + output_tokens
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+async def _openai_response_stream_events_for_text(
+    *,
+    response_id: str,
+    model: str,
+    text: str,
+    usage: dict[str, int],
+):
+    item_id = "msg_proxy_stream"
+    yield _openai_response_sse(
+        "response.created",
+        {
+            "type": "response.created",
+            "response": _openai_response_payload(
+                response_id=response_id,
+                model=model,
+                text="",
+                usage=None,
+                status="in_progress",
+                item_id=item_id,
+                include_output=False,
+            ),
+        },
+    )
+    yield _openai_response_sse(
+        "response.output_item.added",
+        {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": _openai_response_message_item("", status="in_progress", item_id=item_id),
+            },
+        )
+    yield _openai_response_sse(
+        "response.content_part.added",
+        {
+            "type": "response.content_part.added",
+            "item_id": item_id,
+            "output_index": 0,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": ""},
+        },
+    )
+    if text:
+        yield _openai_response_sse(
+            "response.output_text.delta",
+            {
+                "type": "response.output_text.delta",
+                "item_id": item_id,
+                "output_index": 0,
+                "content_index": 0,
+                "delta": text,
+            },
+        )
+    async for event in _openai_response_stream_completion_events(
+        response_id=response_id,
+        item_id=item_id,
+        model=model,
+        text=text,
+        usage=usage,
+    ):
+        yield event
+
+
+async def _openai_response_stream_completion_events(
+    *,
+    response_id: str,
+    item_id: str,
+    model: str,
+    text: str,
+    usage: dict[str, int],
+):
+    message = _openai_response_message_item(text, item_id=item_id)
+    part = {"type": "output_text", "text": text}
+    yield _openai_response_sse(
+        "response.output_text.done",
+        {
+            "type": "response.output_text.done",
+            "item_id": item_id,
+            "output_index": 0,
+            "content_index": 0,
+            "text": text,
+        },
+    )
+    yield _openai_response_sse(
+        "response.content_part.done",
+        {
+            "type": "response.content_part.done",
+            "item_id": item_id,
+            "output_index": 0,
+            "content_index": 0,
+            "part": part,
+        },
+    )
+    yield _openai_response_sse(
+        "response.output_item.done",
+        {
+            "type": "response.output_item.done",
+            "item_id": item_id,
+            "output_index": 0,
+            "item": message,
+        },
+    )
+    yield _openai_response_sse(
+        "response.completed",
+        {
+            "type": "response.completed",
+            "response": _openai_response_payload(
+                response_id=response_id,
+                model=model,
+                text=text,
+                usage=usage,
+                status="completed",
+                item_id=item_id,
+            ),
+        },
+    )
 
 
 def _anthropic_content_to_text(value: Any) -> str:

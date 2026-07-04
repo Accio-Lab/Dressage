@@ -267,6 +267,29 @@ def claude_code_register_payload(
     }
 
 
+def codex_register_payload(
+    prompt_file: Path,
+    *,
+    bound_session_id: str = "sess-001",
+    bound_instance_id: str = "inst-001",
+) -> dict:
+    return {
+        "blackbox_type": "codex",
+        "router": "127.0.0.1:30000",
+        "router_api_path": "/v1",
+        "bound_session_id": bound_session_id,
+        "bound_instance_id": bound_instance_id,
+        "system_prompt_file": str(prompt_file),
+        "backend_options": {
+            "model": {
+                "id": "proxy-model",
+                "name": "Dressage Proxy",
+            },
+            "proxy": {},
+        },
+    }
+
+
 def test_http_request_and_response_bodies_are_logged(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -347,6 +370,8 @@ def test_status_lists_blackbox_backends_as_implemented(tmp_path: Path):
     assert "openclaw" in data["known_backends"]
     assert "claude_code" in data["implemented_backends"]
     assert "claude_code" in data["known_backends"]
+    assert "codex" in data["implemented_backends"]
+    assert "codex" in data["known_backends"]
 
 
 def test_claude_code_register_uses_prompt_runtime_path(
@@ -385,6 +410,63 @@ def test_claude_code_message_validation_rejects_non_user_message(
     assert response.status_code == 400
     assert response.json()["error"] == "request_error"
     assert "claude_code phase 1 only accepts a user message" in response.json()["message"]
+
+
+def test_codex_register_uses_prompt_runtime_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    prompt_file: Path,
+):
+    client = make_client(tmp_path, monkeypatch, FakeAdapter())
+
+    with client:
+        response = client.post("/v1/rollout/register", json=codex_register_payload(prompt_file))
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["binding"]["blackbox_type"] == "codex"
+    system_prompt = data["binding"]["system_prompt"]
+    assert system_prompt["runtime_file"].endswith("/prompts/system.txt")
+    assert system_prompt["applies_to"] == "codex"
+
+
+def test_codex_message_validation_rejects_non_user_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    prompt_file: Path,
+):
+    client = make_client(tmp_path, monkeypatch, FakeAdapter())
+
+    with client:
+        register_response = client.post("/v1/rollout/register", json=codex_register_payload(prompt_file))
+        assert register_response.status_code == 200
+        response = client.post(
+            "/v1/sessions/sess-001/messages",
+            json={"turn_id": "turn-bad", "messages": [{"role": "assistant", "content": "bad"}]},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "request_error"
+    assert "codex phase 1 only accepts a user message" in response.json()["message"]
+
+
+def test_codex_message_validation_rejects_empty_user_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    prompt_file: Path,
+):
+    client = make_client(tmp_path, monkeypatch, FakeAdapter())
+
+    with client:
+        register_response = client.post("/v1/rollout/register", json=codex_register_payload(prompt_file))
+        assert register_response.status_code == 200
+        response = client.post(
+            "/v1/sessions/sess-001/messages",
+            json={"turn_id": "turn-empty", "messages": [{"role": "user", "content": "  "}]},
+        )
+
+    assert response.status_code == 400
+    assert "codex phase 1 requires non-empty user content" in response.json()["message"]
 
 
 def test_openclaw_register_uses_agents_workspace_prompt_path(

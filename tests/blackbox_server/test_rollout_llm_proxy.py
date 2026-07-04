@@ -45,6 +45,21 @@ def _sse_event(payload: dict[str, Any]) -> bytes:
     return f"data: {json.dumps(payload)}\n\n".encode("utf-8")
 
 
+def _sse_events_from_body(body: bytes) -> list[tuple[str | None, dict[str, Any]]]:
+    events: list[tuple[str | None, dict[str, Any]]] = []
+    for raw_event in body.decode("utf-8").strip().split("\n\n"):
+        event_name: str | None = None
+        data_lines: list[str] = []
+        for line in raw_event.splitlines():
+            if line.startswith("event:"):
+                event_name = line[len("event:") :].strip()
+            elif line.startswith("data:"):
+                data_lines.append(line[len("data:") :].strip())
+        if data_lines:
+            events.append((event_name, json.loads("\n".join(data_lines))))
+    return events
+
+
 def test_rollout_proxy_defaults_to_registered_router_for_anthropic_messages():
     proxy = RolloutLLMProxy(
         upstream_origin="http://127.0.0.1:8800",
@@ -322,6 +337,338 @@ def test_rollout_proxy_matches_any_chat_completion_prefix():
     assert proxy._is_chat_completion("POST", "custom-prefix/chat/completions") is True
     assert proxy._is_chat_completion("GET", "v1/chat/completions") is False
     assert proxy._is_chat_completion("POST", "v1/responses") is False
+    assert proxy._is_openai_responses("POST", "v1/responses") is True
+    assert proxy._is_openai_responses("POST", "custom-prefix/responses") is True
+    assert proxy._is_openai_responses("GET", "v1/responses") is False
+    assert proxy._is_openai_responses("POST", "v1/chat/completions") is False
+
+
+def test_rollout_proxy_bridges_openai_responses_to_chat_completions():
+    proxy = _make_proxy()
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["payload"] = json.loads(request.content.decode("utf-8"))
+        captured["headers"] = dict(request.headers)
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-1",
+                "model": "proxy-model",
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "visible",
+                            "tool_calls": [
+                                {
+                                    "id": "call_2",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "Bash",
+                                        "arguments": "{\"cmd\":\"ls\"}",
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 7, "total_tokens": 12},
+            },
+        )
+
+    async def run_test() -> None:
+        proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await proxy.open_turn("turn-001", backend_session_id="codex-session-1")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.app),
+            base_url="http://proxy",
+        ) as client:
+            response = await client.post(
+                "/v1/responses",
+                json={
+                    "model": "proxy-model",
+                    "instructions": "system prompt",
+                    "input": [
+                        {
+                            "type": "message",
+                            "role": "developer",
+                            "content": [{"type": "input_text", "text": "developer prompt"}],
+                        },
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "hello"}],
+                        },
+                        {
+                            "type": "message",
+                            "role": "system",
+                            "content": [{"type": "input_text", "text": "late system"}],
+                        },
+                        {
+                            "type": "message",
+                            "role": "critic",
+                            "content": [{"type": "input_text", "text": "unknown role text"}],
+                        },
+                        {
+                            "type": "function_call",
+                            "call_id": "call_1",
+                            "name": "Bash",
+                            "arguments": "{\"cmd\":\"pwd\"}",
+                        },
+                        {
+                            "type": "function_call_output",
+                            "call_id": "call_1",
+                            "output": "repo",
+                        },
+                    ],
+                    "max_output_tokens": 128,
+                    "temperature": 0.2,
+                    "top_p": 0.9,
+                    "parallel_tool_calls": False,
+                    "stream": False,
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "Bash",
+                            "description": "run shell commands",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                        {"type": "web_search_preview"},
+                    ],
+                    "tool_choice": {"type": "function", "name": "Bash"},
+                },
+            )
+        await proxy.drain_turn(timeout=1.0)
+        await proxy.clear_turn()
+        await proxy._client.aclose()
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["id"] == "chatcmpl-1"
+        assert body["object"] == "response"
+        assert body["status"] == "completed"
+        assert body["model"] == "proxy-model"
+        assert body["usage"] == {"input_tokens": 5, "output_tokens": 7, "total_tokens": 12}
+        assert body["output"][0]["type"] == "message"
+        assert body["output"][0]["content"] == [{"type": "output_text", "text": "visible"}]
+        assert body["output"][1] == {
+            "type": "function_call",
+            "id": "fc_call_2",
+            "call_id": "call_2",
+            "name": "Bash",
+            "arguments": "{\"cmd\":\"ls\"}",
+            "status": "completed",
+        }
+
+    asyncio.run(run_test())
+
+    assert str(captured["url"]).endswith("/v1/chat/completions")
+    payload = captured["payload"]
+    assert payload == {
+        "model": "proxy-model",
+        "messages": [
+            {"role": "system", "content": "system prompt\n\ndeveloper prompt\n\nlate system"},
+            {"role": "user", "content": "hello"},
+            {"role": "user", "content": "unknown role text"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "Bash", "arguments": "{\"cmd\":\"pwd\"}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "repo"},
+        ],
+        "stream": False,
+        "max_tokens": 128,
+        "temperature": 0.2,
+        "top_p": 0.9,
+        "parallel_tool_calls": False,
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "Bash",
+                    "description": "run shell commands",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+        "tool_choice": {"type": "function", "function": {"name": "Bash"}},
+    }
+    roles = [message["role"] for message in payload["messages"]]
+    assert roles.count("system") == 1
+    assert "developer" not in roles
+    assert set(roles) <= {"system", "user", "assistant", "tool"}
+    headers = captured["headers"]
+    assert headers["x-smg-routing-key"] == "sess-001"
+    assert headers["x-session-id"] == "sess-001"
+    assert headers["x-instance-id"] == "inst-001"
+    assert headers["x-turn-id"] == "turn-001"
+
+
+def test_rollout_proxy_streams_chat_chunks_as_openai_response_events():
+    proxy = _make_proxy()
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["payload"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=MockAsyncByteStream(
+                [
+                    _sse_event(
+                        {
+                            "id": "chatcmpl-stream",
+                            "model": "proxy-model",
+                            "choices": [{"delta": {"content": "hel"}}],
+                        }
+                    ),
+                    _sse_event({"id": "chatcmpl-stream", "choices": [{"delta": {"content": "lo"}}]}),
+                    _sse_event(
+                        {
+                            "id": "chatcmpl-stream",
+                            "choices": [{"delta": {}, "finish_reason": "stop"}],
+                            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+                        }
+                    ),
+                    b"data: [DONE]\n\n",
+                ]
+            ),
+        )
+
+    async def run_test() -> bytes:
+        proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await proxy.open_turn("turn-001", backend_session_id="codex-session-1")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.app),
+            base_url="http://proxy",
+        ) as client:
+            async with client.stream(
+                "POST",
+                "/v1/responses",
+                json={"model": "proxy-model", "input": "hello", "stream": True},
+            ) as response:
+                body = await response.aread()
+        await proxy.drain_turn(timeout=1.0)
+        await proxy.clear_turn()
+        await proxy._client.aclose()
+
+        assert response.status_code == 200
+        return body
+
+    body = asyncio.run(run_test())
+    events = _sse_events_from_body(body)
+    assert [name for name, _ in events] == [
+        "response.created",
+        "response.output_item.added",
+        "response.content_part.added",
+        "response.output_text.delta",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.content_part.done",
+        "response.output_item.done",
+        "response.completed",
+    ]
+    assert events[3][1]["delta"] == "hel"
+    assert events[4][1]["delta"] == "lo"
+    completed = events[-1][1]["response"]
+    assert completed["status"] == "completed"
+    assert completed["output"][0]["content"] == [{"type": "output_text", "text": "hello"}]
+    assert completed["usage"] == {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
+    assert str(captured["url"]).endswith("/v1/chat/completions")
+    assert captured["payload"] == {
+        "model": "proxy-model",
+        "messages": [{"role": "user", "content": "hello"}],
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+
+
+def test_rollout_proxy_rejects_openai_responses_after_max_steps():
+    proxy = _make_proxy(max_steps=1)
+    request_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        return httpx.Response(
+            200,
+            json={
+                "id": f"chatcmpl-{request_count}",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            },
+        )
+
+    async def run_test() -> None:
+        proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await proxy.open_turn("turn-001", backend_session_id="codex-session-1")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.app),
+            base_url="http://proxy",
+        ) as client:
+            first = await client.post(
+                "/v1/responses",
+                json={"model": "proxy-model", "input": "hi", "stream": False},
+            )
+            second = await client.post(
+                "/v1/responses",
+                json={"model": "proxy-model", "input": "again", "stream": False},
+            )
+        await proxy.drain_turn(timeout=1.0)
+        state = proxy.pause_state()
+        await proxy.clear_turn()
+        await proxy._client.aclose()
+
+        assert first.status_code == 200
+        assert second.status_code == 429
+        assert second.json()["error"]["code"] == "max_steps_exceeded"
+        assert request_count == 1
+        assert state["http_inflight_requests"] == 0
+
+    asyncio.run(run_test())
+
+
+def test_rollout_proxy_records_failed_upstream_for_openai_responses():
+    proxy = _make_proxy()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, headers={"content-type": "text/plain"}, content=b"boom")
+
+    async def run_test() -> tuple[httpx.Response, dict[str, Any] | None]:
+        proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await proxy.open_turn("turn-001", backend_session_id="codex-session-1")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.app),
+            base_url="http://proxy",
+        ) as client:
+            response = await client.post(
+                "/v1/responses",
+                json={"model": "proxy-model", "input": "hi", "stream": False},
+            )
+        await proxy.drain_turn(timeout=1.0)
+        payload = await proxy.consume_failed_upstream_error()
+        await proxy.clear_turn()
+        await proxy._client.aclose()
+        return response, payload
+
+    response, payload = asyncio.run(run_test())
+
+    assert response.status_code == 500
+    assert response.text == "boom"
+    assert payload is not None
+    assert payload["status_code"] == 500
+    assert payload["message"] == "Upstream returned HTTP 500: boom"
+    assert str(payload["upstream_url"]).endswith("/v1/chat/completions")
 
 
 def test_rollout_proxy_preserves_stream_options_without_logprob_injection():

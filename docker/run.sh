@@ -24,6 +24,7 @@ env_args=(
   -e "OPENCODE_BIN=/usr/local/bin/opencode"
   -e "OPENCLAW_BIN=/usr/local/bin/openclaw"
   -e "CLAUDE_CODE_BIN=/usr/local/bin/claude"
+  -e "CODEX_BIN=/usr/local/bin/codex"
 )
 
 if [[ -d "${HOST_CHECKPOINT_DIR}" ]]; then

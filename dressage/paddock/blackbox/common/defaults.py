@@ -71,16 +71,31 @@ _CLAUDE_CODE_STATIC_BACKEND_DEFAULTS: dict[str, Any] = {
     },
 }
 
+_CODEX_STATIC_BACKEND_DEFAULTS: dict[str, Any] = {
+    "model": {
+        "id": "proxy-model",
+        "name": "Dressage Proxy",
+    },
+    "model_provider_id": "dressage_proxy",
+    "sandbox_mode": "danger-full-access",
+    "approval_policy": "never",
+    "skip_git_repo_check": True,
+    "ignore_rules": True,
+    "web_search": "disabled",
+}
+
 _KNOWN_BACKEND_DEFAULTS: dict[str, dict[str, Any]] = {
     "opencode": _OPENCODE_STATIC_BACKEND_DEFAULTS,
     "openclaw": _OPENCLAW_STATIC_BACKEND_DEFAULTS,
     "claude_code": _CLAUDE_CODE_STATIC_BACKEND_DEFAULTS,
+    "codex": _CODEX_STATIC_BACKEND_DEFAULTS,
 }
 
 _DYNAMIC_BACKEND_KEYS: dict[str, tuple[str, ...]] = {
     "opencode": ("model_limit", "compaction", "proxy"),
     "openclaw": ("context_window", "max_tokens", "request", "compaction", "proxy"),
     "claude_code": ("compaction", "proxy"),
+    "codex": ("proxy",),
 }
 
 
@@ -109,6 +124,13 @@ def backend_defaults_for(blackbox_type: Any, args: Any | None = None) -> dict[st
 def dynamic_backend_defaults_for(blackbox_type: Any, args: Any) -> dict[str, Any]:
     """Return rollout-argument-derived backend defaults."""
     backend = normalize_blackbox_type(blackbox_type)
+    if backend == "codex":
+        return {
+            "proxy": {
+                "default_temperature": _rollout_temperature_arg(args),
+            },
+        }
+
     limits = _dynamic_token_defaults(args, backend)
 
     if backend == "opencode":
