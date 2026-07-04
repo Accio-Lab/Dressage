@@ -150,11 +150,11 @@ bash examples/scripts/run_hotpotqa_whitebox_agent_qwen3.5_4b.sh
 
 ### Blackbox — HTTP Agent Rollouts
 
-**Best for**: real-world coding agents, complex environments, production agent frameworks like opencode/openclaw.
+**Best for**: real-world coding agents, complex environments, production agent frameworks like opencode/openclaw/claude_code.
 
 ```text
 BlackboxServer (in sandbox)
-  └── Backend Agent (opencode/openclaw)
+  └── Backend Agent (opencode/openclaw/claude_code)
       └── Agent's LLM calls → In-process Proxy → Dressage Proxy → SGLang
       └── Agent's tools → execution inside sandbox
 ```
@@ -233,7 +233,7 @@ docker/run.sh
 ```
 
 > [!NOTE]
-> `--privileged` is required for bubblewrap inside Docker containers. The image includes bubblewrap, opencode, openclaw, Dressage, BlackboxServer, and all dependencies. See [docker/README.md](../docker/README.md) for details.
+> `--privileged` is required for bubblewrap inside Docker containers. The image includes bubblewrap, opencode, openclaw, Claude Code, Dressage, BlackboxServer, and all dependencies. See [docker/README.md](../docker/README.md) for details.
 
 ## ⚙️ Configuration Reference
 
@@ -303,7 +303,7 @@ All Dressage configuration is via environment variables. Here's the complete ref
 
  | Variable | Values | Default | Description |
  | :--------- | :------- | :-------- | :------------ |
- | `DRESSAGE_BLACKBOX_TYPE` | `opencode` \| `openclaw` | `opencode` | Backend agent type. |
+ | `DRESSAGE_BLACKBOX_TYPE` | `opencode` \| `openclaw` \| `claude_code` | `opencode` | Backend agent type. |
  | `DRESSAGE_BLACKBOX_MAX_STEPS` | int | — | Positive int forwarded to `backend_options.proxy.max_steps`; set `0` to disable the backend proxy step limit. |
  | `DRESSAGE_BLACKBOX_COMPACT_THRESHOLD` | int | — | Positive value no greater than the context window; controls backend compaction reserve sizing. |
  | `BBS_HOST` | host | `0.0.0.0` | BlackboxServer bind host. |
@@ -317,6 +317,7 @@ All Dressage configuration is via environment variables. Here's the complete ref
  | `BBS_RUNTIME_HEALTH_CHECK_RETRY_DELAY` | float | `0.5` | Delay between runtime health-check retries. |
  | `OPENCODE_BIN` | path | `opencode` | Path to the opencode binary. |
  | `OPENCLAW_BIN` | path | `openclaw` | Path to the openclaw binary. |
+ | `CLAUDE_CODE_BIN` | path | `claude` | Path to the Claude Code binary. |
 
 </details>
 
@@ -454,7 +455,7 @@ Common issues and their solutions:
  | **Proxy connection refused** | `ConnectionRefusedError` on chat completions | Check `DRESSAGE_PROXY_URL` and ensure the proxy server is running (`dressage-proxy`). |
  | **Bwrap slot unavailable** | Rollout hangs waiting for sandbox | Run `dressage-local-bwrap-status` to check pool health. Ensure enough slots are provisioned. |
  | **Mode mismatch error** | `ValueError` at startup about paddock/pool mode | Ensure `DRESSAGE_PADDOCK_MODE` matches `DRESSAGE_LOCAL_BWRAP_POOL_MODE` (blackbox↔blackbox, whitebox↔command_only). |
- | **Backend not found** | `FileNotFoundError` for opencode/openclaw binary | Set `OPENCODE_BIN` or `OPENCLAW_BIN` to the full path of the binary. |
+ | **Backend not found** | `FileNotFoundError` for opencode/openclaw/claude binary | Set `OPENCODE_BIN`, `OPENCLAW_BIN`, or `CLAUDE_CODE_BIN` to the full path of the binary. |
  | **TITO failure** | Warning about `concat_incremental_tokenization_failed` | Check model compatibility — TITO currently supports `qwen3_5` only. Failure triggers safe segment boundary. |
  | **Pause timeout** | `TimeoutError` during weight update | Increase `DRESSAGE_PROXY_PAUSE_TIMEOUT_SEC`. Default 300s may not be enough for large batches. |
  | **Session desync** | BlackboxServer reports `desynced` state | Agent process may have crashed. Check sandbox logs. Session will be aborted and retried automatically. |

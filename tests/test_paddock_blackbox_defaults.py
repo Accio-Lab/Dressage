@@ -34,6 +34,21 @@ def test_openclaw_dynamic_defaults_include_proxy_temperature() -> None:
     assert options["proxy"]["default_temperature"] == 0.7
 
 
+def test_claude_code_dynamic_defaults_include_proxy_temperature() -> None:
+    options = merge_backend_options("claude_code", {}, args=_args(0.7))
+
+    assert options["proxy"]["default_temperature"] == 0.7
+
+
+def test_claude_code_static_defaults_include_proxy_model() -> None:
+    options = merge_backend_options("claude_code", None)
+
+    assert options["model"]["id"] == "proxy-model"
+    assert options["model"]["name"] == "Dressage Proxy"
+    assert options["system_prompt_mode"] == "append"
+    assert options["gateway"]["auth_token"] == "blackbox-local"
+
+
 def test_explicit_proxy_temperature_override_wins() -> None:
     options = merge_backend_options(
         "opencode",
@@ -77,6 +92,15 @@ def test_openclaw_explicit_compact_threshold_sets_reserve_tokens(monkeypatch) ->
     assert options["compaction"]["reserve_tokens_floor"] == 6
 
 
+def test_claude_code_explicit_compact_threshold_sets_auto_compact_pct(monkeypatch) -> None:
+    monkeypatch.setenv("DRESSAGE_BLACKBOX_COMPACT_THRESHOLD", "10")
+
+    options = merge_backend_options("claude_code", {}, args=_args())
+
+    assert options["compaction"]["auto"] is True
+    assert options["compaction"]["auto_compact_pct_override"] == 62
+
+
 def test_opencode_compact_threshold_rejects_value_over_context(monkeypatch) -> None:
     monkeypatch.setenv("DRESSAGE_BLACKBOX_COMPACT_THRESHOLD", "17")
 
@@ -94,6 +118,18 @@ def test_openclaw_compact_threshold_rejects_value_over_context(monkeypatch) -> N
 
     try:
         merge_backend_options("openclaw", {}, args=_args())
+    except ValueError as exc:
+        assert "DRESSAGE_BLACKBOX_COMPACT_THRESHOLD" in str(exc)
+        assert "context window (16)" in str(exc)
+    else:
+        raise AssertionError("compact threshold above context should be rejected")
+
+
+def test_claude_code_compact_threshold_rejects_value_over_context(monkeypatch) -> None:
+    monkeypatch.setenv("DRESSAGE_BLACKBOX_COMPACT_THRESHOLD", "17")
+
+    try:
+        merge_backend_options("claude_code", {}, args=_args())
     except ValueError as exc:
         assert "DRESSAGE_BLACKBOX_COMPACT_THRESHOLD" in str(exc)
         assert "context window (16)" in str(exc)
@@ -119,9 +155,11 @@ def test_blackbox_max_steps_env_is_added_to_proxy_options(monkeypatch) -> None:
 
     opencode = merge_backend_options("opencode", {}, args=_args())
     openclaw = merge_backend_options("openclaw", {}, args=_args())
+    claude_code = merge_backend_options("claude_code", {}, args=_args())
 
     assert opencode["proxy"]["max_steps"] == 37
     assert openclaw["proxy"]["max_steps"] == 37
+    assert claude_code["proxy"]["max_steps"] == 37
 
 
 def test_explicit_proxy_max_steps_override_wins(monkeypatch) -> None:

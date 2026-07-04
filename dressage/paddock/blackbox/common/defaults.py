@@ -37,14 +37,50 @@ _OPENCLAW_STATIC_BACKEND_DEFAULTS: dict[str, Any] = {
     "api_key": "sglang-local",
 }
 
+_CLAUDE_CODE_STATIC_BACKEND_DEFAULTS: dict[str, Any] = {
+    "model": {
+        "id": "proxy-model",
+        "name": "Dressage Proxy",
+        "supported_capabilities": [
+            "thinking",
+            "adaptive_thinking",
+            "interleaved_thinking",
+        ],
+    },
+    "max_turns": 20,
+    "permission_mode": "default",
+    "setting_sources": "user",
+    "system_prompt_mode": "append",
+    "gateway": {
+        "auth_token": "blackbox-local",
+    },
+    "thinking": {
+        "enabled": True,
+        "interleaved": True,
+        "budget_tokens": None,
+    },
+    "compaction": {
+        "auto": True,
+    },
+    "compat": {
+        "disable_prompt_caching": True,
+        "disable_nonessential_traffic": True,
+    },
+    "subagents": {
+        "enabled": False,
+    },
+}
+
 _KNOWN_BACKEND_DEFAULTS: dict[str, dict[str, Any]] = {
     "opencode": _OPENCODE_STATIC_BACKEND_DEFAULTS,
     "openclaw": _OPENCLAW_STATIC_BACKEND_DEFAULTS,
+    "claude_code": _CLAUDE_CODE_STATIC_BACKEND_DEFAULTS,
 }
 
 _DYNAMIC_BACKEND_KEYS: dict[str, tuple[str, ...]] = {
     "opencode": ("model_limit", "compaction", "proxy"),
     "openclaw": ("context_window", "max_tokens", "request", "compaction", "proxy"),
+    "claude_code": ("compaction", "proxy"),
 }
 
 
@@ -105,6 +141,21 @@ def dynamic_backend_defaults_for(blackbox_type: Any, args: Any) -> dict[str, Any
                 "reserve_tokens": limits["reserved"],
                 "reserve_tokens_floor": limits["reserved"],
             },
+        }
+
+    if backend == "claude_code":
+        compaction: dict[str, Any] = {"auto": True}
+        compact_threshold = _compact_threshold(limits["context"], backend)
+        if compact_threshold is not None:
+            compaction["auto_compact_pct_override"] = max(
+                1,
+                min(100, int(compact_threshold * 100 / limits["context"])),
+            )
+        return {
+            "proxy": {
+                "default_temperature": _rollout_temperature_arg(args),
+            },
+            "compaction": compaction,
         }
 
     return {}
@@ -217,7 +268,7 @@ def _dynamic_token_defaults(args: Any, backend: str) -> dict[str, int]:
 
 
 def _compact_threshold(context: int, backend: str) -> int | None:
-    if backend not in {"opencode", "openclaw"}:
+    if backend not in {"opencode", "openclaw", "claude_code"}:
         return None
 
     raw_value = os.environ.get(BLACKBOX_COMPACT_THRESHOLD_ENV)

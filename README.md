@@ -3,7 +3,7 @@
 
 **Dressage** is an agentic reinforcement learning training framework built on top of [slime](https://github.com/THUDM/slime). It bridges the gap between policy rollouts, sandboxed tool execution, and training data conversion through a shared proxy and paddock layer.
 
-Dressage lets you train diverse types of LLM agents that use real tools — like code editors, shell commands, file I/O, retrieval APIs — with full RL gradient flow. Both **whitebox** (Python tool loops) and **blackbox** (HTTP agents like `opencode` / `openclaw`) paradigms are supported through a unified interface.
+Dressage lets you train diverse types of LLM agents that use real tools — like code editors, shell commands, file I/O, retrieval APIs — with full RL gradient flow. Both **whitebox** (Python tool loops) and **blackbox** (HTTP agents like `opencode`, `openclaw`, and `claude_code`) paradigms are supported through a unified interface.
 
 ## Table of Contents
 
@@ -31,7 +31,7 @@ Dressage introduces several key innovations for agentic RL:
 
 ### Any Agent, Any Sandbox
 
-Dressage separates agent semantics from execution placement. Whitebox Python tool loops, blackbox HTTP agents such as `opencode` / `openclaw`, local bubblewrap pools, and remote E2B sandboxes all converge on the same proxy-to-training path.
+Dressage separates agent semantics from execution placement. Whitebox Python tool loops, blackbox HTTP agents such as `opencode`, `openclaw`, and `claude_code`, local bubblewrap pools, and remote E2B sandboxes all converge on the same proxy-to-training path.
 
 ### Token-Wise Control
 
@@ -169,7 +169,7 @@ Two pluggable isolation backends, swapped via a single environment variable. **L
 
 ### [BlackboxServer](docs/blackbox-server.md): Unified HTTP Adapter
 
-Bundled HTTP adapter service that decouples the rollout manager from concrete agentic backends. Sits inside sandboxes, manages exactly one backend agent process and one active session at a time, and transparently proxies all LLM calls back through the Dressage inference proxy. Supports `opencode`, `openclaw`, and future backends through a pluggable adapter pattern. Features turn idempotency, register-and-rebind, and background health monitoring.
+Bundled HTTP adapter service that decouples the rollout manager from concrete agentic backends. Sits inside sandboxes, manages exactly one backend agent process and one active session at a time, and transparently proxies all LLM calls back through the Dressage inference proxy. Supports `opencode`, `openclaw`, and `claude_code` through a pluggable adapter pattern. Features turn idempotency, register-and-rebind, and background health monitoring.
 
 ### [Rollout Hooks](docs/rollout.md): Slime Integration
 
@@ -206,7 +206,7 @@ docker/build.sh    # Build the image
 docker/run.sh      # Run with --gpus all --network host --ipc host --privileged
 ```
 
-The image includes bubblewrap, opencode, openclaw, Dressage, and BlackboxServer. `--privileged` is required for bubblewrap inside containers. See [docker/README.md](docker/README.md) for details.
+The image includes bubblewrap, opencode, openclaw, Claude Code, Dressage, and BlackboxServer. `--privileged` is required for bubblewrap inside containers. See [docker/README.md](docker/README.md) for details.
 
 ## 👥 Team
 
@@ -247,7 +247,7 @@ Contributions are welcome! If you have suggestions for new features, performance
 **Development notes:**
 - When bumping the slime submodule, diff `convert_samples.py` against upstream `slime/ray/rollout.py`
 - TITO currently supports `qwen3_5` only — contributions for additional model templates welcome
-- The `claude_code` adapter is reserved (501) — contributions welcome
+- The `claude_code` adapter runs Claude Code headless through the BlackboxServer Anthropic Messages bridge.
 
 ## 🙏 Acknowledgements
 
@@ -262,4 +262,4 @@ Dressage is built by the **Alibaba Accio** team. We gratefully acknowledge:
 
 This project is licensed under the Apache License 2.0 — see the [LICENSE](LICENSE) file for details.
 
-The Docker setup can install `opencode` and `openclaw` using their public install scripts. Those tools are not source code distributed by this repository; review their upstream licenses before redistribution.
+The Docker setup can install `opencode`, `openclaw`, and Claude Code using their public install scripts. Those tools are not source code distributed by this repository; review their upstream licenses before redistribution.

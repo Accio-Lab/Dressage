@@ -683,6 +683,8 @@ class OpencodeAdapter(BackendAdapter):
     async def _raise_if_proxy_context_overflow(self) -> None:
         if self._proxy is None:
             return
+        if not hasattr(self._proxy, "consume_context_overflow_error"):
+            return
         payload = await self._proxy.consume_context_overflow_error()
         typed_error = backend_context_overflow_from_proxy_payload(payload)
         if typed_error is not None:
@@ -690,6 +692,8 @@ class OpencodeAdapter(BackendAdapter):
 
     async def _raise_if_proxy_rollout_invalidated(self) -> None:
         if self._proxy is None:
+            return
+        if not hasattr(self._proxy, "consume_rollout_invalidated_error"):
             return
         payload = await self._proxy.consume_rollout_invalidated_error()
         if payload is None:

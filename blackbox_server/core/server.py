@@ -1037,7 +1037,7 @@ class BlackboxServer:
             raise ApiError(400, "request_error", "Current backend accepts exactly one input message.")
         if (
             self._binding_context is not None
-            and self._binding_context.binding.blackbox_type in {"opencode", "openclaw"}
+            and self._binding_context.binding.blackbox_type in {"opencode", "openclaw", "claude_code"}
         ):
             backend = self._binding_context.binding.blackbox_type
             only_message = messages[0]

@@ -23,6 +23,7 @@ env_args=(
   -e "DRESSAGE_BLACKBOX_BWRAP_BIN=bwrap"
   -e "OPENCODE_BIN=/usr/local/bin/opencode"
   -e "OPENCLAW_BIN=/usr/local/bin/openclaw"
+  -e "CLAUDE_CODE_BIN=/usr/local/bin/claude"
 )
 
 if [[ -d "${HOST_CHECKPOINT_DIR}" ]]; then

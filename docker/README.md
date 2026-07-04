@@ -1,13 +1,13 @@
 # Dressage Docker
 
 This directory builds a local and remote blackbox environment on top of
-`slimerl/slime:nightly-dev-20260430b`. The image installs bubblewrap, opencode, openclaw,
+`slimerl/slime:nightly-dev-20260430b`. The image installs bubblewrap, opencode, openclaw, Claude Code,
 Dressage, and the standalone `dressage-blackbox-server` package from
 `blackbox_server/`.
 
 Dressage's default dependencies include E2B support, Ray `2.55.1`, and
 transformers `5.3.0`. The current default installer outputs are opencode
-`1.17.4` and OpenClaw `2026.6.6`.
+`1.17.4`, OpenClaw `2026.6.6`, and Claude Code from the `stable` channel.
 
 ## Build
 
@@ -71,6 +71,7 @@ Inside the container:
 bwrap --version
 opencode --version
 openclaw --version
+claude --version
 python -c "import ray; print(ray.__version__)"
 python -c "import transformers; print(transformers.__version__)"
 python -c "import e2b; print('e2b ok')"
