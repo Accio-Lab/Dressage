@@ -112,6 +112,36 @@ def test_blackbox_async_scripts_record_token_versions_for_staleness():
         assert "--record-token-versions" in source
 
 
+def test_ray_job_scripts_forward_harbor_env_without_overriding_write_mode() -> None:
+    defaults_source = Path(
+        "examples/scripts/default/dressage_env_defaults.sh"
+    ).read_text()
+    assert (
+        'DRESSAGE_HARBOR_ATIF_EXPORT="${DRESSAGE_HARBOR_ATIF_EXPORT:-0}"'
+        in defaults_source
+    )
+    assert "export DRESSAGE_HARBOR_ATIF_EXPORT" in defaults_source
+    assert "DRESSAGE_LOG_WRITE_MODE" not in defaults_source
+
+    script_paths = sorted(Path("examples/scripts").rglob("*.sh"))
+    ray_job_scripts = [
+        path
+        for path in script_paths
+        if '--runtime-env-json="${RUNTIME_ENV_JSON}"' in path.read_text()
+    ]
+
+    assert len(ray_job_scripts) == 11
+    for path in ray_job_scripts:
+        source = path.read_text()
+        assert (
+            '"DRESSAGE_HARBOR_ATIF_EXPORT": "${DRESSAGE_HARBOR_ATIF_EXPORT:-0}"'
+            in source
+        ), f"{path} does not forward the Harbor export flag through Ray runtime_env"
+        assert "DRESSAGE_LOG_WRITE_MODE" not in source, (
+            f"{path} should use the writer's default background mode"
+        )
+
+
 def test_train_async_entrypoint_uses_slime_common_parser():
     source = Path("dressage/training/train_async_with_rollout_pause.py").read_text()
 
