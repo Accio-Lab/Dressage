@@ -293,28 +293,6 @@ All Dressage configuration is via environment variables. Here's the complete ref
 </details>
 
 <details>
-<summary><b> Rollout Artifacts & Harbor</b></summary>
-<br>
-
- | Variable | Values | Default | Description |
- | :--------- | :------- | :-------- | :------------ |
- | `DRESSAGE_HARBOR_ATIF_EXPORT` | `0` \| `1` | `0` | Also export each saved trajectory in Harbor ATIF-v1.7 format. Truthy aliases are `true`, `yes`, and `on`. |
-
-When enabled, Dressage keeps the existing raw payload at
-`<DRESSAGE_TRAJECTORY_PAYLOAD_LOG_DIR>/<instance_id>/<session_id>/session.json`
-and additionally writes the converted trajectory to
-`<DRESSAGE_TRAJECTORY_PAYLOAD_LOG_DIR>/<instance_id>/<session_id>/harbor/trajectory.json`.
-The export uses the artifact writer's existing write mode and is best effort: a
-conversion or Harbor write failure is logged without failing the rollout.
-
-```bash
-export DRESSAGE_HARBOR_ATIF_EXPORT=1
-bash examples/scripts/run_blackbox_qwen3.5_4b_async_remote.sh
-```
-
-</details>
-
-<details>
 <summary><b> Partial Rollout</b></summary>
 <br>
 
