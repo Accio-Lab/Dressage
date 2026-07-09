@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -20,9 +21,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from transformers import AutoTokenizer
 
 from dressage.config import (
-    DEFAULT_TRAJECTORY_BUILD_MODEL,
+    DEFAULT_TOKEN_BUILD_MODEL,
     sglang_router_url as default_sglang_router_url,
-    trajectory_build_defaults,
+    token_build_defaults,
 )
 
 from .generation_controller import (
@@ -36,7 +37,7 @@ from .last_step import (
     create_default_mask_template_registry,
 )
 from .reasoning_parser import ProxyReasoningParser, canonicalize_reasoning_content
-from .session_manager import Session, SessionFinalizedError, SessionManager
+from .session_manager import Route, Session, SessionFinalizedError, SessionManager, StepRecord
 from .sglang_client import SGLangRouterClient
 from .tool_call_parser import (
     ModelToolCallParserRegistry,
@@ -52,6 +53,8 @@ logger = logging.getLogger(__name__)
 _INPUT_TOKEN_VERSION = "-1"
 _DEFAULT_TOOL_CALL_PARSER = object()
 _NON_REAL_TOKEN_VERSIONS = {"", "-1", "unknown", "none"}
+TokenBuildMode = Literal["tito", "snapshot"]
+SegmentView = Literal["lineage", "timeline"]
 
 
 def _canonical_json(value: Any) -> str:
@@ -300,6 +303,17 @@ def _tools_changed(
     ) != _canonicalize_tools(current_tools, none_equals_empty=none_equals_empty)
 
 
+def _tools_hash(
+    tools: list[dict[str, Any]] | None,
+    *,
+    none_equals_empty: bool,
+) -> str:
+    canonical = _canonicalize_tools(tools, none_equals_empty=none_equals_empty)
+    if canonical is None:
+        canonical = "null"
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _boundary_reasons(
     *,
     rewrite_detected: bool,
@@ -453,6 +467,61 @@ def _split_session_into_segments(session: Session) -> list[dict[str, Any]]:
     return segments
 
 
+def _split_session_into_lineage_segments(session: Session) -> list[dict[str, Any]]:
+    segments: list[dict[str, Any]] = []
+    sorted_lineages = sorted(session.lineages.values(), key=lambda item: item.index)
+    for lineage in sorted_lineages:
+        lineage_steps = [
+            step for step in session.steps if step.lineage_id == lineage.id
+        ]
+        current_steps: list[StepRecord] = []
+        current_segment_reasons: list[str] = ["initial"]
+
+        def flush_segment() -> None:
+            nonlocal current_steps, current_segment_reasons
+            if not current_steps:
+                return
+            segments.append(
+                {
+                    "steps": current_steps,
+                    "segment_reason": current_segment_reasons[0],
+                    "segment_reasons": list(current_segment_reasons),
+                    "turn_ids": _ordered_turn_ids(current_steps),
+                    "lineage_id": lineage.id,
+                    "lineage_index": lineage.index,
+                    "branch_from_step_id": lineage.branch_from_step_id,
+                }
+            )
+            current_steps = []
+            current_segment_reasons = ["initial"]
+
+        for step in lineage_steps:
+            if step.lineage_segment_boundary_before and current_steps:
+                flush_segment()
+                current_segment_reasons = list(
+                    step.lineage_segment_reasons_before or ["initial"]
+                )
+            current_steps.append(step)
+        flush_segment()
+    return segments
+
+
+def _split_session_into_timeline_segments(session: Session) -> list[dict[str, Any]]:
+    return [
+        {
+            "steps": [step],
+            "segment_reason": step.segment_reason_before or "initial",
+            "segment_reasons": list(step.segment_reasons_before or ["initial"]),
+            "turn_ids": [step.turn_id],
+            "lineage_id": step.lineage_id,
+            "lineage_index": step.lineage_index,
+            "route_type": step.route_type,
+            "route_base_step_id": step.route_base_step_id,
+        }
+        for step in session.steps
+    ]
+
+
 def create_app(
     *,
     sglang_router_url: str | None = None,
@@ -470,8 +539,8 @@ def create_app(
     model_mask_type: str | None = None,
     default_max_tokens: int = 4096,
     api_key: str = "no-auth",
-    trajectory_build_mode: Literal["last_step", "concat"] = "concat",
-    trajectory_build_model: str = DEFAULT_TRAJECTORY_BUILD_MODEL,
+    token_build_mode: TokenBuildMode = "tito",
+    token_build_model: str = DEFAULT_TOKEN_BUILD_MODEL,
     tito_model: str | None = None,
     record_token_versions: bool = False,
     mask_nonlast_version_tokens: bool = False,
@@ -488,10 +557,10 @@ def create_app(
         raise ValueError("context_window must be greater than 0 when provided")
     if max_partial_rollout_preempts is not None and max_partial_rollout_preempts < 0:
         raise ValueError("max_partial_rollout_preempts must be greater than or equal to 0")
-    if trajectory_build_mode not in {"last_step", "concat"}:
+    if token_build_mode not in {"snapshot", "tito"}:
         raise ValueError(
-            "trajectory_build_mode must be 'last_step' or 'concat', "
-            f"got {trajectory_build_mode!r}"
+            "token_build_mode must be 'snapshot' or 'tito', "
+            f"got {token_build_mode!r}"
         )
     if tool_call_parse_backend not in {"local", "sglang_api", "hybrid"}:
         raise ValueError(
@@ -513,9 +582,9 @@ def create_app(
             f"got {model_reasoning_type!r}"
         )
 
-    build_defaults = trajectory_build_defaults(
-        trajectory_build_mode=trajectory_build_mode,
-        trajectory_build_model=trajectory_build_model,
+    build_defaults = token_build_defaults(
+        token_build_mode=token_build_mode,
+        token_build_model=token_build_model,
     )
     if model_mask_type is None:
         model_mask_type = build_defaults.model_mask_type
@@ -554,9 +623,9 @@ def create_app(
     )
     tito_tokenizer = None
     effective_model_mask_type = model_mask_type
-    if trajectory_build_mode == "concat":
+    if token_build_mode == "tito":
         if tito_model is None:
-            raise ValueError("concat mode requires tito_model='qwen3_5'")
+            raise ValueError("tito mode requires tito_model='qwen3_5'")
         if tito_model != "qwen3_5":
             raise ValueError(f"Unsupported TITO model type: {tito_model!r}")
         from .tito import create_tito_tokenizer, load_fixed_template
@@ -592,6 +661,114 @@ def create_app(
         backend=reasoning_parse_backend,
     )
     none_equals_empty_tools = _tools_none_equals_empty(mask_builder)
+    tito_template_kwargs = (
+        {"preserve_thinking": True} if token_build_mode == "tito" else None
+    )
+
+    def _candidate_snapshot_rendered(
+        *,
+        step: StepRecord,
+        tools: list[dict[str, Any]] | None,
+        tools_hash: str,
+    ) -> str:
+        if step.snapshot_tools_hash == tools_hash and step.snapshot_rendered:
+            return step.snapshot_rendered
+        rendered = mask_builder.render_messages(
+            step.normalized_messages_snapshot,
+            tools,
+            add_generation_prompt=False,
+            template_kwargs=tito_template_kwargs,
+        )
+        step.snapshot_rendered = rendered
+        step.snapshot_rendered_len = len(rendered)
+        step.snapshot_tools_hash = tools_hash
+        return rendered
+
+    def _select_route(
+        *,
+        session: Session,
+        normalized_request_messages: list[dict],
+        tools: list[dict[str, Any]] | None,
+        tools_hash: str,
+    ) -> Route:
+        current_request_rendered = mask_builder.render_messages(
+            normalized_request_messages,
+            tools,
+            add_generation_prompt=True,
+            template_kwargs=tito_template_kwargs,
+        )
+        step_order = {step.step_id: index for index, step in enumerate(session.steps)}
+        valid_candidates: list[StepRecord] = []
+        for step_id in session.prefix_tree.candidates(normalized_request_messages):
+            candidate = session.steps_by_id.get(step_id)
+            if candidate is None:
+                continue
+            snapshot_rendered = _candidate_snapshot_rendered(
+                step=candidate,
+                tools=tools,
+                tools_hash=tools_hash,
+            )
+            if len(snapshot_rendered) > len(current_request_rendered):
+                continue
+            if current_request_rendered[: len(snapshot_rendered)] == snapshot_rendered:
+                valid_candidates.append(candidate)
+
+        def sort_key(step: StepRecord) -> tuple[int, int, int, int]:
+            lineage = session.lineages.get(step.lineage_id)
+            is_latest = bool(lineage and lineage.latest_step_id == step.step_id)
+            lineage_index = lineage.index if lineage is not None else step.lineage_index
+            return (
+                -int(step.snapshot_rendered_len or len(step.snapshot_rendered)),
+                0 if is_latest else 1,
+                -step_order.get(step.step_id, -1),
+                lineage_index,
+            )
+
+        valid_candidates.sort(key=sort_key)
+        if not valid_candidates:
+            normalized_candidates = [
+                step
+                for step in session.steps
+                if len(step.normalized_messages_snapshot)
+                <= len(normalized_request_messages)
+                and normalized_request_messages[
+                    : len(step.normalized_messages_snapshot)
+                ]
+                == step.normalized_messages_snapshot
+            ]
+            normalized_candidates.sort(key=sort_key)
+            for candidate in normalized_candidates:
+                lineage = session.lineages.get(candidate.lineage_id)
+                if lineage is None or lineage.latest_step_id != candidate.step_id:
+                    continue
+                if _tools_changed(
+                    candidate.tools,
+                    tools,
+                    none_equals_empty=none_equals_empty_tools,
+                ):
+                    return Route(
+                        lineage_id=candidate.lineage_id,
+                        type="append",
+                        base_step_id=candidate.step_id,
+                    )
+            lineage = session.create_lineage(branch_from_step_id=None)
+            return Route(lineage_id=lineage.id, type="create", base_step_id=None)
+
+        selected = valid_candidates[0]
+        selected_lineage = session.lineages.get(selected.lineage_id)
+        if selected_lineage is not None and selected_lineage.latest_step_id == selected.step_id:
+            return Route(
+                lineage_id=selected.lineage_id,
+                type="append",
+                base_step_id=selected.step_id,
+            )
+
+        lineage = session.create_lineage(branch_from_step_id=selected.step_id)
+        return Route(
+            lineage_id=lineage.id,
+            type="branch",
+            base_step_id=selected.step_id,
+        )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -611,7 +788,7 @@ def create_app(
         if auth_header != expected:
             raise HTTPException(status_code=401, detail="Unauthorized")
 
-    def _build_segment_record(
+    def _build_snapshot_segment_record(
         *,
         session: Session,
         trajectory_id: str,
@@ -620,6 +797,7 @@ def create_app(
         segment_count: int,
         instance_id: str,
         label: Any | None = None,
+        token_build_mode_for_record: TokenBuildMode = "snapshot",
     ) -> dict[str, Any]:
         steps = segment["steps"]
         base_step = steps[-1]
@@ -628,14 +806,20 @@ def create_app(
         tools = base_step.tools
         alignment = mask_builder.build_segment_alignment(base_step, tools)
         extra_info = {
-            "alignment_method": "last_step_all_logprobs+assistant_prompt_mask",
-            "trajectory_build_mode": "last_step",
+            "alignment_method": "snapshot_all_logprobs+assistant_prompt_mask",
+            "token_build_mode": token_build_mode_for_record,
+            "segment_view": "timeline",
             "mask_template_equivalent": alignment["mask_template_equivalent"],
             "prompt_assistant_token_count": alignment["prompt_assistant_token_count"],
             "output_token_count": len(base_step.response_token_ids),
             "num_steps": len(steps),
             "num_turns": len(turn_ids),
             "turn_ids": turn_ids,
+            "step_id": base_step.step_id,
+            "lineage_id": base_step.lineage_id,
+            "lineage_index": base_step.lineage_index,
+            "route_type": base_step.route_type,
+            "route_base_step_id": base_step.route_base_step_id,
             "timestamp": str(time.time()),
             "history_rewritten": session.history_rewritten,
             "segment_reason": segment["segment_reason"],
@@ -687,6 +871,90 @@ def create_app(
             record["routed_experts"] = base_step.response_routed_experts
         return record
 
+    def _build_step_snapshot_record(
+        *,
+        session: Session,
+        trajectory_id: str,
+        segment: dict[str, Any],
+        segment_index: int,
+        segment_count: int,
+        instance_id: str,
+        label: Any | None = None,
+        token_build_mode_for_record: TokenBuildMode,
+    ) -> dict[str, Any]:
+        step = segment["steps"][-1]
+        tokens = list(step.all_token_ids)
+        prompt_len = min(len(step.prompt_token_ids), len(tokens))
+        response_len = max(0, len(tokens) - prompt_len)
+        response_logprobs, invalid = _normalize_logprobs_to_length(
+            list(step.response_logprobs),
+            response_len,
+        )
+        response_mask = [0] * prompt_len + [1] * response_len
+        response_logprobs = [0.0] * prompt_len + response_logprobs
+
+        full_versions = None
+        if record_token_versions:
+            response_version = (
+                step.response_version
+                or (step.response_versions[-1] if step.response_versions else None)
+                or step.request_version
+                or "unknown"
+            )
+            full_versions = [_INPUT_TOKEN_VERSION] * prompt_len + [
+                str(response_version)
+            ] * response_len
+
+        extra_info = {
+            "alignment_method": "snapshot_step",
+            "token_build_mode": token_build_mode_for_record,
+            "segment_view": "timeline",
+            "context_token_count": prompt_len,
+            "output_token_count": response_len,
+            "num_steps": 1,
+            "num_turns": len(segment["turn_ids"]),
+            "turn_ids": segment["turn_ids"],
+            "step_id": step.step_id,
+            "lineage_id": step.lineage_id,
+            "lineage_index": step.lineage_index,
+            "route_type": step.route_type,
+            "route_base_step_id": step.route_base_step_id,
+            "timestamp": str(time.time()),
+            "history_rewritten": session.history_rewritten,
+            "segment_reason": segment["segment_reason"],
+            "segment_reasons": segment["segment_reasons"],
+            "trajectory_num_segments": segment_count,
+        }
+        if invalid:
+            extra_info["snapshot_logprobs_invalid"] = True
+        if mask_nonlast_version_tokens:
+            extra_info["mask_nonlast_version_tokens"] = True
+
+        record = {
+            "uid": str(uuid.uuid4()),
+            "trajectory_id": trajectory_id,
+            "turn_id": step.turn_id,
+            "instance_id": instance_id,
+            "segment_index": segment_index,
+            "segment_count": segment_count,
+            "messages": step.messages_snapshot,
+            "tools": step.tools,
+            "tokens": tokens,
+            "full_logprobs": response_logprobs,
+            "full_loss_mask": response_mask,
+            "aligned_response_length": sum(response_mask),
+            "label": label,
+            "finish_reason": step.finish_reason,
+            "extra_info": extra_info,
+        }
+        if full_versions is not None:
+            record["full_versions"] = full_versions
+        if step.response_routed_experts_chunks:
+            record["routed_experts_chunks"] = step.response_routed_experts_chunks
+        if step.response_routed_experts is not None:
+            record["routed_experts"] = step.response_routed_experts
+        return record
+
     def _normalize_logprobs_to_length(
         values: list[float],
         token_count: int,
@@ -705,7 +973,7 @@ def create_app(
                 invalid = True
         return normalized, invalid
 
-    def _build_concat_segment_record(
+    def _build_tito_lineage_segment_record(
         *,
         session: Session,
         trajectory_id: str,
@@ -747,14 +1015,19 @@ def create_app(
             )
 
         extra_info = {
-            "alignment_method": "tito_concat",
-            "trajectory_build_mode": "concat",
+            "alignment_method": "tito",
+            "token_build_mode": "tito",
+            "segment_view": "lineage",
             "context_token_count": context_token_count,
             "context_delta_token_count": context_token_count,
             "output_token_count": output_token_count,
             "num_steps": len(steps),
             "num_turns": len(turn_ids),
             "turn_ids": turn_ids,
+            "lineage_id": segment.get("lineage_id"),
+            "lineage_index": segment.get("lineage_index"),
+            "branch_from_step_id": segment.get("branch_from_step_id"),
+            "step_ids": [step.step_id for step in steps],
             "timestamp": str(time.time()),
             "history_rewritten": session.history_rewritten,
             "segment_reason": segment["segment_reason"],
@@ -762,22 +1035,22 @@ def create_app(
             "trajectory_num_segments": segment_count,
         }
         if concat_logprobs_invalid:
-            extra_info["concat_logprobs_invalid"] = True
+            extra_info["tito_logprobs_invalid"] = True
         if concat_incremental_tokenization_failed:
-            extra_info["concat_incremental_tokenization_failed"] = True
+            extra_info["tito_incremental_tokenization_failed"] = True
         if mask_nonlast_version_tokens:
             extra_info["mask_nonlast_version_tokens"] = True
 
         if not (len(tokens) == len(response_logprobs) == len(response_mask)):
             raise RuntimeError(
-                "concat segment arrays are not aligned: "
+                "tito segment arrays are not aligned: "
                 f"tokens={len(tokens)}, "
                 f"full_logprobs={len(response_logprobs)}, "
                 f"full_loss_mask={len(response_mask)}"
             )
         if record_token_versions and len(full_versions) != len(tokens):
             raise RuntimeError(
-                "concat segment arrays are not aligned: "
+                "tito segment arrays are not aligned: "
                 f"tokens={len(tokens)}, "
                 f"full_logprobs={len(response_logprobs)}, "
                 f"full_loss_mask={len(response_mask)}, "
@@ -824,14 +1097,15 @@ def create_app(
 
         return record
 
-    def _concat_prefix_token_ids(session: Session) -> list[int]:
+    def _lineage_tito_prefix_token_ids(session: Session, lineage_id: str) -> list[int]:
+        lineage_steps = [step for step in session.steps if step.lineage_id == lineage_id]
         start_index = 0
-        for index, step in enumerate(session.steps):
-            if step.segment_boundary_before:
+        for index, step in enumerate(lineage_steps):
+            if step.lineage_segment_boundary_before:
                 start_index = index
 
         tokens: list[int] = []
-        for step in session.steps[start_index:]:
+        for step in lineage_steps[start_index:]:
             tokens.extend(step.concat_token_ids)
         return tokens
 
@@ -844,20 +1118,26 @@ def create_app(
             normalized_request_messages,
             tools,
             add_generation_prompt=True,
+            template_kwargs=tito_template_kwargs,
         )
 
     def _build_prompt_tokens(
         *,
         session: Session,
-        previous_step: Any | None,
-        segment_boundary_before: bool,
+        route: Route,
+        lineage_segment_boundary_before: bool,
         normalized_request_messages: list[dict],
         tools: list[dict[str, Any]] | None,
     ) -> dict[str, Any]:
+        base_step = (
+            None
+            if route.base_step_id is None
+            else session.steps_by_id.get(route.base_step_id)
+        )
         if (
-            trajectory_build_mode != "concat"
-            or previous_step is None
-            or segment_boundary_before
+            token_build_mode != "tito"
+            or base_step is None
+            or lineage_segment_boundary_before
         ):
             input_ids = _full_prompt_token_ids(
                 normalized_request_messages=normalized_request_messages,
@@ -867,16 +1147,19 @@ def create_app(
                 "input_ids": input_ids,
                 "context_delta_ids": list(input_ids),
                 "used_tito_for_prompt": False,
-                "concat_incremental_tokenization_failed": False,
+                "tito_incremental_tokenization_failed": False,
             }
 
         if tito_tokenizer is None:
-            raise RuntimeError("TITO tokenizer is not initialized for concat mode.")
+            raise RuntimeError("TITO tokenizer is not initialized for tito mode.")
 
-        prefix_tokens = _concat_prefix_token_ids(session)
+        if route.type == "branch":
+            prefix_tokens = list(base_step.snapshot_token_ids)
+        else:
+            prefix_tokens = _lineage_tito_prefix_token_ids(session, route.lineage_id)
         try:
             merged_tokens = tito_tokenizer.merge_tokens(
-                old_messages=previous_step.messages_snapshot,
+                old_messages=base_step.normalized_messages_snapshot,
                 new_messages=normalized_request_messages,
                 pretokenized_token_ids=prefix_tokens,
                 tools=tools,
@@ -893,14 +1176,18 @@ def create_app(
                 "input_ids": input_ids,
                 "context_delta_ids": list(input_ids),
                 "used_tito_for_prompt": False,
-                "concat_incremental_tokenization_failed": True,
+                "tito_incremental_tokenization_failed": True,
             }
 
         return {
             "input_ids": list(merged_tokens),
-            "context_delta_ids": list(merged_tokens[len(prefix_tokens) :]),
+            "context_delta_ids": (
+                list(merged_tokens)
+                if route.type == "branch"
+                else list(merged_tokens[len(prefix_tokens) :])
+            ),
             "used_tito_for_prompt": True,
-            "concat_incremental_tokenization_failed": False,
+            "tito_incremental_tokenization_failed": False,
         }
 
     def _build_concat_step_payload(
@@ -1153,11 +1440,47 @@ def create_app(
                 current_epoch=request_rollout_epoch,
                 partial_rollout=partial_rollout,
             )
+            normalized_request_messages = mask_builder.normalize_template_messages(messages)
+            current_tools_hash = _tools_hash(
+                tools,
+                none_equals_empty=none_equals_empty_tools,
+            )
             append_only = (
                 previous_step is None
                 or session_manager.is_append_only_continuation(
                     previous_step.messages_snapshot, messages
                 )
+            )
+            routing_render_failed = False
+            try:
+                route = _select_route(
+                    session=session,
+                    normalized_request_messages=normalized_request_messages,
+                    tools=tools,
+                    tools_hash=current_tools_hash,
+                )
+            except Exception:
+                logger.exception(
+                    "Rendered-prefix routing failed; using a full-prompt safety reset."
+                )
+                routing_render_failed = True
+                if previous_step is not None and append_only:
+                    route = Route(
+                        lineage_id=previous_step.lineage_id,
+                        type="append",
+                        base_step_id=previous_step.step_id,
+                    )
+                else:
+                    lineage = session.create_lineage(branch_from_step_id=None)
+                    route = Route(
+                        lineage_id=lineage.id,
+                        type="create",
+                        base_step_id=None,
+                    )
+            route_base_step = (
+                None
+                if route.base_step_id is None
+                else session.steps_by_id.get(route.base_step_id)
             )
             rewrite_detected = (
                 previous_step is not None
@@ -1165,13 +1488,13 @@ def create_app(
                 and not append_only
             )
             message_prefix_mismatch = (
-                trajectory_build_mode == "concat"
+                token_build_mode == "tito"
                 and previous_step is not None
-                and not append_only
+                and route.type == "create"
                 and not rewrite_detected
             )
-            tools_changed = previous_step is not None and _tools_changed(
-                previous_step.tools,
+            tools_changed = route_base_step is not None and _tools_changed(
+                route_base_step.tools,
                 tools,
                 none_equals_empty=none_equals_empty_tools,
             )
@@ -1183,33 +1506,51 @@ def create_app(
             segment_boundary_before = previous_step is not None and bool(
                 segment_reasons_before
             )
+            if routing_render_failed and previous_step is not None:
+                segment_reasons_before = list(segment_reasons_before) + [
+                    "tito_routing_render_failed"
+                ]
+                segment_boundary_before = True
             rewrite_reason = None
             if rewrite_detected:
                 rewrite_reason = "Turn history rewritten between steps."
                 session_manager.mark_history_rewritten(session_id, rewrite_reason)
 
-            normalized_request_messages = mask_builder.normalize_template_messages(messages)
+            lineage_segment_reasons_before = []
+            if tools_changed:
+                lineage_segment_reasons_before.append("tools_changed")
+            if routing_render_failed:
+                lineage_segment_reasons_before.append("tito_routing_render_failed")
+            lineage_segment_boundary_before = bool(lineage_segment_reasons_before)
             prompt_payload = _build_prompt_tokens(
                 session=session,
-                previous_step=previous_step,
-                segment_boundary_before=segment_boundary_before,
+                route=route,
+                lineage_segment_boundary_before=lineage_segment_boundary_before,
                 normalized_request_messages=normalized_request_messages,
                 tools=tools,
             )
             input_ids = prompt_payload["input_ids"]
-            concat_incremental_tokenization_failed = bool(
-                prompt_payload["concat_incremental_tokenization_failed"]
+            tito_incremental_tokenization_failed = bool(
+                prompt_payload["tito_incremental_tokenization_failed"]
             )
             if (
-                concat_incremental_tokenization_failed
-                and previous_step is not None
-                and not segment_boundary_before
+                tito_incremental_tokenization_failed
+                and route_base_step is not None
             ):
-                segment_reasons_before = list(segment_reasons_before) + [
-                    "concat_incremental_tokenization_failed"
-                ]
+                if "tito_incremental_tokenization_failed" not in segment_reasons_before:
+                    segment_reasons_before = list(segment_reasons_before) + [
+                        "tito_incremental_tokenization_failed"
+                    ]
                 segment_boundary_before = True
-            request_logprob_start_len = -1 if trajectory_build_mode == "concat" else 0
+                if (
+                    "tito_incremental_tokenization_failed"
+                    not in lineage_segment_reasons_before
+                ):
+                    lineage_segment_reasons_before.append(
+                        "tito_incremental_tokenization_failed"
+                    )
+                lineage_segment_boundary_before = True
+            request_logprob_start_len = -1 if token_build_mode == "tito" else 0
             prompt_tokens = len(input_ids)
             sampling_params = _build_sampling_params(
                 body,
@@ -1416,8 +1757,23 @@ def create_app(
                 prompt_versions if output_overflow else all_versions
             )
             recorded_raw_text = "" if output_overflow else raw_text
+            normalized_full_messages = mask_builder.normalize_template_messages(
+                full_messages
+            )
+            try:
+                snapshot_rendered = mask_builder.render_messages(
+                    normalized_full_messages,
+                    tools,
+                    add_generation_prompt=False,
+                    template_kwargs=tito_template_kwargs,
+                )
+            except Exception:
+                logger.exception(
+                    "Snapshot render failed after generation; recording step without rendered cache."
+                )
+                snapshot_rendered = ""
             concat_payload: dict[str, Any] = {}
-            if trajectory_build_mode == "concat":
+            if token_build_mode == "tito":
                 snapshot_token_ids = list(input_ids) + list(recorded_response_token_ids)
                 concat_payload = _build_concat_step_payload(
                     context_delta_ids=prompt_payload["context_delta_ids"],
@@ -1426,17 +1782,15 @@ def create_app(
                     response_versions=recorded_response_versions,
                     context_version=str(request_version),
                     concat_incremental_tokenization_failed=(
-                        concat_incremental_tokenization_failed
+                        tito_incremental_tokenization_failed
                     ),
                 )
             else:
-                normalized_full_messages = mask_builder.normalize_template_messages(
-                    full_messages
-                )
                 snapshot_token_ids = mask_builder.tokenize_messages(
                     normalized_full_messages,
                     tools,
                     add_generation_prompt=False,
+                    template_kwargs=tito_template_kwargs,
                 )
 
             session_manager.record_step(
@@ -1469,6 +1823,17 @@ def create_app(
                     segment_reasons_before[0] if segment_reasons_before else None
                 ),
                 segment_reasons_before=segment_reasons_before,
+                step_id=session.next_step_id(),
+                lineage_id=route.lineage_id,
+                lineage_index=session.lineages[route.lineage_id].index,
+                route_type=route.type,
+                route_base_step_id=route.base_step_id,
+                normalized_messages_snapshot=normalized_full_messages,
+                snapshot_rendered=snapshot_rendered,
+                snapshot_rendered_len=len(snapshot_rendered),
+                snapshot_tools_hash=current_tools_hash,
+                lineage_segment_boundary_before=lineage_segment_boundary_before,
+                lineage_segment_reasons_before=lineage_segment_reasons_before,
                 finish_reason=finish_reason,
                 request_version=str(request_version),
                 response_version=str(response_version),
@@ -1535,10 +1900,15 @@ def create_app(
         session_id = body["session_id"]
         instance_id = body.get("instance_id")
         label = body.get("label")
-        if "trajectory_build_mode" in body or "trajectory_build_modes" in body:
+        if (
+            "token_build_mode" in body
+            or "token_build_modes" in body
+            or "trajectory_build_mode" in body
+            or "trajectory_build_modes" in body
+        ):
             raise HTTPException(
                 status_code=400,
-                detail="trajectory_build_mode is configured at proxy startup",
+                detail="token_build_mode is configured at proxy startup",
             )
 
         session = session_manager.get_session(session_id)
@@ -1554,25 +1924,53 @@ def create_app(
 
             effective_instance_id = instance_id or session.instance_id
             trajectory_id = session.session_id
-            segments = _split_session_into_segments(session)
-            segment_count = len(segments)
-            build_segment_record = (
-                _build_concat_segment_record
-                if trajectory_build_mode == "concat"
-                else _build_segment_record
-            )
-            for segment_index, segment in enumerate(segments):
-                trajectory_store.write_dict(
-                    build_segment_record(
-                        session=session,
-                        trajectory_id=trajectory_id,
-                        segment=segment,
-                        segment_index=segment_index,
-                        segment_count=segment_count,
-                        instance_id=effective_instance_id,
-                        label=label,
+            if token_build_mode == "tito":
+                lineage_segments = _split_session_into_lineage_segments(session)
+                timeline_segments = _split_session_into_timeline_segments(session)
+                for segment_index, segment in enumerate(lineage_segments):
+                    trajectory_store.write_dict(
+                        _build_tito_lineage_segment_record(
+                            session=session,
+                            trajectory_id=trajectory_id,
+                            segment=segment,
+                            segment_index=segment_index,
+                            segment_count=len(lineage_segments),
+                            instance_id=effective_instance_id,
+                            label=label,
+                        )
                     )
-                )
+                for segment_index, segment in enumerate(timeline_segments):
+                    trajectory_store.write_dict(
+                        _build_step_snapshot_record(
+                            session=session,
+                            trajectory_id=trajectory_id,
+                            segment=segment,
+                            segment_index=segment_index,
+                            segment_count=len(timeline_segments),
+                            instance_id=effective_instance_id,
+                            label=label,
+                            token_build_mode_for_record="tito",
+                        )
+                    )
+                segment_count = len(lineage_segments)
+                timeline_segment_count = len(timeline_segments)
+            else:
+                timeline_segments = _split_session_into_timeline_segments(session)
+                for segment_index, segment in enumerate(timeline_segments):
+                    trajectory_store.write_dict(
+                        _build_step_snapshot_record(
+                            session=session,
+                            trajectory_id=trajectory_id,
+                            segment=segment,
+                            segment_index=segment_index,
+                            segment_count=len(timeline_segments),
+                            instance_id=effective_instance_id,
+                            label=label,
+                            token_build_mode_for_record="snapshot",
+                        )
+                    )
+                segment_count = len(timeline_segments)
+                timeline_segment_count = len(timeline_segments)
 
         return {
             "success": True,
@@ -1582,9 +1980,10 @@ def create_app(
             "num_steps": len(session.steps),
             "num_turns": len(session.turn_ids),
             "num_segments": segment_count,
+            "num_timeline_segments": timeline_segment_count,
             "history_rewritten": session.history_rewritten,
-            "trajectory_build_mode": trajectory_build_mode,
-            "trajectory_build_model": trajectory_build_model,
+            "token_build_mode": token_build_mode,
+            "token_build_model": token_build_model,
             "record_token_versions": record_token_versions,
             "mask_nonlast_version_tokens": mask_nonlast_version_tokens,
         }
@@ -1597,15 +1996,25 @@ def create_app(
         instance_id = body.get("instance_id")
         max_groups = body.get("max_groups")
         drain = bool(body.get("drain", False))
+        segment_view = body.get("segment_view")
+        if segment_view is not None and segment_view not in {"lineage", "timeline"}:
+            raise HTTPException(
+                status_code=400,
+                detail="segment_view must be 'lineage' or 'timeline'",
+            )
 
         if trajectory_id:
             data = (
                 trajectory_store.pop_trajectory(
-                    trajectory_id, instance_id=instance_id
+                    trajectory_id,
+                    instance_id=instance_id,
+                    segment_view=segment_view,
                 )
                 if drain
                 else trajectory_store.read_trajectory(
-                    trajectory_id, instance_id=instance_id
+                    trajectory_id,
+                    instance_id=instance_id,
+                    segment_view=segment_view,
                 )
             )
             return {
@@ -1667,8 +2076,8 @@ def create_app(
             "rollout_pause": generation_controller.state(),
             "config": {
                 "sglang_router_url": sglang_router_url,
-                "trajectory_build_mode": trajectory_build_mode,
-                "trajectory_build_model": trajectory_build_model,
+                "token_build_mode": token_build_mode,
+                "token_build_model": token_build_model,
                 "record_token_versions": record_token_versions,
                 "mask_nonlast_version_tokens": mask_nonlast_version_tokens,
                 "rollout_temperature": rollout_temperature,
@@ -1739,21 +2148,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--session-timeout", type=float, default=3200.0)
     parser.add_argument("--group-timeout", type=float, default=300.0)
     parser.add_argument(
-        "--trajectory-build-mode",
-        choices=("last_step", "concat"),
-        default="concat",
-        help="Trajectory build strategy, fixed for the proxy lifetime.",
+        "--token-build-mode",
+        choices=("snapshot", "tito"),
+        default="tito",
+        help="Token build strategy, fixed for the proxy lifetime.",
     )
     parser.add_argument(
-        "--trajectory-build-model",
-        default=DEFAULT_TRAJECTORY_BUILD_MODEL,
-        help="Trajectory model defaults to infer mask/parser/TITO settings.",
+        "--token-build-model",
+        default=DEFAULT_TOKEN_BUILD_MODEL,
+        help="Token model defaults to infer mask/parser/TITO settings.",
     )
     parser.add_argument(
         "--tito-model",
         choices=("qwen3_5",),
         default=None,
-        help="TITO model type, required when --trajectory-build-mode=concat.",
+        help="TITO model type, required when --token-build-mode=tito.",
     )
     parser.add_argument(
         "--record-token-versions",
@@ -1800,8 +2209,8 @@ def main() -> None:
         model_mask_type=args.model_mask_type,
         default_max_tokens=args.default_max_tokens,
         api_key=args.api_key,
-        trajectory_build_mode=args.trajectory_build_mode,
-        trajectory_build_model=args.trajectory_build_model,
+        token_build_mode=args.token_build_mode,
+        token_build_model=args.token_build_model,
         tito_model=args.tito_model,
         record_token_versions=args.record_token_versions,
         mask_nonlast_version_tokens=args.mask_nonlast_version_tokens,

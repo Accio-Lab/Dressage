@@ -109,7 +109,7 @@ MODEL_TOOL_CALL_TYPE=${MODEL_TOOL_CALL_TYPE:-qwen3_5}
 TOOL_CALL_PARSE_BACKEND=${TOOL_CALL_PARSE_BACKEND:-sglang_api}
 MODEL_REASONING_TYPE=${MODEL_REASONING_TYPE:-qwen3}
 REASONING_PARSE_BACKEND=${REASONING_PARSE_BACKEND:-sglang_api}
-TRAJECTORY_BUILD_MODE=${TRAJECTORY_BUILD_MODE:-concat}
+TOKEN_BUILD_MODE=${TOKEN_BUILD_MODE:-tito}
 TITO_MODEL=${TITO_MODEL:-qwen3_5}
 TOKENIZER_PATH=${TOKENIZER_PATH:-${HF_CHECKPOINT}}
 
@@ -133,8 +133,8 @@ for TRAJECTORY_LOG_DIR_VAR in DRESSAGE_TRAJECTORY_PAYLOAD_LOG_DIR DRESSAGE_TRAJE
   find "${TRAJECTORY_LOG_DIR}" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
 done
 
-if [[ "${TRAJECTORY_BUILD_MODE}" != "last_step" && "${TRAJECTORY_BUILD_MODE}" != "concat" ]]; then
-  echo "TRAJECTORY_BUILD_MODE must be last_step or concat, got: ${TRAJECTORY_BUILD_MODE}" >&2
+if [[ "${TOKEN_BUILD_MODE}" != "snapshot" && "${TOKEN_BUILD_MODE}" != "tito" ]]; then
+  echo "TOKEN_BUILD_MODE must be snapshot or tito, got: ${TOKEN_BUILD_MODE}" >&2
   exit 1
 fi
 
@@ -159,7 +159,7 @@ PROXY_ARGS=(
    --tool-call-parse-backend "${TOOL_CALL_PARSE_BACKEND}"
    --model-reasoning-type "${MODEL_REASONING_TYPE}"
    --reasoning-parse-backend "${REASONING_PARSE_BACKEND}"
-   --trajectory-build-mode "${TRAJECTORY_BUILD_MODE}"
+   --token-build-mode "${TOKEN_BUILD_MODE}"
    "${COMM_ARGS[@]}"
    --context-window "${CONTEXT_WINDOW}"
    --tito-model "${TITO_MODEL}"

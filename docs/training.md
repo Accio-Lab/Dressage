@@ -60,7 +60,7 @@ Each finalized segment carries a complete training-ready data bundle:
 ```python
 {
     "segment_index": int,           # position in the session (0, 1, 2, ...)
-    "tokens": list[int],            # token IDs (TITO-aligned or last-step)
+    "tokens": list[int],            # token IDs (TITO-aligned or snapshot)
     "full_loss_mask": list[int],    # 0 = prompt/tool, 1 = trainable assistant token
     "full_logprobs": list[float],   # per-token log probabilities from rollout
     "messages": list[dict],         # conversation messages for this segment
@@ -137,7 +137,7 @@ TITO renders and encodes only the **append delta** each turn, then concatenates 
 ```text
 Turn 1:  encode(system + user₁)                → fragment₁ = [101, 202, 303, 404]
 Turn 2:  encode(delta: asst₁ + tool₁ + user₂)  → fragment₂ = [505, 606, 707]
-         concat(fragment₁ + fragment₂)         → [101, 202, 303, 404, 505, 606, 707]
+         stitch(fragment₁ + fragment₂)         → [101, 202, 303, 404, 505, 606, 707]
                                                   ✅ prefix [101, 202, 303, 404] intact!
 ```
 
@@ -152,9 +152,9 @@ The proxy records TITO fragments per step in `StepRecord` fields:
  | `concat_response_mask` | Loss mask, with context positions set to `0` and generated response positions set to `1` |
  | `concat_versions` | Token weight-version markers |
  | `concat_context_token_count` / `concat_output_token_count` | Context and generated-token counts |
- | `concat_logprobs_invalid` / `concat_incremental_tokenization_failed` | Safety flags for concat assembly |
+ | `concat_logprobs_invalid` / `tito_incremental_tokenization_failed` | Safety flags for TITO assembly |
 
-At finalize time, the `concat` trajectory build mode stitches all fragments into a single coherent sequence per segment.
+At finalize time, the `tito` token build mode stitches all fragments into a single coherent sequence per lineage segment.
 
 ### Append-Only Contract
 
@@ -182,8 +182,8 @@ TITO depends on append-only conversation history:
 ```bash
 dressage-proxy \
   --tokenizer-path /path/to/Qwen3.5-4B \
-  --trajectory-build-mode concat \
-  --trajectory-build-model qwen3_5 \
+  --token-build-mode tito \
+  --token-build-model qwen3_5 \
   --tito-model qwen3_5
 ```
 
@@ -191,13 +191,13 @@ dressage-proxy \
 
 ### Mode Comparison
 
- | | `last_step` | `concat` + TITO | 
- | :-- | :-----------: | :---------------: | 
- | **Token Source** | Last step's `all_token_ids` | Concatenated TITO fragments | 
- | **Multi-Turn Context** | Last-step snapshot (re-tokenized) | Full trajectory per segment (incremental) | 
- | **Prefix Consistency** | Not guaranteed | Guaranteed | 
- | **Model Support** | General (any model) | `qwen3_5` with fixed template | 
- | **Best For** | Shorter trajectories (1-3 turns) | Long agentic rollouts (10+ turns) | 
+ | | `snapshot` | `tito` |
+ | :-- | :-----------: | :---------------: |
+ | **Token Source** | Last step's `all_token_ids` | Concatenated TITO fragments |
+ | **Multi-Turn Context** | Step snapshot | Full trajectory per lineage segment (incremental) |
+ | **Prefix Consistency** | Not guaranteed | Guaranteed |
+ | **Model Support** | General (any model) | `qwen3_5` with fixed template |
+ | **Best For** | Shorter trajectories (1-3 turns) | Long agentic rollouts (10+ turns) |
  | **Overhead** | Lower (single tokenization) | Slightly higher (per-step recording) | 
 
 ## ⚖️ Prompt-Equal Aggregation

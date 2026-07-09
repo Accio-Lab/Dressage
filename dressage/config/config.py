@@ -18,11 +18,11 @@ DEFAULT_PADDOCK_MODE = "blackbox"
 DEFAULT_SANDBOX_PROVIDER = "local_bwrap"
 DEFAULT_LOCAL_BWRAP_NAMESPACE = "dressage"
 DEFAULT_LOCAL_BWRAP_MANAGER_NAME = "dressage_local_bwrap_manager"
-DEFAULT_TRAJECTORY_BUILD_MODEL = "qwen3_5"
+DEFAULT_TOKEN_BUILD_MODEL = "qwen3_5"
 
 
 @dataclass(frozen=True)
-class TrajectoryBuildDefaults:
+class TokenBuildDefaults:
     model_mask_type: str | None
     model_tool_call_type: str | None
     model_reasoning_type: str | None
@@ -139,19 +139,19 @@ def proxy_pid_file(*, name: str | None = None) -> Path:
     return log_dir() / "proxy" / f"{name or run_name()}.pid"
 
 
-def trajectory_build_defaults(
+def token_build_defaults(
     *,
-    trajectory_build_mode: str,
-    trajectory_build_model: str | None = None,
-) -> TrajectoryBuildDefaults:
-    model = (trajectory_build_model or DEFAULT_TRAJECTORY_BUILD_MODEL).strip().lower()
+    token_build_mode: str,
+    token_build_model: str | None = None,
+) -> TokenBuildDefaults:
+    model = (token_build_model or DEFAULT_TOKEN_BUILD_MODEL).strip().lower()
     if model != "qwen3_5":
         raise ValueError(
-            "unsupported trajectory_build_model="
-            f"{trajectory_build_model!r}; expected 'qwen3_5'"
+            "unsupported token_build_model="
+            f"{token_build_model!r}; expected 'qwen3_5'"
         )
-    tito_model = "qwen3_5" if trajectory_build_mode == "concat" else None
-    return TrajectoryBuildDefaults(
+    tito_model = "qwen3_5" if token_build_mode == "tito" else None
+    return TokenBuildDefaults(
         model_mask_type="qwen3_5",
         model_tool_call_type="qwen3_5",
         model_reasoning_type="qwen3",

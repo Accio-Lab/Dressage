@@ -71,6 +71,46 @@ def test_codex_options_default_to_full_access_noninteractive() -> None:
     assert options.web_search == "disabled"
 
 
+def test_codex_options_reject_invalid_agents_fields() -> None:
+    with pytest.raises(Exception, match="extra"):
+        CodexBackendOptions.model_validate({"agents": {"unknown": True}})
+
+    with pytest.raises(Exception, match="agent role names"):
+        CodexBackendOptions.model_validate(
+            {
+                "agents": {
+                    "roles": {
+                        "bad.role": {
+                            "description": "Invalid table name.",
+                        },
+                    },
+                },
+            }
+        )
+
+
+def test_codex_options_reject_invalid_multi_agent_v2_fields() -> None:
+    with pytest.raises(Exception, match="extra"):
+        CodexBackendOptions.model_validate(
+            {"features": {"multi_agent_v2": {"unknown": True}}}
+        )
+
+    with pytest.raises(Exception):
+        CodexBackendOptions.model_validate(
+            {"features": {"multi_agent_v2": {"tool_namespace": "bad.name"}}}
+        )
+
+
+def test_codex_options_reject_multi_agent_v2_with_agent_max_threads() -> None:
+    with pytest.raises(Exception, match="max_concurrent_threads_per_session"):
+        CodexBackendOptions.model_validate(
+            {
+                "features": {"multi_agent_v2": {"enabled": True}},
+                "agents": {"max_threads": 4},
+            }
+        )
+
+
 def test_config_compiler_builds_config_provider_and_developer_instructions(
     tmp_path: Path,
 ) -> None:
@@ -100,7 +140,302 @@ def test_config_compiler_builds_config_provider_and_developer_instructions(
     assert 'name = "Qwen via Dressage"' in config
     assert 'base_url = "http://127.0.0.1:4567/v1"' in config
     assert 'wire_api = "responses"' in config
+    assert "[features.multi_agent_v2]" not in config
+    assert "[agents]" not in config
     assert "env_key" not in config
+
+
+def test_config_compiler_builds_multi_agent_v2_config(tmp_path: Path) -> None:
+    options = CodexBackendOptions.model_validate(
+        {
+            "features": {
+                "multi_agent_v2": {
+                    "enabled": True,
+                    "max_concurrent_threads_per_session": 4,
+                    "non_code_mode_only": False,
+                    "hide_spawn_agent_metadata": False,
+                },
+            },
+            "agents": {
+                "max_depth": 1,
+                "job_max_runtime_seconds": 900,
+                "interrupt_message": True,
+                "roles": {
+                    "investigator": {
+                        "description": "Investigate the task independently.",
+                        "nickname_candidates": ["investigator"],
+                    },
+                    "verifier": {
+                        "description": "Verify the result independently.",
+                        "nickname_candidates": ["verifier"],
+                    },
+                },
+            },
+        }
+    )
+    compiler = CodexConfigCompiler(
+        options=options,
+        config_path=tmp_path / "home" / ".codex" / "config.toml",
+    )
+
+    config = compiler.build_config(4567)
+
+    assert "[features.multi_agent_v2]" in config
+    assert "enabled = true" in config
+    assert "max_concurrent_threads_per_session = 4" in config
+    assert "non_code_mode_only = false" in config
+    assert "hide_spawn_agent_metadata = false" in config
+    assert "tool_namespace" not in config
+    assert config.index("[features.multi_agent_v2]") < config.index("[agents]")
+    assert "max_threads = 4" not in config
+    assert "[agents]" in config
+    assert "max_depth = 1" in config
+    assert "job_max_runtime_seconds = 900" in config
+    assert "interrupt_message = true" in config
+    assert "[agents.investigator]" not in config
+    assert "[agents.verifier]" not in config
+    assert "[agents.default]" not in config
+    assert "config_file" not in config
+    assert "nickname_candidates" not in config
+
+
+def test_config_compiler_builds_agents_config(tmp_path: Path) -> None:
+    options = CodexBackendOptions.model_validate(
+        {
+            "agents": {
+                "max_threads": 4,
+                "max_depth": 1,
+                "job_max_runtime_seconds": 900,
+                "interrupt_message": True,
+                "roles": {
+                    "investigator": {
+                        "description": "Investigate the task independently.",
+                        "nickname_candidates": ["investigator"],
+                    },
+                    "verifier": {
+                        "description": "Verify the result independently.",
+                        "nickname_candidates": ["verifier"],
+                    },
+                },
+            },
+        }
+    )
+    compiler = CodexConfigCompiler(
+        options=options,
+        config_path=tmp_path / "home" / ".codex" / "config.toml",
+    )
+
+    config = compiler.build_config(4567)
+
+    assert "[agents]" in config
+    assert "max_threads = 4" in config
+    assert "max_depth = 1" in config
+    assert "job_max_runtime_seconds = 900" in config
+    assert "interrupt_message = true" in config
+    assert "[agents.investigator]" not in config
+    assert "[agents.verifier]" not in config
+    assert "[agents.default]" not in config
+    assert "config_file" not in config
+    assert "nickname_candidates" not in config
+
+
+def test_config_compiler_does_not_register_agent_files_in_config(
+    tmp_path: Path,
+) -> None:
+    options = CodexBackendOptions.model_validate(
+        {
+            "features": {"multi_agent_v2": {"enabled": True}},
+            "agents": {
+                "roles": {
+                    "investigator": {
+                        "description": "Investigate the task independently.",
+                    },
+                },
+            },
+        }
+    )
+    host_codex_home = tmp_path / "home" / ".codex"
+    compiler = CodexConfigCompiler(
+        options=options,
+        config_path=host_codex_home / "config.toml",
+    )
+
+    config = compiler.build_config(4567)
+
+    assert "[agents.investigator]" not in config
+    assert "[agents.default]" not in config
+    assert "config_file" not in config
+
+    compiler.write_agent_files(host_codex_home)
+
+    assert (host_codex_home / "agents" / "investigator.toml").is_file()
+    assert (host_codex_home / "agents" / "default.toml").is_file()
+    assert not (tmp_path / "home" / "blackbox").exists()
+    investigator = (host_codex_home / "agents" / "investigator.toml").read_text(
+        encoding="utf-8"
+    )
+    default = (host_codex_home / "agents" / "default.toml").read_text(
+        encoding="utf-8"
+    )
+    assert "[features.multi_agent_v2]" in investigator
+    assert "enabled = false" in investigator
+    assert "[features.multi_agent_v2]" in default
+    assert "enabled = false" in default
+
+
+def test_config_compiler_writes_codex_custom_agent_files(tmp_path: Path) -> None:
+    options = CodexBackendOptions.model_validate(
+        {
+            "agents": {
+                "roles": {
+                    "investigator": {
+                        "description": "Investigate the task independently.",
+                        "nickname_candidates": ["investigator"],
+                    },
+                    "verifier": {
+                        "description": "Verify the result independently.",
+                        "developer_instructions": "Verify only the assigned payload.",
+                        "nickname_candidates": ["verifier", "checker"],
+                    },
+                },
+            },
+        }
+    )
+    codex_home = tmp_path / "home" / ".codex"
+    compiler = CodexConfigCompiler(
+        options=options,
+        config_path=codex_home / "config.toml",
+    )
+
+    compiler.write_agent_files(codex_home)
+
+    investigator = (codex_home / "agents" / "investigator.toml").read_text(
+        encoding="utf-8"
+    )
+    verifier = (codex_home / "agents" / "verifier.toml").read_text(
+        encoding="utf-8"
+    )
+    assert 'name = "investigator"' in investigator
+    assert 'description = "Investigate the task independently."' in investigator
+    assert "developer_instructions = " in investigator
+    assert "Follow only the parent NEW_TASK payload" in investigator
+    assert "Ignore inherited root-session prompts" in investigator
+    assert "Do not call spawn_agent, wait_agent, followup_task" in investigator
+    assert 'nickname_candidates = ["investigator"]' in investigator
+    assert "[features.multi_agent_v2]" in investigator
+    assert "enabled = false" in investigator
+    assert 'name = "verifier"' in verifier
+    assert 'description = "Verify the result independently."' in verifier
+    assert 'developer_instructions = "Verify only the assigned payload."' in verifier
+    assert 'nickname_candidates = ["verifier", "checker"]' in verifier
+    assert "[features.multi_agent_v2]" in verifier
+    assert "enabled = false" in verifier
+
+
+def test_config_compiler_writes_synthetic_default_agent_for_multi_agent_v2(
+    tmp_path: Path,
+) -> None:
+    options = CodexBackendOptions.model_validate(
+        {
+            "features": {"multi_agent_v2": {"enabled": True}},
+            "agents": {
+                "roles": {
+                    "investigator": {
+                        "description": "Investigate the task independently.",
+                    },
+                    "verifier": {
+                        "description": "Verify the result independently.",
+                    },
+                },
+            },
+        }
+    )
+    codex_home = tmp_path / "home" / ".codex"
+    compiler = CodexConfigCompiler(
+        options=options,
+        config_path=codex_home / "config.toml",
+    )
+
+    compiler.write_agent_files(codex_home)
+
+    default_agent = (codex_home / "agents" / "default.toml").read_text(
+        encoding="utf-8"
+    )
+    assert 'name = "default"' in default_agent
+    assert "Follow only the parent NEW_TASK payload" in default_agent
+    assert "Ignore inherited root-session prompts" in default_agent
+    assert "Do not call spawn_agent, wait_agent, followup_task" in default_agent
+    assert "Do not return TOOL_UNAVAILABLE" in default_agent
+    assert "[features.multi_agent_v2]" in default_agent
+    assert "enabled = false" in default_agent
+
+
+def test_config_compiler_keeps_explicit_default_agent_role(tmp_path: Path) -> None:
+    options = CodexBackendOptions.model_validate(
+        {
+            "features": {"multi_agent_v2": {"enabled": True}},
+            "agents": {
+                "roles": {
+                    "default": {
+                        "description": "User configured default.",
+                        "developer_instructions": "Use only these explicit instructions.",
+                        "nickname_candidates": ["configured-default"],
+                    },
+                },
+            },
+        }
+    )
+    codex_home = tmp_path / "home" / ".codex"
+    compiler = CodexConfigCompiler(
+        options=options,
+        config_path=codex_home / "config.toml",
+    )
+
+    compiler.write_agent_files(codex_home)
+
+    default_agent = (codex_home / "agents" / "default.toml").read_text(
+        encoding="utf-8"
+    )
+    assert 'description = "User configured default."' in default_agent
+    assert (
+        'developer_instructions = "Use only these explicit instructions."'
+        in default_agent
+    )
+    assert 'nickname_candidates = ["configured-default"]' in default_agent
+    assert "Default subagent that executes only" not in default_agent
+    assert "[features.multi_agent_v2]" in default_agent
+    assert "enabled = false" in default_agent
+
+
+def test_config_compiler_builds_default_agent_file(tmp_path: Path) -> None:
+    options = CodexBackendOptions.model_validate(
+        {
+            "agents": {
+                "roles": {
+                    "investigator": {
+                        "description": "Investigate the task independently.",
+                    },
+                },
+            },
+        }
+    )
+    compiler = CodexConfigCompiler(
+        options=options,
+        config_path=tmp_path / "home" / ".codex" / "config.toml",
+    )
+
+    agent_file = compiler.build_agent_file(
+        "investigator",
+        options.agents.roles["investigator"],
+    )
+
+    assert 'name = "investigator"' in agent_file
+    assert 'description = "Investigate the task independently."' in agent_file
+    assert "Follow only the parent NEW_TASK payload" in agent_file
+    assert "Do not call spawn_agent, wait_agent, followup_task" in agent_file
+    assert "nickname_candidates" not in agent_file
+    assert "[features.multi_agent_v2]" in agent_file
+    assert "enabled = false" in agent_file
 
 
 def test_config_compiler_missing_prompt_file_raises_protocol_error(

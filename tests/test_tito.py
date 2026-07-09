@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+from jinja2 import Environment
+
 from dressage.proxy.tito import Qwen35TITOTokenizer, load_fixed_template
 
 
@@ -56,6 +58,45 @@ class TinyTokenizer:
     def convert_tokens_to_ids(self, token):
         if token == "<|im_end|>":
             return 1
+        return None
+
+
+class QwenJinjaTokenizer:
+    def __init__(self):
+        self.chat_template = load_fixed_template("qwen3_5")
+
+    def apply_chat_template(
+        self,
+        messages,
+        *,
+        tokenize,
+        add_generation_prompt,
+        return_dict=False,
+        tools=None,
+        **template_vars,
+    ):
+        del return_dict
+
+        def raise_exception(message):
+            raise RuntimeError(message)
+
+        rendered = Environment().from_string(self.chat_template).render(
+            messages=messages,
+            tools=tools,
+            add_generation_prompt=add_generation_prompt,
+            raise_exception=raise_exception,
+            **template_vars,
+        )
+        if tokenize:
+            return [ord(character) for character in rendered]
+        return rendered
+
+    def encode(self, text, *, add_special_tokens=False):
+        del add_special_tokens
+        return [ord(character) for character in text]
+
+    def convert_tokens_to_ids(self, token):
+        del token
         return None
 
 
@@ -160,3 +201,51 @@ def test_merge_empty_prefix():
     )
 
     assert decode(merged) == "<user>hi<assistant>"
+
+
+def test_merge_tokens_preserves_thinking_for_appended_tool_and_user():
+    tokenizer = Qwen35TITOTokenizer(QwenJinjaTokenizer())
+    old_messages = [
+        {"role": "user", "content": "root task"},
+        {
+            "role": "assistant",
+            "content": None,
+            "reasoning_content": "Need to report.",
+            "tool_calls": [
+                {
+                    "id": "callabcdef12",
+                    "type": "function",
+                    "function": {
+                        "name": "send_message",
+                        "arguments": {
+                            "target": "/root",
+                            "message": "Answer: 5",
+                        },
+                    },
+                }
+            ],
+        },
+    ]
+    new_messages = old_messages + [
+        {"role": "tool", "tool_call_id": "callabcdef12", "content": ""},
+        {
+            "role": "user",
+            "content": '{"type":"agent_message","author":"/root","recipient":"/root"}',
+        },
+    ]
+    old_rendered = tokenizer._render_messages(
+        old_messages,
+        add_generation_prompt=False,
+    )
+
+    merged = tokenizer.merge_tokens(
+        old_messages=old_messages,
+        new_messages=new_messages,
+        pretokenized_token_ids=[ord(character) for character in old_rendered],
+    )
+    full_rendered = tokenizer._render_messages(
+        new_messages,
+        add_generation_prompt=True,
+    )
+
+    assert decode(merged) == full_rendered

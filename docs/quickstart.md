@@ -286,7 +286,7 @@ All Dressage configuration is via environment variables. Here's the complete ref
  | Variable | Values | Default | Description |
  | :--------- | :------- | :-------- | :------------ |
  | `DRESSAGE_PROXY_URL` | URL | `http://${PROXY_PUBLIC_HOST}:${PROXY_PORT}` in scripts | Proxy server endpoint. Must be reachable from sandboxes. |
- | `TRAJECTORY_BUILD_MODE` | `concat` \| `last_step` | `concat` in scripts | Script helper passed to proxy `--trajectory-build-mode`. |
+ | `TOKEN_BUILD_MODE` | `tito` \| `snapshot` | `tito` in scripts | Script helper passed to proxy `--token-build-mode`. |
  | `TITO_MODEL` | string | `qwen3_5` in scripts | Script helper passed to proxy `--tito-model`. |
  | `DRESSAGE_PROXY_MAX_STEPS_PER_SESSION` | int | `0` (unlimited) | Returns HTTP 400 before the next proxy generation once the session already has this many steps. |
 
@@ -464,7 +464,7 @@ Common issues and their solutions:
  | **Bwrap slot unavailable** | Rollout hangs waiting for sandbox | Run `dressage-local-bwrap-status` to check pool health. Ensure enough slots are provisioned. |
  | **Mode mismatch error** | `ValueError` at startup about paddock/pool mode | Ensure `DRESSAGE_PADDOCK_MODE` matches `DRESSAGE_LOCAL_BWRAP_POOL_MODE` (blackbox↔blackbox, whitebox↔command_only). |
  | **Backend not found** | `FileNotFoundError` for opencode/openclaw/claude binary | Set `OPENCODE_BIN`, `OPENCLAW_BIN`, or `CLAUDE_CODE_BIN` to the full path of the binary. |
- | **TITO failure** | Warning about `concat_incremental_tokenization_failed` | Check model compatibility — TITO currently supports `qwen3_5` only. Failure triggers safe segment boundary. |
+ | **TITO failure** | Warning about `tito_incremental_tokenization_failed` | Check model compatibility — TITO currently supports `qwen3_5` only. Failure triggers safe segment boundary. |
  | **Pause timeout** | `TimeoutError` during weight update | Increase `DRESSAGE_PROXY_PAUSE_TIMEOUT_SEC`. Default 300s may not be enough for large batches. |
  | **Session desync** | BlackboxServer reports `desynced` state | Agent process may have crashed. Check sandbox logs. Session will be aborted and retried automatically. |
  | **Docker bwrap fails** | Bubblewrap errors inside container | Ensure Docker is running with `--privileged` flag. Required for Linux namespace operations inside containers. |

@@ -6,6 +6,9 @@ import json
 from pathlib import Path
 from typing import Any
 
+from ..reasoning_parser import canonicalize_reasoning_content
+from ..tool_call_ids import canonicalize_openclaw_tool_call_id
+
 
 class ModelMaskTemplateRegistry:
     """Resolve model mask types to mask-only chat template files."""
@@ -74,6 +77,18 @@ class PromptAssistantMaskBuilder:
             normalized_message = {
                 key: self._deep_copy_jsonish(value) for key, value in message.items()
             }
+            if "reasoning_content" in normalized_message:
+                reasoning_content = canonicalize_reasoning_content(
+                    normalized_message.get("reasoning_content")
+                )
+                if reasoning_content is None:
+                    normalized_message.pop("reasoning_content", None)
+                else:
+                    normalized_message["reasoning_content"] = reasoning_content
+            if "tool_call_id" in normalized_message:
+                normalized_message["tool_call_id"] = canonicalize_openclaw_tool_call_id(
+                    normalized_message["tool_call_id"]
+                )
             tool_calls = normalized_message.get("tool_calls")
             if not isinstance(tool_calls, list):
                 normalized_messages.append(normalized_message)
@@ -82,6 +97,10 @@ class PromptAssistantMaskBuilder:
             normalized_tool_calls: list[dict[str, Any]] = []
             for tool_call in tool_calls:
                 normalized_tool_call = self._deep_copy_jsonish(tool_call)
+                if "id" in normalized_tool_call:
+                    normalized_tool_call["id"] = canonicalize_openclaw_tool_call_id(
+                        normalized_tool_call["id"]
+                    )
                 function = normalized_tool_call.get("function")
                 if not isinstance(function, dict):
                     normalized_tool_calls.append(normalized_tool_call)
@@ -107,6 +126,7 @@ class PromptAssistantMaskBuilder:
         return_dict: bool = False,
         return_assistant_tokens_mask: bool = False,
         chat_template: str | None = None,
+        template_kwargs: dict[str, Any] | None = None,
     ) -> Any:
         kwargs: dict[str, Any] = {
             "tokenize": tokenize,
@@ -119,6 +139,8 @@ class PromptAssistantMaskBuilder:
             kwargs["chat_template"] = chat_template
         if tools is not None:
             kwargs["tools"] = tools
+        if template_kwargs:
+            kwargs.update(template_kwargs)
         try:
             return self._tokenizer.apply_chat_template(messages, **kwargs)
         except TypeError:
@@ -148,6 +170,7 @@ class PromptAssistantMaskBuilder:
         *,
         add_generation_prompt: bool,
         chat_template: str | None = None,
+        template_kwargs: dict[str, Any] | None = None,
     ) -> list[int]:
         token_ids = self._apply_chat_template(
             messages,
@@ -156,6 +179,7 @@ class PromptAssistantMaskBuilder:
             tokenize=True,
             return_dict=False,
             chat_template=chat_template,
+            template_kwargs=template_kwargs,
         )
         return self._coerce_flat_int_list(token_ids)
 
@@ -166,6 +190,7 @@ class PromptAssistantMaskBuilder:
         *,
         add_generation_prompt: bool,
         chat_template: str | None = None,
+        template_kwargs: dict[str, Any] | None = None,
     ) -> str:
         rendered = self._apply_chat_template(
             messages,
@@ -174,6 +199,7 @@ class PromptAssistantMaskBuilder:
             tokenize=False,
             return_dict=False,
             chat_template=chat_template,
+            template_kwargs=template_kwargs,
         )
         return str(rendered)
 
@@ -181,6 +207,8 @@ class PromptAssistantMaskBuilder:
         self,
         messages: list[dict],
         tools: list[dict] | None = None,
+        *,
+        template_kwargs: dict[str, Any] | None = None,
     ) -> tuple[list[int], list[int]]:
         if self._mask_chat_template is None:
             return [], []
@@ -192,6 +220,7 @@ class PromptAssistantMaskBuilder:
             return_dict=True,
             return_assistant_tokens_mask=True,
             chat_template=self._mask_chat_template,
+            template_kwargs=template_kwargs,
         )
         if not hasattr(encoded, "get"):
             return [], []

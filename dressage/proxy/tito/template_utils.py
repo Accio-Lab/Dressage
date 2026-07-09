@@ -1,4 +1,4 @@
-"""Small chat-template helpers used by TITO concat tokenization."""
+"""Small chat-template helpers used by TITO tokenization."""
 
 from __future__ import annotations
 

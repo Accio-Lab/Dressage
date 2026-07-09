@@ -98,7 +98,7 @@
         {%- endif %}
         {%- set reasoning_content = reasoning_content|trim %}
         {{- '<|im_start|>' + message.role + '\n' }}{% generation %}
-        {%- if loop.index0 > ns.last_query_index %}
+        {%- if (preserve_thinking is defined and preserve_thinking is true) or loop.index0 > ns.last_query_index %}
             {{- '<think>\n' + reasoning_content + '\n</think>\n\n' + content }}
         {%- else %}
             {{- content }}

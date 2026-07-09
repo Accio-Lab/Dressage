@@ -79,8 +79,8 @@ dressage_compute_local_bwrap_resources "${WORKER_COUNT}"
 dressage_validate_proxy_defaults
 dressage_clear_trajectory_logs
 
-if [[ "${TRAJECTORY_BUILD_MODE}" != "last_step" && "${TRAJECTORY_BUILD_MODE}" != "concat" ]]; then
-  echo "TRAJECTORY_BUILD_MODE must be last_step or concat, got: ${TRAJECTORY_BUILD_MODE}" >&2
+if [[ "${TOKEN_BUILD_MODE}" != "snapshot" && "${TOKEN_BUILD_MODE}" != "tito" ]]; then
+  echo "TOKEN_BUILD_MODE must be snapshot or tito, got: ${TOKEN_BUILD_MODE}" >&2
   exit 1
 fi
 
@@ -97,8 +97,8 @@ PROXY_ARGS=(
    --tokenizer-path "${BASE_FOLDER}/Qwen3.5-4B"
    --host "${PROXY_HOST}"
    --port "${PROXY_PORT}"
-   --trajectory-build-mode "${TRAJECTORY_BUILD_MODE}"
-   --trajectory-build-model "${TRAJECTORY_BUILD_MODEL}"
+   --token-build-mode "${TOKEN_BUILD_MODE}"
+   --token-build-model "${TOKEN_BUILD_MODEL}"
    "${COMM_ARGS[@]}"
    --dressage-partial-rollout
    --context-window "${CONTEXT_WINDOW}"

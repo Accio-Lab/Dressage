@@ -68,6 +68,7 @@ class ProxyClient:
         session_id: str | None = None,
         instance_id: str | None = None,
         max_groups: int | None = None,
+        segment_view: str | None = None,
         drain: bool = False,
     ) -> dict:
         payload: dict[str, Any] = {
@@ -81,6 +82,8 @@ class ProxyClient:
             payload["instance_id"] = instance_id
         if max_groups is not None:
             payload["max_groups"] = max_groups
+        if segment_view is not None:
+            payload["segment_view"] = segment_view
 
         response = await self._client.post(
             f"{self._proxy_url}/trajectory/read", json=payload
