@@ -40,10 +40,10 @@ def test_open_source_sandbox_defaults(monkeypatch):
     assert config.local_bwrap_pool_mode(mode="whitebox") == "command_only"
 
 
-def test_trajectory_build_model_qwen35_defaults():
-    defaults = config.trajectory_build_defaults(
-        trajectory_build_mode="concat",
-        trajectory_build_model="qwen3_5",
+def test_token_build_model_qwen35_defaults():
+    defaults = config.token_build_defaults(
+        token_build_mode="tito",
+        token_build_model="qwen3_5",
     )
 
     assert defaults.model_mask_type == "qwen3_5"

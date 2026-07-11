@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import threading
 import time
@@ -18,6 +19,69 @@ IMPLICIT_TURN_ID_PREFIX = "__implicit_turn__:"
 
 class SessionFinalizedError(RuntimeError):
     """Raised when a caller attempts to reuse a finalized session."""
+
+
+RouteType = Literal["append", "branch", "create"]
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+@dataclass
+class Lineage:
+    id: str
+    index: int
+    latest_step_id: str | None
+    branch_from_step_id: str | None = None
+
+
+@dataclass(frozen=True)
+class Route:
+    lineage_id: str
+    type: RouteType
+    base_step_id: str | None
+
+
+class SessionPrefixTree:
+    """Message-prefix candidate index for lineage routing.
+
+    The tree only narrows the candidate set.  Route correctness is decided by
+    rendered chat-template prefix equality in ``server.py``.
+    """
+
+    def __init__(self) -> None:
+        self._by_fingerprint: dict[str, set[str]] = {}
+        self._fingerprint_by_step_id: dict[str, str] = {}
+        self._all_step_ids: list[str] = []
+
+    @staticmethod
+    def fingerprint(messages: list[dict[str, Any]]) -> str:
+        payload = _canonical_json(messages)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def insert(self, step: "StepRecord") -> None:
+        fingerprint = self.fingerprint(step.normalized_messages_snapshot)
+        self._fingerprint_by_step_id[step.step_id] = fingerprint
+        self._by_fingerprint.setdefault(fingerprint, set()).add(step.step_id)
+        self._all_step_ids.append(step.step_id)
+
+    def candidates(self, current_messages: list[dict[str, Any]]) -> list[str]:
+        candidates: list[str] = []
+        seen: set[str] = set()
+        for prefix_len in range(len(current_messages) + 1):
+            fingerprint = self.fingerprint(current_messages[:prefix_len])
+            for step_id in self._by_fingerprint.get(fingerprint, set()):
+                if step_id in seen:
+                    continue
+                seen.add(step_id)
+                candidates.append(step_id)
+        for step_id in self._all_step_ids:
+            if step_id in seen:
+                continue
+            seen.add(step_id)
+            candidates.append(step_id)
+        return candidates
 
 
 @dataclass
@@ -38,6 +102,17 @@ class StepRecord:
     output_token_texts: list[str]
     messages_snapshot: list[dict]
     raw_response_text: str
+    step_id: str = ""
+    lineage_id: str = ""
+    lineage_index: int = 0
+    route_type: RouteType = "create"
+    route_base_step_id: str | None = None
+    normalized_messages_snapshot: list[dict] = field(default_factory=list)
+    snapshot_rendered: str = ""
+    snapshot_rendered_len: int = 0
+    snapshot_tools_hash: str | None = None
+    lineage_segment_boundary_before: bool = False
+    lineage_segment_reasons_before: list[str] = field(default_factory=list)
     prompt_versions: list[str] = field(default_factory=list)
     response_versions: list[str] = field(default_factory=list)
     all_versions: list[str] = field(default_factory=list)
@@ -83,12 +158,32 @@ class Session:
     turn_ids: list[str] = field(default_factory=list)
     active_turn_id: str | None = None
     rollout_epoch: int | None = None
+    lineages: dict[str, Lineage] = field(default_factory=dict)
+    steps_by_id: dict[str, StepRecord] = field(default_factory=dict)
+    prefix_tree: SessionPrefixTree = field(default_factory=SessionPrefixTree)
     request_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     _turn_counter: int = field(default=0, repr=False)
+    _step_counter: int = field(default=0, repr=False)
+    _lineage_counter: int = field(default=0, repr=False)
 
     def next_turn_id(self) -> str:
         self._turn_counter += 1
         return str(self._turn_counter)
+
+    def next_step_id(self) -> str:
+        self._step_counter += 1
+        return f"step-{self._step_counter:06d}"
+
+    def create_lineage(self, *, branch_from_step_id: str | None = None) -> Lineage:
+        self._lineage_counter += 1
+        lineage = Lineage(
+            id=f"lineage-{self._lineage_counter:06d}",
+            index=self._lineage_counter - 1,
+            latest_step_id=None,
+            branch_from_step_id=branch_from_step_id,
+        )
+        self.lineages[lineage.id] = lineage
+        return lineage
 
     @property
     def turns(self) -> list[StepRecord]:
@@ -341,59 +436,99 @@ class SessionManager:
         rewrite_reason: str | None = None,
         segment_reason_before: str | None = None,
         segment_reasons_before: list[str] | None = None,
+        step_id: str | None = None,
+        lineage_id: str | None = None,
+        lineage_index: int | None = None,
+        route_type: RouteType = "create",
+        route_base_step_id: str | None = None,
+        normalized_messages_snapshot: list[dict] | None = None,
+        snapshot_rendered: str = "",
+        snapshot_rendered_len: int = 0,
+        snapshot_tools_hash: str | None = None,
+        lineage_segment_boundary_before: bool = False,
+        lineage_segment_reasons_before: list[str] | None = None,
         finish_reason: str = "stop",
         request_version: str | None = None,
         response_version: str | None = None,
-    ) -> None:
+    ) -> StepRecord | None:
         with self._lock:
             session = self._sessions.get(session_id)
             if session is None:
-                return
-            session.steps.append(
-                StepRecord(
-                    turn_id=turn_id,
-                    request_messages=request_messages,
-                    normalized_request_messages=normalized_request_messages,
-                    prompt_token_ids=prompt_token_ids,
-                    prompt_token_logprobs=prompt_token_logprobs,
-                    snapshot_token_ids=snapshot_token_ids,
-                    response_token_ids=response_token_ids,
-                    response_logprobs=response_logprobs,
-                    response_versions=list(response_versions or []),
-                    all_token_ids=all_token_ids,
-                    all_logprobs=all_logprobs,
-                    all_versions=list(all_versions or []),
-                    prompt_versions=list(prompt_versions or []),
-                    input_token_texts=input_token_texts,
-                    output_token_texts=output_token_texts,
-                    messages_snapshot=messages,
-                    raw_response_text=raw_response_text,
-                    all_logprobs_invalid=all_logprobs_invalid,
-                    concat_token_ids=list(concat_token_ids or []),
-                    concat_response_logprobs=list(concat_response_logprobs or []),
-                    concat_response_mask=list(concat_response_mask or []),
-                    concat_versions=list(concat_versions or []),
-                    concat_context_token_count=concat_context_token_count,
-                    concat_output_token_count=concat_output_token_count,
-                    concat_logprobs_invalid=concat_logprobs_invalid,
-                    concat_incremental_tokenization_failed=(
-                        concat_incremental_tokenization_failed
-                    ),
-                    response_routed_experts=response_routed_experts,
-                    response_routed_experts_chunks=[
-                        dict(item) for item in (response_routed_experts_chunks or [])
-                    ],
-                    tools=tools,
-                    segment_boundary_before=segment_boundary_before,
-                    rewrite_reason=rewrite_reason,
-                    segment_reason_before=segment_reason_before,
-                    segment_reasons_before=list(segment_reasons_before or []),
-                    finish_reason=finish_reason,
-                    request_version=request_version,
-                    response_version=response_version,
-                )
+                return None
+            if step_id is None:
+                step_id = session.next_step_id()
+            if lineage_id is None:
+                lineage = session.create_lineage(branch_from_step_id=route_base_step_id)
+                lineage_id = lineage.id
+                lineage_index = lineage.index
+            elif lineage_index is None:
+                lineage = session.lineages.get(lineage_id)
+                lineage_index = lineage.index if lineage is not None else 0
+
+            step = StepRecord(
+                turn_id=turn_id,
+                request_messages=request_messages,
+                normalized_request_messages=normalized_request_messages,
+                prompt_token_ids=prompt_token_ids,
+                prompt_token_logprobs=prompt_token_logprobs,
+                snapshot_token_ids=snapshot_token_ids,
+                response_token_ids=response_token_ids,
+                response_logprobs=response_logprobs,
+                response_versions=list(response_versions or []),
+                all_token_ids=all_token_ids,
+                all_logprobs=all_logprobs,
+                all_versions=list(all_versions or []),
+                prompt_versions=list(prompt_versions or []),
+                input_token_texts=input_token_texts,
+                output_token_texts=output_token_texts,
+                messages_snapshot=messages,
+                raw_response_text=raw_response_text,
+                step_id=step_id,
+                lineage_id=lineage_id,
+                lineage_index=int(lineage_index or 0),
+                route_type=route_type,
+                route_base_step_id=route_base_step_id,
+                normalized_messages_snapshot=list(normalized_messages_snapshot or messages),
+                snapshot_rendered=snapshot_rendered,
+                snapshot_rendered_len=snapshot_rendered_len,
+                snapshot_tools_hash=snapshot_tools_hash,
+                lineage_segment_boundary_before=lineage_segment_boundary_before,
+                lineage_segment_reasons_before=list(
+                    lineage_segment_reasons_before or []
+                ),
+                all_logprobs_invalid=all_logprobs_invalid,
+                concat_token_ids=list(concat_token_ids or []),
+                concat_response_logprobs=list(concat_response_logprobs or []),
+                concat_response_mask=list(concat_response_mask or []),
+                concat_versions=list(concat_versions or []),
+                concat_context_token_count=concat_context_token_count,
+                concat_output_token_count=concat_output_token_count,
+                concat_logprobs_invalid=concat_logprobs_invalid,
+                concat_incremental_tokenization_failed=(
+                    concat_incremental_tokenization_failed
+                ),
+                response_routed_experts=response_routed_experts,
+                response_routed_experts_chunks=[
+                    dict(item) for item in (response_routed_experts_chunks or [])
+                ],
+                tools=tools,
+                segment_boundary_before=segment_boundary_before,
+                rewrite_reason=rewrite_reason,
+                segment_reason_before=segment_reason_before,
+                segment_reasons_before=list(segment_reasons_before or []),
+                finish_reason=finish_reason,
+                request_version=request_version,
+                response_version=response_version,
             )
+            session.steps.append(step)
+            session.steps_by_id[step.step_id] = step
+            if step.normalized_messages_snapshot:
+                session.prefix_tree.insert(step)
+            lineage = session.lineages.get(step.lineage_id)
+            if lineage is not None:
+                lineage.latest_step_id = step.step_id
             session.last_active = time.time()
+            return step
 
     def record_turn(self, **kwargs: Any) -> None:
         self.record_step(**kwargs)

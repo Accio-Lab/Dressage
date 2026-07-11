@@ -470,6 +470,23 @@ class RolloutLLMProxy:
                 len(tools) if isinstance(tools, list) else 0,
             )
 
+            if is_anthropic:
+                original_request = original_anthropic_request
+                request_kind = "anthropic_messages"
+            elif is_responses:
+                original_request = original_responses_request
+                request_kind = "openai_responses"
+            else:
+                original_request = original_chat_request
+                request_kind = "openai_chat_completions"
+            if snapshot is not None:
+                self._write_model_request_tool_summary(
+                    snapshot=snapshot,
+                    request_kind=request_kind,
+                    original_body=original_request,
+                    converted_body=body_json,
+                )
+
             if (
                 body_json.get("temperature") is None
                 and self.default_temperature is not None
@@ -497,12 +514,6 @@ class RolloutLLMProxy:
                 "stream_options" in body_json,
             )
 
-            if is_anthropic:
-                original_request = original_anthropic_request
-            elif is_responses:
-                original_request = original_responses_request
-            else:
-                original_request = original_chat_request
             if body_json != original_request:
                 body_bytes = json.dumps(body_json, ensure_ascii=False).encode("utf-8")
                 LOGGER.info("[PROXY REQUEST] Final body size: %d bytes", len(body_bytes))
@@ -1375,6 +1386,44 @@ class RolloutLLMProxy:
             "body": body_value,
         }
 
+    def _write_model_request_tool_summary(
+        self,
+        *,
+        snapshot: _TurnSnapshot,
+        request_kind: str,
+        original_body: dict[str, Any] | None,
+        converted_body: dict[str, Any],
+    ) -> None:
+        if self.debug_log_dir is None:
+            return
+
+        raw_tools = _tools_from_request_body(original_body)
+        converted_tools = _tools_from_request_body(converted_body)
+        payload = {
+            "turn_id": snapshot.turn_id,
+            "step": snapshot.step,
+            "request_kind": request_kind,
+            "raw_tool_count": len(raw_tools),
+            "converted_tool_count": len(converted_tools),
+            "raw_tool_names": _tool_names_from_tools(raw_tools),
+            "converted_tool_names": _tool_names_from_tools(converted_tools),
+            "raw_tool_types": _tool_types_from_tools(raw_tools),
+            "converted_tool_types": _tool_types_from_tools(converted_tools),
+        }
+
+        safe_turn_id = self._safe_filename(snapshot.turn_id or "untagged")
+        output_path = (
+            self.debug_log_dir / f"tool_summary.{safe_turn_id}.{snapshot.step}.json"
+        )
+        try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            LOGGER.warning("Failed to write model request tool summary: %s", exc)
+
     def _upstream_response_dump(
         self,
         *,
@@ -1668,12 +1717,15 @@ class RolloutLLMProxy:
         message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
         assert isinstance(message, dict)
         output: list[dict[str, Any]] = []
+        reasoning = _openai_chat_message_reasoning_to_text(message)
         text = _openai_responses_content_to_text(message.get("content"))
-        if text or not isinstance(message.get("tool_calls"), list):
-            output.append(_openai_response_message_item(text))
         tool_calls = message.get("tool_calls")
-        if isinstance(tool_calls, list):
-            output.extend(_openai_tool_calls_to_response_items(tool_calls))
+        tool_call_items = _openai_tool_calls_to_response_items(tool_calls)
+        if reasoning:
+            output.append(_openai_response_reasoning_item(reasoning))
+        if text or not tool_call_items:
+            output.append(_openai_response_message_item(text))
+        output.extend(tool_call_items)
         return {
             "id": str(payload.get("id") or "resp_proxy"),
             "object": "response",
@@ -1691,7 +1743,9 @@ class RolloutLLMProxy:
         response_id = "resp_proxy_stream"
         item_id = "msg_proxy_stream"
         model = str(original_request.get("model") or "proxy-model")
+        reasoning_parts: list[str] = []
         text_parts: list[str] = []
+        tool_call_deltas: dict[int, dict[str, Any]] = {}
         usage: dict[str, int] | None = None
 
         yield _openai_response_sse(
@@ -1706,24 +1760,6 @@ class RolloutLLMProxy:
                     status="in_progress",
                     include_output=False,
                 ),
-            },
-        )
-        yield _openai_response_sse(
-            "response.output_item.added",
-            {
-                "type": "response.output_item.added",
-                "output_index": 0,
-                "item": _openai_response_message_item("", status="in_progress", item_id=item_id),
-            },
-        )
-        yield _openai_response_sse(
-            "response.content_part.added",
-            {
-                "type": "response.content_part.added",
-                "item_id": item_id,
-                "output_index": 0,
-                "content_index": 0,
-                "part": {"type": "output_text", "text": ""},
             },
         )
 
@@ -1743,30 +1779,72 @@ class RolloutLLMProxy:
             choice = _first_openai_choice(chunk)
             delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
             assert isinstance(delta, dict)
+            reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+            if reasoning:
+                reasoning_parts.append(str(reasoning))
             content = delta.get("content")
             if content:
                 text = str(content)
                 text_parts.append(text)
-                yield _openai_response_sse(
-                    "response.output_text.delta",
-                    {
-                        "type": "response.output_text.delta",
-                        "item_id": item_id,
-                        "output_index": 0,
-                        "content_index": 0,
-                        "delta": text,
-                    },
-                )
+            tool_calls = delta.get("tool_calls")
+            if isinstance(tool_calls, list):
+                for tool_call in tool_calls:
+                    _accumulate_openai_stream_tool_call_delta(tool_call_deltas, tool_call)
 
+        final_reasoning = "".join(reasoning_parts)
         final_text = "".join(text_parts)
-        async for event in _openai_response_stream_completion_events(
-            response_id=response_id,
-            item_id=item_id,
-            model=model,
-            text=final_text,
-            usage=usage or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
-        ):
-            yield event
+        usage = usage or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        tool_call_records = _openai_stream_tool_call_records(tool_call_deltas)
+        completed_output: list[dict[str, Any]] = []
+
+        if final_reasoning:
+            output_index = len(completed_output)
+            reasoning_item = _openai_response_reasoning_item(
+                final_reasoning,
+                item_id="rs_proxy_stream",
+            )
+            async for event in _openai_response_stream_reasoning_item_events(
+                output_index=output_index,
+                item=reasoning_item,
+            ):
+                yield event
+            completed_output.append(reasoning_item)
+
+        if final_text or not tool_call_records:
+            output_index = len(completed_output)
+            async for event in _openai_response_stream_text_item_events(
+                item_id=item_id,
+                output_index=output_index,
+                text=final_text,
+            ):
+                yield event
+            completed_output.append(_openai_response_message_item(final_text, item_id=item_id))
+
+        for record in tool_call_records:
+            output_index = len(completed_output)
+            async for event in _openai_response_stream_function_call_item_events(
+                response_id=response_id,
+                output_index=output_index,
+                item=record["item"],
+                argument_deltas=record["argument_deltas"],
+            ):
+                yield event
+            completed_output.append(record["item"])
+
+        yield _openai_response_sse(
+            "response.completed",
+            {
+                "type": "response.completed",
+                "response": _openai_response_payload(
+                    response_id=response_id,
+                    model=model,
+                    text=final_text,
+                    usage=usage,
+                    status="completed",
+                    output=completed_output,
+                ),
+            },
+        )
 
     def _anthropic_messages_to_openai_chat_completion(self, payload: dict[str, Any]) -> dict[str, Any]:
         system_parts: list[str] = []
@@ -2000,6 +2078,41 @@ def _openai_responses_content_to_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+def _openai_chat_message_reasoning_to_text(message: dict[str, Any]) -> str:
+    for key in ("reasoning_content", "reasoning"):
+        if key not in message:
+            continue
+        text = _openai_responses_content_to_text(message.get(key))
+        if text:
+            return text
+    return ""
+
+
+def _openai_response_reasoning_to_text(item: dict[str, Any]) -> str:
+    summary = item.get("summary")
+    if isinstance(summary, list):
+        parts: list[str] = []
+        for part in summary:
+            if isinstance(part, str):
+                parts.append(part)
+                continue
+            if not isinstance(part, dict):
+                parts.append(str(part))
+                continue
+            text = part.get("text") or part.get("summary_text") or part.get("content")
+            if text is not None:
+                parts.append(_openai_responses_content_to_text(text))
+        text = "\n".join(part for part in parts if part)
+        if text:
+            return text
+    for key in ("content", "text", "reasoning_content", "reasoning"):
+        if key in item:
+            text = _openai_responses_content_to_text(item.get(key))
+            if text:
+                return text
+    return ""
+
+
 def _openai_responses_input_to_chat_messages(value: Any) -> tuple[list[str], list[dict[str, Any]]]:
     if value is None:
         return [], []
@@ -2010,17 +2123,50 @@ def _openai_responses_input_to_chat_messages(value: Any) -> tuple[list[str], lis
 
     system_parts: list[str] = []
     messages: list[dict[str, Any]] = []
+    pending_assistant_index: int | None = None
+    pending_reasoning_content: str | None = None
     for item in value:
         if isinstance(item, str):
+            pending_assistant_index = None
+            pending_reasoning_content = None
             messages.append({"role": "user", "content": item})
             continue
         if not isinstance(item, dict):
+            pending_assistant_index = None
+            pending_reasoning_content = None
             messages.append({"role": "user", "content": _openai_responses_content_to_text(item)})
             continue
         item_type = item.get("type")
-        if item_type == "function_call":
-            messages.append(_openai_response_function_call_to_chat_message(item))
+        if item_type == "reasoning":
+            pending_assistant_index = None
+            reasoning_text = _openai_response_reasoning_to_text(item)
+            if reasoning_text:
+                pending_reasoning_content = (
+                    f"{pending_reasoning_content}\n{reasoning_text}"
+                    if pending_reasoning_content
+                    else reasoning_text
+                )
+        elif item_type == "function_call":
+            tool_call = _openai_response_function_call_to_chat_tool_call(item)
+            if pending_assistant_index is not None:
+                pending_message = messages[pending_assistant_index]
+                tool_calls = pending_message.get("tool_calls")
+                if not isinstance(tool_calls, list):
+                    tool_calls = []
+                    pending_message["tool_calls"] = tool_calls
+                tool_calls.append(tool_call)
+            else:
+                messages.append(
+                    _openai_response_function_call_to_chat_message(
+                        item,
+                        reasoning_content=pending_reasoning_content,
+                    )
+                )
+                pending_reasoning_content = None
+                pending_assistant_index = len(messages) - 1
         elif item_type == "function_call_output":
+            pending_assistant_index = None
+            pending_reasoning_content = None
             messages.append(
                 {
                     "role": "tool",
@@ -2032,40 +2178,58 @@ def _openai_responses_input_to_chat_messages(value: Any) -> tuple[list[str], lis
             role = str(item.get("role") or "user").lower()
             content = _openai_responses_content_to_text(item.get("content"))
             if role in {"developer", "system"}:
+                pending_assistant_index = None
+                pending_reasoning_content = None
                 if content:
                     system_parts.append(content)
                 continue
             if role not in {"user", "assistant", "tool"}:
                 role = "user"
-            messages.append(
-                {
-                    "role": role,
-                    "content": content,
-                }
-            )
+            message: dict[str, Any] = {"role": role, "content": content}
+            if role == "assistant" and pending_reasoning_content:
+                message["reasoning_content"] = pending_reasoning_content
+                pending_reasoning_content = None
+            else:
+                pending_reasoning_content = None
+            messages.append(message)
+            if role == "assistant":
+                pending_assistant_index = len(messages) - 1
+            else:
+                pending_assistant_index = None
         else:
+            pending_assistant_index = None
+            pending_reasoning_content = None
             messages.append({"role": "user", "content": json.dumps(item, ensure_ascii=False)})
     return system_parts, messages
 
 
-def _openai_response_function_call_to_chat_message(item: dict[str, Any]) -> dict[str, Any]:
+def _openai_response_function_call_to_chat_tool_call(item: dict[str, Any]) -> dict[str, Any]:
     arguments = item.get("arguments")
     if not isinstance(arguments, str):
         arguments = json.dumps(arguments or {}, ensure_ascii=False)
     return {
+        "id": str(item.get("call_id") or item.get("id") or "call_proxy"),
+        "type": "function",
+        "function": {
+            "name": str(item.get("name") or "tool"),
+            "arguments": arguments,
+        },
+    }
+
+
+def _openai_response_function_call_to_chat_message(
+    item: dict[str, Any],
+    *,
+    reasoning_content: str | None = None,
+) -> dict[str, Any]:
+    message: dict[str, Any] = {
         "role": "assistant",
         "content": None,
-        "tool_calls": [
-            {
-                "id": str(item.get("call_id") or item.get("id") or "call_proxy"),
-                "type": "function",
-                "function": {
-                    "name": str(item.get("name") or "tool"),
-                    "arguments": arguments,
-                },
-            }
-        ],
+        "tool_calls": [_openai_response_function_call_to_chat_tool_call(item)],
     }
+    if reasoning_content:
+        message["reasoning_content"] = reasoning_content
+    return message
 
 
 def _openai_responses_tools_to_chat_tools(value: Any) -> list[dict[str, Any]]:
@@ -2087,6 +2251,48 @@ def _openai_responses_tools_to_chat_tools(value: Any) -> list[dict[str, Any]]:
             function["strict"] = raw_function["strict"]
         tools.append({"type": "function", "function": function})
     return tools
+
+
+def _tools_from_request_body(body: dict[str, Any] | None) -> list[Any]:
+    if not isinstance(body, dict):
+        return []
+    tools = body.get("tools")
+    return list(tools) if isinstance(tools, list) else []
+
+
+def _tool_names_from_tools(tools: list[Any], *, prefix: str = "") -> list[str]:
+    names: list[str] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+
+        raw_function = tool.get("function")
+        if isinstance(raw_function, dict):
+            name = raw_function.get("name")
+        else:
+            name = tool.get("name")
+        child_tools = tool.get("tools")
+        has_child_tools = isinstance(child_tools, list)
+        if name is not None and (
+            isinstance(raw_function, dict)
+            or tool.get("type") == "function"
+            or not has_child_tools
+        ):
+            names.append(f"{prefix}{name}")
+
+        if has_child_tools:
+            namespace = str(tool.get("name") or tool.get("namespace") or "")
+            child_prefix = f"{prefix}{namespace}." if namespace else prefix
+            names.extend(_tool_names_from_tools(child_tools, prefix=child_prefix))
+    return names
+
+
+def _tool_types_from_tools(tools: list[Any]) -> list[str]:
+    types: list[str] = []
+    for tool in tools:
+        if isinstance(tool, dict):
+            types.append(str(tool.get("type") or ""))
+    return types
 
 
 def _openai_responses_tool_choice_to_chat(value: Any) -> Any:
@@ -2118,6 +2324,18 @@ def _openai_response_message_item(
     }
 
 
+def _openai_response_reasoning_item(
+    text: str,
+    *,
+    item_id: str = "rs_proxy",
+) -> dict[str, Any]:
+    return {
+        "id": item_id,
+        "type": "reasoning",
+        "summary": [{"type": "summary_text", "text": text}],
+    }
+
+
 def _openai_response_payload(
     *,
     response_id: str,
@@ -2127,16 +2345,38 @@ def _openai_response_payload(
     status: str,
     item_id: str = "msg_proxy",
     include_output: bool = True,
+    output: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    if output is not None:
+        response_output = output
+    elif include_output:
+        response_output = [_openai_response_message_item(text, status=status, item_id=item_id)]
+    else:
+        response_output = []
     return {
         "id": response_id,
         "object": "response",
         "status": status,
         "model": model,
-        "output": [_openai_response_message_item(text, status=status, item_id=item_id)]
-        if include_output
-        else [],
+        "output": response_output,
         "usage": usage,
+    }
+
+
+def _openai_response_function_call_item(
+    *,
+    call_id: str,
+    name: str,
+    arguments: str,
+    status: str = "completed",
+) -> dict[str, Any]:
+    return {
+        "type": "function_call",
+        "id": f"fc_{call_id}",
+        "call_id": call_id,
+        "name": name,
+        "arguments": arguments,
+        "status": status,
     }
 
 
@@ -2155,16 +2395,68 @@ def _openai_tool_calls_to_response_items(value: Any) -> list[dict[str, Any]]:
         if not isinstance(arguments, str):
             arguments = json.dumps(arguments or {}, ensure_ascii=False)
         items.append(
-            {
-                "type": "function_call",
-                "id": f"fc_{call_id}",
-                "call_id": call_id,
-                "name": str(function.get("name") or "tool"),
-                "arguments": arguments,
-                "status": "completed",
-            }
+            _openai_response_function_call_item(
+                call_id=call_id,
+                name=str(function.get("name") or "tool"),
+                arguments=arguments,
+            )
         )
     return items
+
+
+def _accumulate_openai_stream_tool_call_delta(
+    tool_call_deltas: dict[int, dict[str, Any]],
+    tool_call: Any,
+) -> None:
+    if not isinstance(tool_call, dict):
+        return
+    raw_index = tool_call.get("index")
+    try:
+        index = int(raw_index)
+    except (TypeError, ValueError):
+        index = 0
+    state = tool_call_deltas.setdefault(
+        index,
+        {"id": None, "type": None, "name": None, "arguments_parts": []},
+    )
+    if tool_call.get("id"):
+        state["id"] = str(tool_call["id"])
+    if tool_call.get("type"):
+        state["type"] = str(tool_call["type"])
+    function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+    if not isinstance(function, dict):
+        function = {}
+    if function.get("name"):
+        state["name"] = str(function["name"])
+    if "arguments" in function and function.get("arguments") is not None:
+        arguments_delta = function.get("arguments")
+        if not isinstance(arguments_delta, str):
+            arguments_delta = json.dumps(arguments_delta or {}, ensure_ascii=False)
+        state["arguments_parts"].append(arguments_delta)
+
+
+def _openai_stream_tool_call_records(
+    tool_call_deltas: dict[int, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for index in sorted(tool_call_deltas):
+        state = tool_call_deltas[index]
+        argument_deltas = [
+            str(part)
+            for part in state.get("arguments_parts", [])
+            if part is not None
+        ]
+        if not (state.get("id") or state.get("name") or argument_deltas):
+            continue
+        call_id = str(state.get("id") or f"call_proxy_{index}")
+        arguments = "".join(argument_deltas)
+        item = _openai_response_function_call_item(
+            call_id=call_id,
+            name=str(state.get("name") or "tool"),
+            arguments=arguments,
+        )
+        records.append({"item": item, "argument_deltas": argument_deltas})
+    return records
 
 
 def _openai_usage_to_response_usage(value: Any) -> dict[str, int]:
@@ -2205,84 +2497,12 @@ async def _openai_response_stream_events_for_text(
             ),
         },
     )
-    yield _openai_response_sse(
-        "response.output_item.added",
-        {
-                "type": "response.output_item.added",
-                "output_index": 0,
-                "item": _openai_response_message_item("", status="in_progress", item_id=item_id),
-            },
-        )
-    yield _openai_response_sse(
-        "response.content_part.added",
-        {
-            "type": "response.content_part.added",
-            "item_id": item_id,
-            "output_index": 0,
-            "content_index": 0,
-            "part": {"type": "output_text", "text": ""},
-        },
-    )
-    if text:
-        yield _openai_response_sse(
-            "response.output_text.delta",
-            {
-                "type": "response.output_text.delta",
-                "item_id": item_id,
-                "output_index": 0,
-                "content_index": 0,
-                "delta": text,
-            },
-        )
-    async for event in _openai_response_stream_completion_events(
-        response_id=response_id,
+    async for event in _openai_response_stream_text_item_events(
         item_id=item_id,
-        model=model,
+        output_index=0,
         text=text,
-        usage=usage,
     ):
         yield event
-
-
-async def _openai_response_stream_completion_events(
-    *,
-    response_id: str,
-    item_id: str,
-    model: str,
-    text: str,
-    usage: dict[str, int],
-):
-    message = _openai_response_message_item(text, item_id=item_id)
-    part = {"type": "output_text", "text": text}
-    yield _openai_response_sse(
-        "response.output_text.done",
-        {
-            "type": "response.output_text.done",
-            "item_id": item_id,
-            "output_index": 0,
-            "content_index": 0,
-            "text": text,
-        },
-    )
-    yield _openai_response_sse(
-        "response.content_part.done",
-        {
-            "type": "response.content_part.done",
-            "item_id": item_id,
-            "output_index": 0,
-            "content_index": 0,
-            "part": part,
-        },
-    )
-    yield _openai_response_sse(
-        "response.output_item.done",
-        {
-            "type": "response.output_item.done",
-            "item_id": item_id,
-            "output_index": 0,
-            "item": message,
-        },
-    )
     yield _openai_response_sse(
         "response.completed",
         {
@@ -2295,6 +2515,157 @@ async def _openai_response_stream_completion_events(
                 status="completed",
                 item_id=item_id,
             ),
+        },
+    )
+
+
+async def _openai_response_stream_reasoning_item_events(
+    *,
+    output_index: int,
+    item: dict[str, Any],
+):
+    item_id = str(item["id"])
+    yield _openai_response_sse(
+        "response.output_item.added",
+        {
+            "type": "response.output_item.added",
+            "item_id": item_id,
+            "output_index": output_index,
+            "item": item,
+        },
+    )
+    yield _openai_response_sse(
+        "response.output_item.done",
+        {
+            "type": "response.output_item.done",
+            "item_id": item_id,
+            "output_index": output_index,
+            "item": item,
+        },
+    )
+
+
+async def _openai_response_stream_text_item_events(
+    *,
+    item_id: str,
+    output_index: int,
+    text: str,
+):
+    message = _openai_response_message_item(text, item_id=item_id)
+    part = {"type": "output_text", "text": text}
+    yield _openai_response_sse(
+        "response.output_item.added",
+        {
+            "type": "response.output_item.added",
+            "output_index": output_index,
+            "item": _openai_response_message_item("", status="in_progress", item_id=item_id),
+        },
+    )
+    yield _openai_response_sse(
+        "response.content_part.added",
+        {
+            "type": "response.content_part.added",
+            "item_id": item_id,
+            "output_index": output_index,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": ""},
+        },
+    )
+    if text:
+        yield _openai_response_sse(
+            "response.output_text.delta",
+            {
+                "type": "response.output_text.delta",
+                "item_id": item_id,
+                "output_index": output_index,
+                "content_index": 0,
+                "delta": text,
+            },
+        )
+    yield _openai_response_sse(
+        "response.output_text.done",
+        {
+            "type": "response.output_text.done",
+            "item_id": item_id,
+            "output_index": output_index,
+            "content_index": 0,
+            "text": text,
+        },
+    )
+    yield _openai_response_sse(
+        "response.content_part.done",
+        {
+            "type": "response.content_part.done",
+            "item_id": item_id,
+            "output_index": output_index,
+            "content_index": 0,
+            "part": part,
+        },
+    )
+    yield _openai_response_sse(
+        "response.output_item.done",
+        {
+            "type": "response.output_item.done",
+            "item_id": item_id,
+            "output_index": output_index,
+            "item": message,
+        },
+    )
+
+
+async def _openai_response_stream_function_call_item_events(
+    *,
+    response_id: str,
+    output_index: int,
+    item: dict[str, Any],
+    argument_deltas: list[str],
+):
+    item_id = str(item["id"])
+    in_progress_item = dict(item)
+    in_progress_item["status"] = "in_progress"
+    in_progress_item["arguments"] = ""
+    deltas = list(argument_deltas)
+    if not deltas and item.get("arguments"):
+        deltas = [str(item["arguments"])]
+    yield _openai_response_sse(
+        "response.output_item.added",
+        {
+            "type": "response.output_item.added",
+            "response_id": response_id,
+            "output_index": output_index,
+            "item": in_progress_item,
+        },
+    )
+    for delta in deltas:
+        yield _openai_response_sse(
+            "response.function_call_arguments.delta",
+            {
+                "type": "response.function_call_arguments.delta",
+                "response_id": response_id,
+                "item_id": item_id,
+                "output_index": output_index,
+                "delta": delta,
+            },
+        )
+    yield _openai_response_sse(
+        "response.function_call_arguments.done",
+        {
+            "type": "response.function_call_arguments.done",
+            "response_id": response_id,
+            "item_id": item_id,
+            "output_index": output_index,
+            "arguments": str(item.get("arguments") or ""),
+            "item": item,
+        },
+    )
+    yield _openai_response_sse(
+        "response.output_item.done",
+        {
+            "type": "response.output_item.done",
+            "response_id": response_id,
+            "item_id": item_id,
+            "output_index": output_index,
+            "item": item,
         },
     )
 

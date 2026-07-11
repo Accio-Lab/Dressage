@@ -88,6 +88,38 @@ class TrajectoryStore:
     def _trajectory_key(item: TrajectorySegment) -> str:
         return item.trajectory_id
 
+    @staticmethod
+    def _item_segment_view(item: TrajectorySegment) -> str | None:
+        value = item.extra_info.get("segment_view")
+        return str(value) if value is not None else None
+
+    @staticmethod
+    def _item_token_build_mode(item: TrajectorySegment) -> str | None:
+        value = item.extra_info.get("token_build_mode")
+        return str(value) if value is not None else None
+
+    @classmethod
+    def _default_segment_view(cls, items: list[TrajectorySegment]) -> str | None:
+        token_build_modes = {cls._item_token_build_mode(item) for item in items}
+        if "tito" in token_build_modes:
+            return "lineage"
+        if "snapshot" in token_build_modes:
+            return "timeline"
+        return None
+
+    @classmethod
+    def _filter_segment_view(
+        cls,
+        items: list[TrajectorySegment],
+        segment_view: str | None,
+    ) -> list[TrajectorySegment]:
+        selected_view = segment_view or cls._default_segment_view(items)
+        if selected_view is None:
+            return list(items)
+        return [
+            item for item in items if cls._item_segment_view(item) == selected_view
+        ]
+
     def write(self, item: TrajectorySegment) -> None:
         with self._lock:
             self._by_instance.setdefault(item.instance_id, []).append(item)
@@ -144,17 +176,24 @@ class TrajectoryStore:
         return item
 
     def read_trajectory(
-        self, trajectory_id: str, instance_id: str | None = None
+        self,
+        trajectory_id: str,
+        instance_id: str | None = None,
+        segment_view: str | None = None,
     ) -> list[dict]:
         with self._lock:
             items = self._by_trajectory.get(trajectory_id, [])
             if instance_id is not None:
                 items = [item for item in items if item.instance_id == instance_id]
+            items = self._filter_segment_view(items, segment_view)
             items = sorted(items, key=lambda item: (item.segment_index, item.timestamp))
             return [copy.deepcopy(item.to_dict()) for item in items]
 
     def pop_trajectory(
-        self, trajectory_id: str, instance_id: str | None = None
+        self,
+        trajectory_id: str,
+        instance_id: str | None = None,
+        segment_view: str | None = None,
     ) -> list[dict]:
         """Read and remove finalized segments for one trajectory.
 
@@ -178,6 +217,8 @@ class TrajectoryStore:
             if not matched:
                 return []
 
+            returned = self._filter_segment_view(matched, segment_view)
+
             if remaining_by_trajectory:
                 self._by_trajectory[trajectory_id] = remaining_by_trajectory
             else:
@@ -198,10 +239,10 @@ class TrajectoryStore:
                     self._by_instance.pop(affected_instance_id, None)
                     self._instance_timestamps.pop(affected_instance_id, None)
 
-            matched = sorted(
-                matched, key=lambda item: (item.segment_index, item.timestamp)
+            returned = sorted(
+                returned, key=lambda item: (item.segment_index, item.timestamp)
             )
-            return [copy.deepcopy(item.to_dict()) for item in matched]
+            return [copy.deepcopy(item.to_dict()) for item in returned]
 
     def read_session(self, session_id: str, instance_id: str | None = None) -> list[dict]:
         return self.read_trajectory(session_id, instance_id=instance_id)
@@ -245,10 +286,24 @@ class TrajectoryStore:
                     ]
                     if trajectory_items:
                         self._by_trajectory[item.trajectory_id] = trajectory_items
-                    else:
-                        self._by_trajectory.pop(item.trajectory_id, None)
+                else:
+                    self._by_trajectory.pop(item.trajectory_id, None)
                 self._instance_timestamps.pop(instance_id, None)
-                groups.append([copy.deepcopy(item.to_dict()) for item in items])
+                by_trajectory: dict[str, list[TrajectorySegment]] = {}
+                for item in items:
+                    by_trajectory.setdefault(item.trajectory_id, []).append(item)
+                default_items: list[TrajectorySegment] = []
+                for trajectory_items in by_trajectory.values():
+                    default_items.extend(self._filter_segment_view(trajectory_items, None))
+                default_items = sorted(
+                    default_items,
+                    key=lambda item: (
+                        item.trajectory_id,
+                        item.segment_index,
+                        item.timestamp,
+                    ),
+                )
+                groups.append([copy.deepcopy(item.to_dict()) for item in default_items])
             return groups
 
     def stats(self) -> dict:

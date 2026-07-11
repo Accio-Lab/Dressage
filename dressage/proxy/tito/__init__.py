@@ -1,4 +1,4 @@
-"""Incremental tokenization helpers for concat trajectory building."""
+"""Incremental tokenization helpers for TITO trajectory building."""
 
 from __future__ import annotations
 

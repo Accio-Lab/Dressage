@@ -514,6 +514,673 @@ def test_rollout_proxy_bridges_openai_responses_to_chat_completions():
     assert headers["x-turn-id"] == "turn-001"
 
 
+def test_rollout_proxy_coalesces_responses_message_and_function_call_history():
+    proxy = _make_proxy()
+
+    payload = proxy._openai_responses_to_chat_completion(
+        {
+            "model": "proxy-model",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "I'll call a tool."}],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "spawn_agent",
+                    "arguments": "{\"prompt\":\"solve\"}",
+                },
+            ],
+        }
+    )
+
+    assert payload["messages"] == [
+        {
+            "role": "assistant",
+            "content": "I'll call a tool.",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "spawn_agent",
+                        "arguments": "{\"prompt\":\"solve\"}",
+                    },
+                }
+            ],
+        }
+    ]
+
+
+def test_rollout_proxy_round_trips_responses_reasoning_message_and_function_call():
+    proxy = _make_proxy()
+
+    response_payload = proxy._chat_completion_to_openai_response(
+        {
+            "id": "chatcmpl-1",
+            "model": "proxy-model",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "reasoning_content": "I should delegate.",
+                        "content": "I'll spawn a helper.",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "spawn_agent",
+                                    "arguments": "{\"prompt\":\"solve\"}",
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+        },
+        {"model": "proxy-model"},
+    )
+
+    assert [item["type"] for item in response_payload["output"]] == [
+        "reasoning",
+        "message",
+        "function_call",
+    ]
+    assert response_payload["output"][0]["summary"] == [
+        {"type": "summary_text", "text": "I should delegate."}
+    ]
+
+    replay_payload = proxy._openai_responses_to_chat_completion(
+        {
+            "model": "proxy-model",
+            "input": [
+                *response_payload["output"],
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "agent-1",
+                },
+            ],
+        }
+    )
+
+    assert replay_payload["messages"] == [
+        {
+            "role": "assistant",
+            "content": "I'll spawn a helper.",
+            "reasoning_content": "I should delegate.",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "spawn_agent",
+                        "arguments": "{\"prompt\":\"solve\"}",
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "agent-1"},
+    ]
+
+
+def test_rollout_proxy_attaches_reasoning_to_standalone_function_call_group():
+    proxy = _make_proxy()
+
+    payload = proxy._openai_responses_to_chat_completion(
+        {
+            "model": "proxy-model",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "Need a helper."}],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "spawn_agent",
+                    "arguments": "{\"prompt\":\"solve\"}",
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_2",
+                    "name": "wait_agent",
+                    "arguments": "{\"agent_id\":\"agent-1\"}",
+                },
+            ],
+        }
+    )
+
+    assert payload["messages"] == [
+        {
+            "role": "assistant",
+            "content": None,
+            "reasoning_content": "Need a helper.",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "spawn_agent",
+                        "arguments": "{\"prompt\":\"solve\"}",
+                    },
+                },
+                {
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {
+                        "name": "wait_agent",
+                        "arguments": "{\"agent_id\":\"agent-1\"}",
+                    },
+                },
+            ],
+        }
+    ]
+
+
+def test_rollout_proxy_clears_pending_reasoning_on_boundaries():
+    proxy = _make_proxy()
+
+    payload = proxy._openai_responses_to_chat_completion(
+        {
+            "model": "proxy-model",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "Do not leak."}],
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_0",
+                    "output": "result",
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "spawn_agent",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "Attach me."}],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "break"}],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "No reasoning."}],
+                },
+            ],
+        }
+    )
+
+    assert payload["messages"] == [
+        {"role": "tool", "tool_call_id": "call_0", "content": "result"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "spawn_agent", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "user", "content": "break"},
+        {"role": "assistant", "content": "No reasoning."},
+    ]
+
+
+def test_rollout_proxy_coalesces_multiple_responses_function_calls_in_order():
+    proxy = _make_proxy()
+
+    payload = proxy._openai_responses_to_chat_completion(
+        {
+            "model": "proxy-model",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Two calls."}],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "spawn_agent",
+                    "arguments": "{\"prompt\":\"solve\"}",
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_2",
+                    "name": "wait_agent",
+                    "arguments": "{\"agent_id\":\"agent-1\"}",
+                },
+            ],
+        }
+    )
+
+    assistant = payload["messages"][0]
+    assert assistant["role"] == "assistant"
+    assert assistant["content"] == "Two calls."
+    assert [call["id"] for call in assistant["tool_calls"]] == ["call_1", "call_2"]
+    assert [call["function"]["name"] for call in assistant["tool_calls"]] == [
+        "spawn_agent",
+        "wait_agent",
+    ]
+
+
+def test_rollout_proxy_coalesces_standalone_responses_function_calls():
+    proxy = _make_proxy()
+
+    payload = proxy._openai_responses_to_chat_completion(
+        {
+            "model": "proxy-model",
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "spawn_agent",
+                    "arguments": "{\"prompt\":\"solve\"}",
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_2",
+                    "name": "wait_agent",
+                    "arguments": "{\"agent_id\":\"agent-1\"}",
+                },
+            ],
+        }
+    )
+
+    assert payload["messages"] == [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "spawn_agent",
+                        "arguments": "{\"prompt\":\"solve\"}",
+                    },
+                },
+                {
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {
+                        "name": "wait_agent",
+                        "arguments": "{\"agent_id\":\"agent-1\"}",
+                    },
+                },
+            ],
+        }
+    ]
+
+
+def test_rollout_proxy_does_not_coalesce_function_calls_across_boundaries():
+    proxy = _make_proxy()
+
+    payload = proxy._openai_responses_to_chat_completion(
+        {
+            "model": "proxy-model",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Done."}],
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_0",
+                    "output": "result",
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "spawn_agent",
+                    "arguments": "{\"prompt\":\"solve\"}",
+                },
+            ],
+        }
+    )
+
+    assert payload["messages"] == [
+        {"role": "assistant", "content": "Done."},
+        {"role": "tool", "tool_call_id": "call_0", "content": "result"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "spawn_agent",
+                        "arguments": "{\"prompt\":\"solve\"}",
+                    },
+                }
+            ],
+        },
+    ]
+
+
+def test_rollout_proxy_clears_pending_assistant_on_user_system_and_unknown_items():
+    proxy = _make_proxy()
+
+    payload = proxy._openai_responses_to_chat_completion(
+        {
+            "model": "proxy-model",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "First."}],
+                },
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "developer note"}],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_after_developer",
+                    "name": "spawn_agent",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Second."}],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "user break"}],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_after_user",
+                    "name": "wait_agent",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Third."}],
+                },
+                {"type": "unknown", "value": "break"},
+                {
+                    "type": "function_call",
+                    "call_id": "call_after_unknown",
+                    "name": "exec_command",
+                    "arguments": "{}",
+                },
+            ],
+        }
+    )
+
+    assert payload["messages"] == [
+        {"role": "system", "content": "developer note"},
+        {"role": "assistant", "content": "First."},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_after_developer",
+                    "type": "function",
+                    "function": {"name": "spawn_agent", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "assistant", "content": "Second."},
+        {"role": "user", "content": "user break"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_after_user",
+                    "type": "function",
+                    "function": {"name": "wait_agent", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "assistant", "content": "Third."},
+        {"role": "user", "content": "{\"type\": \"unknown\", \"value\": \"break\"}"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_after_unknown",
+                    "type": "function",
+                    "function": {"name": "exec_command", "arguments": "{}"},
+                }
+            ],
+        },
+    ]
+
+
+def test_rollout_proxy_bridges_coalesced_responses_history_to_chat_completions():
+    proxy = _make_proxy()
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-1",
+                "model": "proxy-model",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            },
+        )
+
+    async def run_test() -> None:
+        proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await proxy.open_turn("turn-001", backend_session_id="codex-session-1")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.app),
+            base_url="http://proxy",
+        ) as client:
+            response = await client.post(
+                "/v1/responses",
+                json={
+                    "model": "proxy-model",
+                    "input": [
+                        {"type": "message", "role": "user", "content": "hi"},
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "I'll spawn."}],
+                        },
+                        {
+                            "type": "function_call",
+                            "call_id": "call_1",
+                            "name": "spawn_agent",
+                            "arguments": "{\"prompt\":\"solve\"}",
+                        },
+                        {
+                            "type": "function_call_output",
+                            "call_id": "call_1",
+                            "output": "agent-1",
+                        },
+                    ],
+                },
+            )
+        await proxy.drain_turn(timeout=1.0)
+        await proxy.clear_turn()
+        await proxy._client.aclose()
+
+        assert response.status_code == 200
+
+    asyncio.run(run_test())
+
+    assert captured["payload"]["messages"] == [
+        {"role": "user", "content": "hi"},
+        {
+            "role": "assistant",
+            "content": "I'll spawn.",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "spawn_agent",
+                        "arguments": "{\"prompt\":\"solve\"}",
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "agent-1"},
+    ]
+
+
+def test_rollout_proxy_keeps_text_when_chat_tool_calls_are_empty():
+    proxy = _make_proxy()
+
+    payload = proxy._chat_completion_to_openai_response(
+        {
+            "id": "chatcmpl-1",
+            "model": "proxy-model",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "plain text",
+                        "tool_calls": [],
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+        },
+        {"model": "proxy-model"},
+    )
+
+    assert [item["type"] for item in payload["output"]] == ["message"]
+    assert payload["output"][0]["content"] == [{"type": "output_text", "text": "plain text"}]
+
+
+def test_rollout_proxy_omits_empty_text_when_chat_completion_only_calls_tool():
+    proxy = _make_proxy()
+
+    payload = proxy._chat_completion_to_openai_response(
+        {
+            "id": "chatcmpl-1",
+            "model": "proxy-model",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "spawn_agent",
+                                    "arguments": "{\"prompt\":\"solve\"}",
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+        },
+        {"model": "proxy-model"},
+    )
+
+    assert [item["type"] for item in payload["output"]] == ["function_call"]
+    assert payload["output"][0]["name"] == "spawn_agent"
+
+
+def test_rollout_proxy_writes_openai_responses_tool_summary(tmp_path: Path):
+    proxy = _make_proxy(debug_log_dir=tmp_path)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-1",
+                "model": "proxy-model",
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
+        )
+
+    async def run_test() -> None:
+        proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await proxy.open_turn("turn-001", backend_session_id="codex-session-1")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.app),
+            base_url="http://proxy",
+        ) as client:
+            response = await client.post(
+                "/v1/responses",
+                json={
+                    "model": "proxy-model",
+                    "input": "hi",
+                    "stream": False,
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "spawn_agent",
+                            "description": "spawn an agent",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                        {
+                            "type": "namespace",
+                            "name": "collaboration",
+                            "tools": [
+                                {
+                                    "type": "function",
+                                    "name": "wait_agent",
+                                    "description": "wait for an agent",
+                                    "parameters": {
+                                        "type": "object",
+                                        "properties": {},
+                                    },
+                                }
+                            ],
+                        },
+                    ],
+                },
+            )
+        await proxy.drain_turn(timeout=1.0)
+        await proxy.clear_turn()
+        await proxy._client.aclose()
+
+        assert response.status_code == 200
+
+    asyncio.run(run_test())
+
+    summary_path = tmp_path / "tool_summary.turn-001.0.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["request_kind"] == "openai_responses"
+    assert summary["raw_tool_count"] == 2
+    assert summary["converted_tool_count"] == 1
+    assert summary["raw_tool_names"] == ["spawn_agent", "collaboration.wait_agent"]
+    assert summary["converted_tool_names"] == ["spawn_agent"]
+    assert summary["raw_tool_types"] == ["function", "namespace"]
+    assert summary["converted_tool_types"] == ["function"]
+
+
 def test_rollout_proxy_streams_chat_chunks_as_openai_response_events():
     proxy = _make_proxy()
     captured: dict[str, object] = {}
@@ -573,14 +1240,12 @@ def test_rollout_proxy_streams_chat_chunks_as_openai_response_events():
         "response.output_item.added",
         "response.content_part.added",
         "response.output_text.delta",
-        "response.output_text.delta",
         "response.output_text.done",
         "response.content_part.done",
         "response.output_item.done",
         "response.completed",
     ]
-    assert events[3][1]["delta"] == "hel"
-    assert events[4][1]["delta"] == "lo"
+    assert events[3][1]["delta"] == "hello"
     completed = events[-1][1]["response"]
     assert completed["status"] == "completed"
     assert completed["output"][0]["content"] == [{"type": "output_text", "text": "hello"}]
@@ -592,6 +1257,258 @@ def test_rollout_proxy_streams_chat_chunks_as_openai_response_events():
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+
+
+def test_rollout_proxy_streams_chat_tool_calls_as_openai_response_events():
+    proxy = _make_proxy()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        _ = request
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=MockAsyncByteStream(
+                [
+                    _sse_event(
+                        {
+                            "id": "chatcmpl-stream",
+                            "model": "proxy-model",
+                            "choices": [{"delta": {"content": "I'll use "}}],
+                        }
+                    ),
+                    _sse_event(
+                        {
+                            "id": "chatcmpl-stream",
+                            "choices": [{"delta": {"content": "a helper."}}],
+                        }
+                    ),
+                    _sse_event(
+                        {
+                            "id": "chatcmpl-stream",
+                            "choices": [
+                                {
+                                    "delta": {
+                                        "tool_calls": [
+                                            {
+                                                "index": 0,
+                                                "id": "call_spawn",
+                                                "type": "function",
+                                                "function": {
+                                                    "name": "spawn_agent",
+                                                    "arguments": "{\"prompt\":",
+                                                },
+                                            }
+                                        ]
+                                    }
+                                }
+                            ],
+                        }
+                    ),
+                    _sse_event(
+                        {
+                            "id": "chatcmpl-stream",
+                            "choices": [
+                                {
+                                    "delta": {
+                                        "tool_calls": [
+                                            {
+                                                "index": 0,
+                                                "function": {"arguments": "\"solve\"}"},
+                                            }
+                                        ]
+                                    },
+                                    "finish_reason": "tool_calls",
+                                }
+                            ],
+                            "usage": {"prompt_tokens": 9, "completion_tokens": 4, "total_tokens": 13},
+                        }
+                    ),
+                    b"data: [DONE]\n\n",
+                ]
+            ),
+        )
+
+    async def run_test() -> bytes:
+        proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await proxy.open_turn("turn-001", backend_session_id="codex-session-1")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.app),
+            base_url="http://proxy",
+        ) as client:
+            async with client.stream(
+                "POST",
+                "/v1/responses",
+                json={"model": "proxy-model", "input": "spawn", "stream": True},
+            ) as response:
+                body = await response.aread()
+        await proxy.drain_turn(timeout=1.0)
+        await proxy.clear_turn()
+        await proxy._client.aclose()
+
+        assert response.status_code == 200
+        return body
+
+    body = asyncio.run(run_test())
+    events = _sse_events_from_body(body)
+    event_names = [name for name, _ in events]
+    assert event_names == [
+        "response.created",
+        "response.output_item.added",
+        "response.content_part.added",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.content_part.done",
+        "response.output_item.done",
+        "response.output_item.added",
+        "response.function_call_arguments.delta",
+        "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
+        "response.output_item.done",
+        "response.completed",
+    ]
+    assert events[3][1]["delta"] == "I'll use a helper."
+    function_added = events[7][1]
+    assert function_added["output_index"] == 1
+    assert function_added["item"]["type"] == "function_call"
+    assert function_added["item"]["status"] == "in_progress"
+    assert function_added["item"]["arguments"] == ""
+    assert events[8][1]["delta"] == "{\"prompt\":"
+    assert events[9][1]["delta"] == "\"solve\"}"
+    assert events[10][1]["arguments"] == "{\"prompt\":\"solve\"}"
+    completed = events[-1][1]["response"]
+    assert completed["status"] == "completed"
+    assert [item["type"] for item in completed["output"]] == ["message", "function_call"]
+    assert completed["output"][0]["content"] == [
+        {"type": "output_text", "text": "I'll use a helper."}
+    ]
+    function_call = completed["output"][1]
+    assert function_call["name"] == "spawn_agent"
+    assert function_call["arguments"] == "{\"prompt\":\"solve\"}"
+    assert completed["usage"] == {"input_tokens": 9, "output_tokens": 4, "total_tokens": 13}
+
+
+def test_rollout_proxy_streams_chat_reasoning_with_message_and_tool_call_output():
+    proxy = _make_proxy()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        _ = request
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=MockAsyncByteStream(
+                [
+                    _sse_event(
+                        {
+                            "id": "chatcmpl-stream",
+                            "model": "proxy-model",
+                            "choices": [{"delta": {"reasoning_content": "think-"}}],
+                        }
+                    ),
+                    _sse_event(
+                        {
+                            "id": "chatcmpl-stream",
+                            "choices": [{"delta": {"reasoning": "then-act"}}],
+                        }
+                    ),
+                    _sse_event(
+                        {
+                            "id": "chatcmpl-stream",
+                            "choices": [{"delta": {"content": "I'll use a helper."}}],
+                        }
+                    ),
+                    _sse_event(
+                        {
+                            "id": "chatcmpl-stream",
+                            "choices": [
+                                {
+                                    "delta": {
+                                        "tool_calls": [
+                                            {
+                                                "index": 0,
+                                                "id": "call_spawn",
+                                                "type": "function",
+                                                "function": {
+                                                    "name": "spawn_agent",
+                                                    "arguments": "{\"prompt\":",
+                                                },
+                                            }
+                                        ]
+                                    }
+                                }
+                            ],
+                        }
+                    ),
+                    _sse_event(
+                        {
+                            "id": "chatcmpl-stream",
+                            "choices": [
+                                {
+                                    "delta": {
+                                        "tool_calls": [
+                                            {
+                                                "index": 0,
+                                                "function": {"arguments": "\"solve\"}"},
+                                            }
+                                        ]
+                                    },
+                                    "finish_reason": "tool_calls",
+                                }
+                            ],
+                            "usage": {"prompt_tokens": 9, "completion_tokens": 4, "total_tokens": 13},
+                        }
+                    ),
+                    b"data: [DONE]\n\n",
+                ]
+            ),
+        )
+
+    async def run_test() -> bytes:
+        proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await proxy.open_turn("turn-001", backend_session_id="codex-session-1")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.app),
+            base_url="http://proxy",
+        ) as client:
+            async with client.stream(
+                "POST",
+                "/v1/responses",
+                json={"model": "proxy-model", "input": "spawn", "stream": True},
+            ) as response:
+                body = await response.aread()
+        await proxy.drain_turn(timeout=1.0)
+        await proxy.clear_turn()
+        await proxy._client.aclose()
+
+        assert response.status_code == 200
+        return body
+
+    body = asyncio.run(run_test())
+    events = _sse_events_from_body(body)
+    completed = events[-1][1]["response"]
+    assert [item["type"] for item in completed["output"]] == [
+        "reasoning",
+        "message",
+        "function_call",
+    ]
+    assert completed["output"][0]["summary"] == [
+        {"type": "summary_text", "text": "think-then-act"}
+    ]
+    assert completed["output"][1]["content"] == [
+        {"type": "output_text", "text": "I'll use a helper."}
+    ]
+    assert completed["output"][2]["name"] == "spawn_agent"
+    assert completed["output"][2]["arguments"] == "{\"prompt\":\"solve\"}"
+    assert events[1][1]["item"]["type"] == "reasoning"
+    assert events[1][1]["output_index"] == 0
+    assert events[3][1]["item"]["type"] == "message"
+    assert events[3][1]["output_index"] == 1
+    function_added = next(
+        payload
+        for name, payload in events
+        if name == "response.output_item.added"
+        and payload["item"]["type"] == "function_call"
+    )
+    assert function_added["output_index"] == 2
 
 
 def test_rollout_proxy_rejects_openai_responses_after_max_steps():

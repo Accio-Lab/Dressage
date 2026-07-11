@@ -5,6 +5,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import socket
@@ -16,7 +17,7 @@ from uuid import NAMESPACE_URL, uuid5
 
 import httpx
 import uvicorn
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from blackbox_server.adapters.base import (
     BackendAdapter,
@@ -69,6 +70,57 @@ class CodexModelOptions(BaseModel):
     name: str = Field(default="Dressage Proxy", min_length=1)
 
 
+class CodexAgentRoleOptions(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    description: str = Field(min_length=1)
+    developer_instructions: str | None = Field(default=None, min_length=1)
+    nickname_candidates: list[str] = Field(default_factory=list)
+
+
+class CodexAgentsOptions(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    max_threads: int | None = Field(default=None, ge=1)
+    max_depth: int | None = Field(default=None, ge=1)
+    job_max_runtime_seconds: int | None = Field(default=None, ge=1)
+    interrupt_message: bool | None = None
+    roles: dict[str, CodexAgentRoleOptions] = Field(default_factory=dict)
+
+    @field_validator("roles")
+    @classmethod
+    def validate_role_names(
+        cls, value: dict[str, CodexAgentRoleOptions]
+    ) -> dict[str, CodexAgentRoleOptions]:
+        for name in value:
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+                raise ValueError("agent role names must match [A-Za-z0-9_-]+")
+        return value
+
+
+class CodexMultiAgentV2Options(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool | None = None
+    max_concurrent_threads_per_session: int | None = Field(default=None, ge=1)
+    non_code_mode_only: bool | None = None
+    hide_spawn_agent_metadata: bool | None = None
+    tool_namespace: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_-]+$",
+    )
+
+
+class CodexFeaturesOptions(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    multi_agent_v2: CodexMultiAgentV2Options = Field(
+        default_factory=CodexMultiAgentV2Options
+    )
+
+
 class CodexBackendOptions(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -88,7 +140,22 @@ class CodexBackendOptions(BaseModel):
     skip_git_repo_check: bool = True
     ignore_rules: bool = True
     web_search: Literal["disabled", "cached", "live"] = "disabled"
+    features: CodexFeaturesOptions = Field(default_factory=CodexFeaturesOptions)
+    agents: CodexAgentsOptions = Field(default_factory=CodexAgentsOptions)
     proxy: ProxyOptions = Field(default_factory=ProxyOptions)
+
+    @model_validator(mode="after")
+    def validate_multi_agent_v2_agent_limits(self) -> CodexBackendOptions:
+        if (
+            self.features.multi_agent_v2.enabled is True
+            and self.agents.max_threads is not None
+        ):
+            raise ValueError(
+                "agents.max_threads cannot be set when "
+                "features.multi_agent_v2.enabled is true; use "
+                "features.multi_agent_v2.max_concurrent_threads_per_session instead"
+            )
+        return self
 
     def resolved_executable(self) -> str:
         return self.executable or os.getenv("CODEX_BIN") or "codex"
@@ -141,6 +208,16 @@ class CodexConfigCompiler:
             lines.append(f"developer_instructions = {_toml_string(prompt_text)}")
             lines.append("")
 
+        features_lines = _build_features_config_lines(self.options.features)
+        if features_lines:
+            lines.extend(features_lines)
+            lines.append("")
+
+        agents_lines = _build_agents_config_lines(self.options.agents)
+        if agents_lines:
+            lines.extend(agents_lines)
+            lines.append("")
+
         lines.extend(
             [
                 "[analytics]",
@@ -157,6 +234,48 @@ class CodexConfigCompiler:
             ]
         )
         return "\n".join(lines)
+
+    def build_agent_file(
+        self,
+        role_name: str,
+        role: CodexAgentRoleOptions,
+    ) -> str:
+        instructions = role.developer_instructions or _default_agent_developer_instructions(
+            role_name
+        )
+        lines = [
+            f"name = {_toml_string(role_name)}",
+            f"description = {_toml_string(role.description)}",
+            f"developer_instructions = {_toml_string(instructions)}",
+        ]
+        if role.nickname_candidates:
+            values = ", ".join(
+                _toml_string(item) for item in role.nickname_candidates
+            )
+            lines.append(f"nickname_candidates = [{values}]")
+        lines.extend(["", "[features.multi_agent_v2]", "enabled = false"])
+        return "\n".join(lines) + "\n"
+
+    def write_agent_files(self, codex_home: Path) -> None:
+        roles = self._effective_agent_roles()
+        if not roles:
+            return
+        agents_dir = codex_home / "agents"
+        agents_dir.mkdir(parents=True, exist_ok=True)
+        for role_name, role in roles.items():
+            (agents_dir / f"{role_name}.toml").write_text(
+                self.build_agent_file(role_name, role),
+                encoding="utf-8",
+            )
+
+    def _effective_agent_roles(self) -> dict[str, CodexAgentRoleOptions]:
+        roles = dict(self.options.agents.roles)
+        if (
+            self.options.features.multi_agent_v2.enabled is True
+            and "default" not in roles
+        ):
+            roles["default"] = _synthetic_default_agent_role()
+        return roles
 
     def build_env(self, runtime_dir: Path) -> dict[str, str]:
         env = os.environ.copy()
@@ -212,6 +331,71 @@ class CodexConfigCompiler:
         return args
 
 
+def _build_features_config_lines(options: CodexFeaturesOptions) -> list[str]:
+    lines: list[str] = []
+    multi_agent_v2 = options.multi_agent_v2
+    scalar_fields = {
+        "enabled": multi_agent_v2.enabled,
+        "max_concurrent_threads_per_session": (
+            multi_agent_v2.max_concurrent_threads_per_session
+        ),
+        "non_code_mode_only": multi_agent_v2.non_code_mode_only,
+        "hide_spawn_agent_metadata": multi_agent_v2.hide_spawn_agent_metadata,
+        "tool_namespace": multi_agent_v2.tool_namespace,
+    }
+
+    if not any(value is not None for value in scalar_fields.values()):
+        return lines
+
+    lines.append("[features.multi_agent_v2]")
+    for key, value in scalar_fields.items():
+        if value is None:
+            continue
+        lines.append(f"{key} = {_toml_scalar(value)}")
+
+    return lines
+
+
+def _build_agents_config_lines(options: CodexAgentsOptions) -> list[str]:
+    lines: list[str] = []
+    scalar_fields = {
+        "max_threads": options.max_threads,
+        "max_depth": options.max_depth,
+        "job_max_runtime_seconds": options.job_max_runtime_seconds,
+        "interrupt_message": options.interrupt_message,
+    }
+
+    if any(value is not None for value in scalar_fields.values()):
+        lines.append("[agents]")
+
+    for key, value in scalar_fields.items():
+        if value is None:
+            continue
+        lines.append(f"{key} = {_toml_scalar(value)}")
+
+    return lines
+
+
+def _synthetic_default_agent_role() -> CodexAgentRoleOptions:
+    return CodexAgentRoleOptions(
+        description="Default subagent that executes only the assigned NEW_TASK payload.",
+    )
+
+
+def _default_agent_developer_instructions(role_name: str) -> str:
+    return "\n".join(
+        [
+            f"You are the Codex subagent named {role_name}.",
+            "Follow only the parent NEW_TASK payload addressed to this agent.",
+            "Ignore inherited root-session prompts that ask the main agent to spawn or wait for subagents.",
+            "Do not call spawn_agent, wait_agent, followup_task, send_message, list_agents, interrupt_agent, or create further subagents.",
+            "Do not delegate this task. Solve or verify the assigned payload directly.",
+            "Do not return TOOL_UNAVAILABLE when assigned a normal solve or verify task; complete the assigned payload directly.",
+            "Return a concise final result to the parent when the assigned payload is complete.",
+        ]
+    )
+
+
 class CodexAdapter(BackendAdapter):
     def __init__(self) -> None:
         self._binding_context: BindingContext | None = None
@@ -245,6 +429,7 @@ class CodexAdapter(BackendAdapter):
             self._compiler.build_config(self._proxy_port),
             encoding="utf-8",
         )
+        self._compiler.write_agent_files(config_path.parent)
         run_dir = runtime_dir / "run"
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "codex.config").write_text(str(config_path), encoding="utf-8")
@@ -728,6 +913,14 @@ class CodexAdapter(BackendAdapter):
 
 def _toml_string(value: str) -> str:
     return json.dumps(str(value), ensure_ascii=False)
+
+
+def _toml_scalar(value: bool | int | str) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    return _toml_string(value)
 
 
 def _tail_file(path: Path, *, max_chars: int = 2000) -> str | None:

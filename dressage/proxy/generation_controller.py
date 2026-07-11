@@ -183,7 +183,7 @@ class GenerationController:
         input_logprobs_captured = not expect_input_logprobs or len(input_ids) == 0
 
         while max_new_tokens <= 0 or len(generated_ids) < max_new_tokens:
-            await self._resume_event.wait()
+            await self._wait_until_resumed()
             self._raise_if_shutting_down()
             self._raise_if_stale_epoch(expected_epoch)
             remaining = None if max_new_tokens <= 0 else max_new_tokens - len(generated_ids)
@@ -368,7 +368,7 @@ class GenerationController:
 
             self._suspended_generations += 1
             try:
-                await self._resume_event.wait()
+                await self._wait_until_resumed()
                 self._raise_if_shutting_down()
             finally:
                 self._suspended_generations = max(0, self._suspended_generations - 1)
@@ -611,6 +611,10 @@ class GenerationController:
             "suspended_generations": self._suspended_generations,
             "active_request_ids": list(self._active),
         }
+
+    async def _wait_until_resumed(self) -> None:
+        while not self._resume_event.is_set():
+            await asyncio.sleep(0.01)
 
     async def _generate_with_optional_request_id(
         self,

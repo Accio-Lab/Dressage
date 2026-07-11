@@ -1,4 +1,4 @@
-"""Last-step trajectory alignment helpers."""
+"""Snapshot trajectory alignment helpers."""
 
 from .prompt_assistant_mask import (
     ModelMaskTemplateRegistry,

@@ -2,7 +2,7 @@
 
 **Token-Level Trajectory Recording for Agentic RL**
 
-[← Back to Main README](../README.md) · [Overview](#-overview) · [Key Features](#-key-features) · [Core Modules](#-core-modules) · [Session Model](#-session--step-model) · [Build Modes](#-trajectory-build-modes) · [Endpoints](#-http-endpoints) · [Routing Replay](#-routing-replay-r3)
+[← Back to Main README](../README.md) · [Overview](#-overview) · [Key Features](#-key-features) · [Core Modules](#-core-modules) · [Session Model](#-session--step-model) · [Build Modes](#-token-build-modes) · [Endpoints](#-http-endpoints) · [Routing Replay](#-routing-replay-r3)
 
 ## 📖 Overview
 
@@ -30,7 +30,7 @@ The proxy runs as a standalone FastAPI service (CLI: `dressage-proxy`) and is de
 
 - **OpenAI-Compatible API** — Drop-in replacement for `/v1/chat/completions`. Agents don't need any custom integrations — just point your `base_url` at the proxy. Supports streaming and non-streaming modes, tool calls, and all standard OpenAI chat completion parameters.
 - **Per-Step Recording** — Every proxy call captures the full request messages, prompt/response token IDs, per-token logprobs, weight version stamps, and computed loss masks. These per-step records form the raw material for training data construction.
-- **TITO Support** — When `concat` build mode is active, the proxy records incremental tokenization data in fields such as `concat_token_ids`, `concat_response_logprobs`, `concat_response_mask`, and `concat_versions`. These fields are later stitched together at finalize time, guaranteeing exact prefix consistency across arbitrarily long multi-turn trajectories. See [TITO Tokenizer](#-tito-deep-dive) below.
+- **TITO Support** — When `tito` token build mode is active, the proxy records incremental tokenization data in fields such as `concat_token_ids`, `concat_response_logprobs`, `concat_response_mask`, and `concat_versions`. These fields are later stitched together at finalize time, guaranteeing exact prefix consistency across arbitrarily long multi-turn trajectories. See [TITO Tokenizer](#-tito-deep-dive) below.
 - **Auto Segmentation** — The proxy automatically detects when an agent rewrites conversation history (compaction, summarization) or changes the available tool schema mid-trajectory. When this happens, it closes the current segment and starts a new one, preserving clean token boundaries for training. Each segment becomes an independent training sample.
 - **Preemptible Generation** — The `GenerationController` can abort active SGLang generation at any token boundary in response to a weight update signal. Partial output is preserved in the step record, and generation continues after `/v1/rollout/resume` when the proxy was started with `--dressage-partial-rollout`. This enables continuous rollout without discarding in-flight computation.
 - **Weight Version Tracking** — Every generated token is stamped with the model weight version that produced it. When a trajectory spans multiple weight updates (partial rollout), `--record-token-versions` stores the per-token versions and `--mask-nonlast-version-tokens` marks tokens from older versions for selective loss masking.
@@ -49,11 +49,11 @@ The proxy codebase is organized into focused, single-responsibility modules:
  | `trajectory_store.py` | Thread-safe in-memory segment store. Finalized segments are written here and can be read back by rollout code via `/trajectory/read`. Supports cleanup by session ID. | 
  | `generation_controller.py` | Preemptible SGLang generation for partial rollout. Wraps SGLang client calls with abort/resume capability. Manages generation state machine (idle → generating → paused → resumed). | 
  | `sglang_client.py` | Low-level SGLang router client with weight-version tracking. Sends generation requests, receives responses with token IDs and logprobs, records which weight version was active. | 
- | `tool_call_parser.py` | Model-specific tool call extraction from assistant responses. Supports multiple backend modes (`local` for direct parsing, `sglang_api` for SGLang-native, `hybrid` for fallback chain). Currently optimized for Qwen3.5 tool call format. | 
- | `reasoning_parser.py` | Reasoning-content parsing for models that produce structured thinking blocks (e.g., Qwen3's `<think>...</think>` format). Separates reasoning tokens from action tokens for selective loss masking. | 
- | `proxy_client.py` | Async HTTP client used by rollout code to interact with the proxy. Provides typed methods for `chat_completions`, `finalize_session`, and `read_trajectory`. | 
- | `tool_call_ids.py` | Deterministic tool call ID generation. Ensures that tool call IDs are reproducible across re-runs, which is important for trajectory consistency. | 
- | `last_step/prompt_assistant_mask.py` | Last-step trajectory build mode implementation. Constructs segments from the final assistant step, with loss masks marking assistant tokens as trainable. | 
+ | `tool_call_parser.py` | Model-specific tool call extraction from assistant responses. Supports multiple backend modes (`local` for direct parsing, `sglang_api` for SGLang-native, `hybrid` for fallback chain). Currently optimized for Qwen3.5 tool call format. |
+ | `reasoning_parser.py` | Reasoning-content parsing for models that produce structured thinking blocks (e.g., Qwen3's `<think>...</think>` format). Separates reasoning tokens from action tokens for selective loss masking. |
+ | `proxy_client.py` | Async HTTP client used by rollout code to interact with the proxy. Provides typed methods for `chat_completions`, `finalize_session`, and `read_trajectory`. |
+ | `tool_call_ids.py` | Deterministic tool call ID generation. Ensures that tool call IDs are reproducible across re-runs, which is important for trajectory consistency. |
+ | `last_step/prompt_assistant_mask.py` | Snapshot alignment helper. Builds masks for complete step snapshots. |
 
 ## 📋 Session & Step Model
 
@@ -68,7 +68,7 @@ Every step captures a comprehensive snapshot of one LLM interaction:
 - **Response token IDs** — Generated output tokens with per-token logprobs
 - **Weight versions** — Which model weight version generated each token
 - **Loss masks** — Binary masks indicating which tokens are trainable
-- **TITO fields** — Incremental tokenization data (`concat_token_ids`, `concat_response_logprobs`, `concat_response_mask`, etc.) when concat mode is active
+- **TITO fields** — Incremental tokenization data (`concat_token_ids`, `concat_response_logprobs`, `concat_response_mask`, etc.) when tito mode is active
 - **Segment markers** — Whether this step triggered a segment boundary
 - **MoE routing data** — Routed expert IDs per token (when R3 is enabled)
 
@@ -86,11 +86,11 @@ Every `/v1/chat/completions` request must provide these identifiers for proper t
 > [!TIP]
 > The `X-Instance-Id` header is critical for prompt-equal gradient scaling. All samples from the same prompt instance share a gradient denominator, ensuring fair contribution regardless of how many segments each trajectory produces.
 
-## 🧬 Trajectory Build Modes
+## 🧬 Token Build Modes
 
 Dressage supports two modes for converting proxy-recorded steps into training-ready segments. The choice of build mode fundamentally affects how token sequences are constructed and how multi-turn context is handled.
 
-### Concat Mode (Default) — TITO-Powered
+### TITO Mode (Default)
 
 The default and recommended mode for long agentic trajectories. Segments are assembled by concatenating per-step TITO fragments across the full multi-turn context, guaranteeing exact prefix consistency.
 
@@ -99,15 +99,15 @@ Turn 1 → TITO fragment₁ (system + user₁)
 Turn 2 → TITO fragment₂ (asst₁ + tool₁ + user₂)
 Turn 3 → TITO fragment₃ (asst₂ + tool₂ + user₃)
                     ↓
-         concat(fragment₁ + fragment₂ + fragment₃) → Segment
+         stitch(fragment₁ + fragment₂ + fragment₃) → Segment
 ```
 
-- With `trajectory_build_model=qwen3_5`, infers `model_mask_type=qwen3_5`, `model_tool_call_type=qwen3_5`, `model_reasoning_type=qwen3`, and `tito_model=qwen3_5` in concat mode
+- With `token_build_model=qwen3_5`, infers `model_mask_type=qwen3_5`, `model_tool_call_type=qwen3_5`, `model_reasoning_type=qwen3`, and `tito_model=qwen3_5` in tito mode
 - Best for **long agentic trajectories** (SWE tasks, coding agents, multi-step reasoning)
 - Avoids retokenization drift — the #1 correctness challenge in agentic RL training
 - Each fragment is independently tokenized, then IDs are concatenated (never re-tokenized as a whole)
 
-### Last-Step Mode
+### Snapshot Mode
 
 A simpler mode where each segment is built from the last assistant step's full message snapshot. The entire conversation is re-tokenized from scratch at finalize time.
 
@@ -129,8 +129,8 @@ Turn 3 → Full message list snapshot → tokenize → Segment
 ```bash
 dressage-proxy \
   --tokenizer-path /path/to/Qwen3.5-4B \
-  --trajectory-build-mode concat \
-  --trajectory-build-model qwen3_5 \
+  --token-build-mode tito \
+  --token-build-model qwen3_5 \
   --tito-model qwen3_5
 ```
 
@@ -153,7 +153,7 @@ Turn 2:  tokenize("system: ... user: Hello assistant: Hi user: How?")  → [101,
 ```text
 Turn 1:  encode("system: ... user: Hello")           → fragment₁ = [101, 202, 303]
 Turn 2:  encode("assistant: Hi user: How?")           → fragment₂ = [405, 506]
-         concat(fragment₁ + fragment₂)                → [101, 202, 303, 405, 506]  ✅ prefix intact
+         stitch(fragment₁ + fragment₂)                → [101, 202, 303, 405, 506]  ✅ prefix intact
 ```
 
 The proxy stores TITO data in `StepRecord` fields:
@@ -162,11 +162,11 @@ The proxy stores TITO data in `StepRecord` fields:
 - `concat_response_mask` — loss mask, with context positions set to `0` and generated response positions set to `1`
 - `concat_versions` — token weight-version markers
 - `concat_context_token_count` / `concat_output_token_count` — context and generated-token counts
-- `concat_logprobs_invalid` / `concat_incremental_tokenization_failed` — safety flags for concat assembly
+- `concat_logprobs_invalid` / `tito_incremental_tokenization_failed` — safety flags for TITO assembly
 
 ### Append-Only Contract
 
-TITO depends on an **append-only contract** on conversation history. If the agent rewrites history, changes the existing message prefix, changes tool schemas, or concat tokenization fails, the proxy triggers a **segment boundary** — closing the current segment and starting a fresh one with TITO state reset.
+TITO depends on an **append-only contract** on conversation history. If the agent rewrites history, changes the existing message prefix, changes tool schemas, or TITO tokenization fails, the proxy triggers a **segment boundary** — closing the current segment and starting a fresh one with TITO state reset.
 
 > [!NOTE]
 > On TITO failure (e.g., template rendering error), the proxy marks `concat_incremental_tokenization_failed=True` on the step and starts a new segment. This is a safe fallback — no data is lost, just split into separate segments.
@@ -179,7 +179,7 @@ The proxy automatically splits one session into multiple segments when it detect
  | :-------- | :---------- | :------------- | 
  | **History Rewrite** | Agent sends messages that don't extend the previous conversation | Current segment finalizes; new segment starts with fresh state | 
  | **Tool Schema Change** | Available tools change between turns | Segment boundary; new tool context starts clean | 
- | **Concat Prefix Mismatch** | The existing message prefix changes in concat mode | Current segment finalizes; new segment starts with fresh state |
+ | **TITO Prefix Mismatch** | The existing message prefix changes in tito mode | Current segment finalizes; new segment starts with fresh state |
  | **TITO Fallback** | Incremental tokenization fails (template error, encoding mismatch) | Marks failure flag; starts new segment with reset TITO state | 
 
 > [!NOTE]
@@ -229,7 +229,7 @@ The `GenerationController` enables safe interruption of active generation for we
 dressage-proxy \
   --tokenizer-path /path/to/Qwen3.5-4B \
   --sglang-router-url http://<sglang-router-host>:<port> \
-  --trajectory-build-model qwen3_5 \
+  --token-build-model qwen3_5 \
   --context-window 32768 \
   --no-dynamic-max-tokens \
   --rollout-temperature 1.0 \
@@ -286,7 +286,7 @@ R3 stores routed expert IDs as base64-encoded int32 payloads. Dressage supports 
 | ----------------------- | ------------------------------------------------------------------------------------ |
 | `routed_experts`        | Direct payload for a single uninterrupted generation.                                |
 | `routed_experts_chunks` | Chunked payload for partial or resumed generation.                                   |
-| `routed_experts_parts`  | Multi-step wrapper for concat segments; each part may contain direct data or chunks. |
+| `routed_experts_parts`  | Multi-step wrapper for TITO segments; each part may contain direct data or chunks. |
 
 Enable R3 by setting `--use-rollout-routing-replay` on the proxy.
 
@@ -358,7 +358,7 @@ dressage/proxy/
 ├── reasoning_parser.py           # Reasoning content parsing
 ├── proxy_client.py               # Async client for rollout code
 ├── tool_call_ids.py              # Deterministic ID generation
-├── last_step/                    # Last-step build mode
+├── last_step/                    # Snapshot alignment helpers
 │   └── prompt_assistant_mask.py  # Assistant loss mask builder
 └── tito/                         # TITO tokenizer
     ├── tito_tokenizer.py         # Qwen35TITOTokenizer

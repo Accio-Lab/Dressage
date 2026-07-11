@@ -13,7 +13,15 @@ from .reasoning_parser import (
     parse_qwen3_reasoning,
 )
 from .server import create_app
-from .session_manager import Session, SessionManager, StepRecord, TurnRecord
+from .session_manager import (
+    Lineage,
+    Route,
+    Session,
+    SessionManager,
+    SessionPrefixTree,
+    StepRecord,
+    TurnRecord,
+)
 from .sglang_client import SGLangResponse, SGLangRouterClient
 from .tool_call_parser import (
     ModelToolCallParserRegistry,
@@ -31,8 +39,11 @@ __all__ = [
     "ProxyReasoningParser",
     "ProxyClient",
     "ReasoningParseResult",
+    "Lineage",
+    "Route",
     "Session",
     "SessionManager",
+    "SessionPrefixTree",
     "SGLangResponse",
     "SGLangRouterClient",
     "StepRecord",

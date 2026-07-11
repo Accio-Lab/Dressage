@@ -1,4 +1,4 @@
-"""Qwen3.5 TITO tokenizer for concat trajectory construction."""
+"""Qwen3.5 TITO tokenizer for lineage-local token construction."""
 
 from __future__ import annotations
 
@@ -71,6 +71,7 @@ class Qwen35TITOTokenizer:
             tools=tools,
             add_generation_prompt=add_generation_prompt,
             tokenize=False,
+            preserve_thinking=True,
         )
         return str(rendered)
 

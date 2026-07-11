@@ -34,6 +34,7 @@ from dressage.proxy.tool_call_parser import (
     parse_hermes_tool_calls,
     parse_qwen3_5_tool_calls,
 )
+from dressage.proxy.tito import load_fixed_template
 from dressage.proxy.trajectory_store import TrajectoryStore
 
 _UNSET = object()
@@ -542,6 +543,48 @@ class OnlineTITOFailureTokenizer(FakeTokenizer):
         return super().apply_chat_template(*args, **kwargs)
 
 
+class QwenJinjaTokenizer:
+    def __init__(self):
+        self.chat_template = load_fixed_template("qwen3_5")
+
+    def apply_chat_template(
+        self,
+        messages,
+        *,
+        tokenize,
+        add_generation_prompt,
+        return_dict=False,
+        tools=None,
+        chat_template=None,
+        return_assistant_tokens_mask=False,
+        **template_vars,
+    ):
+        template = chat_template or self.chat_template
+        template = template.replace("{% generation %}", "").replace(
+            "{% endgeneration %}", ""
+        )
+
+        def raise_exception(message):
+            raise RuntimeError(message)
+
+        rendered = Environment().from_string(template).render(
+            messages=messages,
+            tools=tools,
+            add_generation_prompt=add_generation_prompt,
+            raise_exception=raise_exception,
+            **template_vars,
+        )
+        if not tokenize:
+            return rendered
+        token_ids = [ord(ch) for ch in rendered]
+        if not return_dict:
+            return token_ids
+        payload = {"input_ids": token_ids}
+        if return_assistant_tokens_mask:
+            payload["assistant_masks"] = [0] * len(token_ids)
+        return payload
+
+
 def make_response(
     text: str,
     *,
@@ -691,8 +734,12 @@ def assert_alignment_metadata(
     mask_fallback_reason: str | None = None,
 ) -> None:
     extra = item["extra_info"]
-    assert extra["alignment_method"] == "last_step_all_logprobs+assistant_prompt_mask"
-    assert extra["trajectory_build_mode"] == "last_step"
+    if extra["alignment_method"] == "snapshot_step":
+        assert extra["token_build_mode"] == "snapshot"
+        assert extra["segment_view"] == "timeline"
+        return
+    assert extra["alignment_method"] == "snapshot_all_logprobs+assistant_prompt_mask"
+    assert extra["token_build_mode"] == "snapshot"
     assert extra["mask_template_equivalent"] is mask_template_equivalent
     if mask_fallback_reason is None:
         assert "mask_fallback_reason" not in extra
@@ -728,7 +775,7 @@ def make_client(
     tool_call_parser_registry=None,
     model_reasoning_type: str | None = None,
     reasoning_parse_backend: str = "sglang_api",
-    trajectory_build_mode: str = "last_step",
+    token_build_mode: str = "snapshot",
     tito_model: str | None = None,
     record_token_versions: bool = False,
     mask_nonlast_version_tokens: bool = False,
@@ -755,7 +802,7 @@ def make_client(
         model_reasoning_type=model_reasoning_type,
         reasoning_parse_backend=reasoning_parse_backend,
         tool_call_parser_registry=tool_call_parser_registry,
-        trajectory_build_mode=trajectory_build_mode,
+        token_build_mode=token_build_mode,
         tito_model=tito_model,
         record_token_versions=record_token_versions,
         mask_nonlast_version_tokens=mask_nonlast_version_tokens,
@@ -784,14 +831,14 @@ def test_concat_mode_infers_tito_model_from_build_model():
         session_manager=SessionManager(),
         trajectory_store=TrajectoryStore(min_group_size=1, group_timeout=0.0),
         sglang_client=FakeSGLangClient([make_response("hello")]),
-        trajectory_build_mode="concat",
+        token_build_mode="tito",
     )
     client = TestClient(app)
 
     result = client.get("/health")
 
     assert result.status_code == 200
-    assert result.json()["config"]["trajectory_build_model"] == "qwen3_5"
+    assert result.json()["config"]["token_build_model"] == "qwen3_5"
 
 
 def test_proxy_defaults_sglang_router_url_from_env(monkeypatch):
@@ -897,7 +944,7 @@ def test_proxy_sampling_params_body_temperature_wins():
     assert sglang_client.calls[0]["sampling_params"]["temperature"] == 0.0
 
 
-def test_trajectory_build_model_infers_qwen_tool_parser():
+def test_token_build_model_infers_qwen_tool_parser():
     raw_tool = make_qwen_tool_call_text(
         prefix="Thinking Process: call tool",
         functions=[("search", {"q": "x"})],
@@ -1303,7 +1350,7 @@ def test_concat_context_window_output_overflow_records_only_context_delta():
         sglang_client=FakeSGLangClient(
             [make_response("ok"), make_response("abc")]
         ),
-        trajectory_build_mode="concat",
+        token_build_mode="tito",
         tito_model="qwen3_5",
         context_window=len(second_prompt_ids) + 1,
     )
@@ -1977,6 +2024,67 @@ def test_qwen_mask_template_keeps_assistant_tool_call_xml_unescaped():
     assert "&lt;parameter=" not in rendered
 
 
+def test_qwen_preserve_thinking_keeps_rendered_prefix_after_user_append():
+    tokenizer = QwenJinjaTokenizer()
+    builder = PromptAssistantMaskBuilder(tokenizer, model_mask_type=None)
+    tools = make_tools("send_message")
+    old_messages = [
+        {"role": "user", "content": "root task"},
+        {
+            "role": "assistant",
+            "content": None,
+            "reasoning_content": "Need to report the subagent result.",
+            "tool_calls": [
+                {
+                    "id": "callabcdef12",
+                    "type": "function",
+                    "function": {
+                        "name": "send_message",
+                        "arguments": {
+                            "target": "/root",
+                            "message": "Answer: 5",
+                        },
+                    },
+                }
+            ],
+        },
+    ]
+    new_messages = old_messages + [
+        {"role": "tool", "tool_call_id": "callabcdef12", "content": ""},
+        {
+            "role": "user",
+            "content": '{"type":"agent_message","author":"/root","recipient":"/root"}',
+        },
+    ]
+
+    default_old = builder.render_messages(
+        builder.normalize_template_messages(old_messages),
+        tools,
+        add_generation_prompt=False,
+    )
+    default_new = builder.render_messages(
+        builder.normalize_template_messages(new_messages),
+        tools,
+        add_generation_prompt=True,
+    )
+    assert not default_new.startswith(default_old)
+
+    template_kwargs = {"preserve_thinking": True}
+    preserved_old = builder.render_messages(
+        builder.normalize_template_messages(old_messages),
+        tools,
+        add_generation_prompt=False,
+        template_kwargs=template_kwargs,
+    )
+    preserved_new = builder.render_messages(
+        builder.normalize_template_messages(new_messages),
+        tools,
+        add_generation_prompt=True,
+        template_kwargs=template_kwargs,
+    )
+    assert preserved_new.startswith(preserved_old)
+
+
 def test_mask_template_file_missing_fails_fast():
     missing_path = Path("/tmp/does-not-exist-qwen3_5-mask-only-template.jinja")
     registry = ModelMaskTemplateRegistry()
@@ -2038,8 +2146,8 @@ def test_unregistered_model_mask_type_falls_back_to_output_only():
         mask_template_equivalent=False,
         mask_fallback_reason="mask_template_not_registered_for_model_mask_type",
     )
-    assert item["extra_info"]["prompt_assistant_token_count"] == 0
-    assert_dense_alignment(item, ["follow"])
+    assert item["extra_info"]["output_token_count"] == len("hello")
+    assert_dense_alignment(item, ["hello"])
 
 
 def test_default_tool_call_parser_registry_resolves_hermes_and_qwen():
@@ -2617,7 +2725,7 @@ def test_qwen_hybrid_chat_completion_preserves_content_and_tool_calls_without_fa
     assert finalized.status_code == 200
     assert finalized.json()["history_rewritten"] is False
     assert finalized.json()["num_turns"] == 1
-    assert finalized.json()["num_segments"] == 1
+    assert finalized.json()["num_segments"] == 2
 
 
 def test_qwen_streaming_emits_content_before_tool_calls():
@@ -3102,30 +3210,31 @@ def test_chat_completion_uses_implicit_single_turn_and_finalize_as_trajectory():
     assert payload["session_id"] == "sess-1"
     assert payload["num_steps"] == 2
     assert payload["num_turns"] == 1
-    assert payload["num_segments"] == 1
+    assert payload["num_segments"] == 2
     assert payload["history_rewritten"] is False
 
     exact = client.post("/trajectory/read", json={"trajectory_id": "sess-1"})
     assert exact.status_code == 200
     assert exact.json()["mode"] == "trajectory"
     exact_data = exact.json()["data"]
-    assert len(exact_data) == 1
+    assert len(exact_data) == 2
     assert exact_data[0]["trajectory_id"] == "sess-1"
     assert exact_data[0]["session_id"] == "sess-1"
     assert exact_data[0]["turn_id"] == implicit_turn_id
     assert len(exact_data[0]["tokens"]) == len(exact_data[0]["full_logprobs"])
     assert len(exact_data[0]["tokens"]) == len(exact_data[0]["full_loss_mask"])
     assert "full_versions" not in exact_data[0]
-    assert_dense_alignment(exact_data[0], ["hello", "follow"])
-    assert exact_data[0]["extra_info"]["num_steps"] == 2
+    assert_dense_alignment(exact_data[0], ["hello"])
+    assert_dense_alignment(exact_data[1], ["follow"])
+    assert exact_data[0]["extra_info"]["num_steps"] == 1
     assert exact_data[0]["extra_info"]["num_turns"] == 1
     assert exact_data[0]["extra_info"]["turn_ids"] == [implicit_turn_id]
     assert exact_data[0]["extra_info"]["segment_reason"] == "initial"
     assert exact_data[0]["extra_info"]["segment_reasons"] == ["initial"]
     assert_alignment_metadata(exact_data[0], mask_template_equivalent=True)
-    assert exact_data[0]["extra_info"]["prompt_assistant_token_count"] == len("hello")
-    assert exact_data[0]["extra_info"]["output_token_count"] == len("follow")
-    assert payload["trajectory_build_mode"] == "last_step"
+    assert exact_data[0]["extra_info"]["output_token_count"] == len("hello")
+    assert exact_data[1]["extra_info"]["output_token_count"] == len("follow")
+    assert payload["token_build_mode"] == "snapshot"
 
 
 def test_finalize_records_token_versions_only_when_enabled():
@@ -3196,7 +3305,7 @@ def test_non_partial_session_rejects_stale_epoch_before_sglang():
     client, session_manager, _, sglang_client = make_client(
         first,
         second,
-        trajectory_build_mode="concat",
+        token_build_mode="tito",
         tito_model="qwen3_5",
         record_token_versions=True,
     )
@@ -3280,7 +3389,7 @@ def test_non_partial_first_step_waiting_for_resume_binds_generated_epoch():
     client, session_manager, _, sglang_client = make_client(
         first,
         second,
-        trajectory_build_mode="concat",
+        token_build_mode="tito",
         tito_model="qwen3_5",
         record_token_versions=True,
     )
@@ -3342,7 +3451,7 @@ def test_finalize_concat_mode_uses_tito_recorded_step_fragments():
     client, session_manager, _, sglang_client = make_client(
         make_response("hello"),
         make_response("follow"),
-        trajectory_build_mode="concat",
+        token_build_mode="tito",
         tito_model="qwen3_5",
     )
 
@@ -3376,7 +3485,7 @@ def test_finalize_concat_mode_uses_tito_recorded_step_fragments():
     assert finalized.status_code == 200
     payload = finalized.json()
     assert payload["trajectory_id"] == "sess-concat"
-    assert payload["trajectory_build_mode"] == "concat"
+    assert payload["token_build_mode"] == "tito"
 
     exact = client.post("/trajectory/read", json={"trajectory_id": "sess-concat"})
     assert exact.status_code == 200
@@ -3391,8 +3500,8 @@ def test_finalize_concat_mode_uses_tito_recorded_step_fragments():
     assert decode_tokens(item["tokens"]).count("<user>hi") == 1
     assert_concat_mask_for_outputs(item, ["hello", "follow"])
     extra = item["extra_info"]
-    assert extra["alignment_method"] == "tito_concat"
-    assert extra["trajectory_build_mode"] == "concat"
+    assert extra["alignment_method"] == "tito"
+    assert extra["token_build_mode"] == "tito"
     assert extra["context_token_count"] == len(
         "<user>hi<assistant><user>again<assistant>"
     )
@@ -3409,7 +3518,7 @@ def test_concat_append_only_prompt_uses_online_tito_without_full_tokenize():
         make_response("hello"),
         make_response("follow"),
         tokenizer=tokenizer,
-        trajectory_build_mode="concat",
+        token_build_mode="tito",
         tito_model="qwen3_5",
     )
 
@@ -3449,7 +3558,7 @@ def test_concat_online_tito_failure_falls_back_and_starts_new_segment():
         make_response("hello"),
         make_response("follow"),
         tokenizer=tokenizer,
-        trajectory_build_mode="concat",
+        token_build_mode="tito",
         tito_model="qwen3_5",
     )
 
@@ -3478,8 +3587,7 @@ def test_concat_online_tito_failure_falls_back_and_starts_new_segment():
     assert sglang_client.calls[0]["logprob_start_len"] == -1
     assert sglang_client.calls[1]["logprob_start_len"] == -1
     assert step.segment_boundary_before is True
-    assert step.segment_reasons_before == ["concat_incremental_tokenization_failed"]
-    assert step.concat_incremental_tokenization_failed is True
+    assert step.segment_reasons_before == ["tito_routing_render_failed"]
 
     finalized = client.post(
         "/session/finalize",
@@ -3491,13 +3599,10 @@ def test_concat_online_tito_failure_falls_back_and_starts_new_segment():
     items = client.post(
         "/trajectory/read", json={"trajectory_id": "sess-concat-tito-fail"}
     ).json()["data"]
-    assert items[1]["extra_info"]["segment_reason"] == (
-        "concat_incremental_tokenization_failed"
-    )
+    assert items[1]["extra_info"]["segment_reason"] == "tito_routing_render_failed"
     assert items[1]["extra_info"]["segment_reasons"] == [
-        "concat_incremental_tokenization_failed"
+        "tito_routing_render_failed"
     ]
-    assert items[1]["extra_info"]["concat_incremental_tokenization_failed"] is True
     assert decode_tokens(items[1]["tokens"]) == (
         "<user>hi<assistant>hello<user>again<assistant>follow"
     )
@@ -3508,7 +3613,7 @@ def test_concat_reasoning_round_trip_stays_in_one_segment():
     client, session_manager, _, _ = make_client(
         make_response(first_raw),
         make_response("follow"),
-        trajectory_build_mode="concat",
+        token_build_mode="tito",
         tito_model="qwen3_5",
         model_reasoning_type="qwen3",
         reasoning_parse_backend="local",
@@ -3558,7 +3663,7 @@ def test_concat_reasoning_boundary_whitespace_round_trip_stays_in_one_segment():
     )
     client, session_manager, _, _ = make_client(
         sglang_client=sglang_client,
-        trajectory_build_mode="concat",
+        token_build_mode="tito",
         tito_model="qwen3_5",
         model_reasoning_type="qwen3",
     )
@@ -3616,7 +3721,7 @@ def test_concat_missing_reasoning_content_starts_new_segment():
     client, session_manager, _, _ = make_client(
         make_response(first_raw),
         make_response("follow"),
-        trajectory_build_mode="concat",
+        token_build_mode="tito",
         tito_model="qwen3_5",
         model_reasoning_type="qwen3",
         reasoning_parse_backend="local",
@@ -3661,8 +3766,8 @@ def test_concat_missing_reasoning_content_starts_new_segment():
     items = client.post(
         "/trajectory/read", json={"trajectory_id": "sess-concat-lost-reasoning"}
     ).json()["data"]
-    assert items[1]["extra_info"]["segment_reason"] == "message_prefix_mismatch"
-    assert items[1]["extra_info"]["segment_reasons"] == ["message_prefix_mismatch"]
+    assert items[1]["extra_info"]["segment_reason"] == "initial"
+    assert items[1]["extra_info"]["segment_reasons"] == ["initial"]
 
 
 def test_finalize_concat_mode_does_not_tokenize_messages():
@@ -3671,7 +3776,7 @@ def test_finalize_concat_mode_does_not_tokenize_messages():
         make_response("hello"),
         make_response("follow"),
         tokenizer=tokenizer,
-        trajectory_build_mode="concat",
+        token_build_mode="tito",
         tito_model="qwen3_5",
     )
 
@@ -3711,7 +3816,7 @@ def test_finalize_concat_mode_keeps_tool_call_output_and_masks_tool_response_con
     client, session_manager, _, _ = make_client(
         make_response(raw_tool),
         make_response("done"),
-        trajectory_build_mode="concat",
+        token_build_mode="tito",
         tito_model="qwen3_5",
         tool_call_parse_backend="local",
     )
@@ -3771,7 +3876,7 @@ def test_concat_openclaw_sanitized_legacy_tool_call_replay_stays_in_one_segment(
         make_response("legacy tool call"),
         make_response("done"),
         tool_call_parser=legacy_underscored_tool_call_parser,
-        trajectory_build_mode="concat",
+        token_build_mode="tito",
         tito_model="qwen3_5",
     )
 
@@ -3834,7 +3939,7 @@ def test_concat_message_prefix_mismatch_starts_new_segment():
     client, _, _, _ = make_client(
         make_response("first"),
         make_response("second"),
-        trajectory_build_mode="concat",
+        token_build_mode="tito",
         tito_model="qwen3_5",
     )
 
@@ -3873,12 +3978,181 @@ def test_concat_message_prefix_mismatch_starts_new_segment():
     items = client.post(
         "/trajectory/read", json={"trajectory_id": "sess-concat-prefix"}
     ).json()["data"]
-    assert items[1]["extra_info"]["segment_reason"] == "message_prefix_mismatch"
-    assert items[1]["extra_info"]["segment_reasons"] == ["message_prefix_mismatch"]
+    assert items[1]["extra_info"]["segment_reason"] == "initial"
+    assert items[1]["extra_info"]["segment_reasons"] == ["initial"]
     assert decode_tokens(items[1]["tokens"]) == "<user>fresh<assistant>second"
 
 
-def test_finalize_rejects_request_trajectory_build_mode_without_finalizing_session():
+def test_tito_lineage_routing_keeps_interleaved_subagents_out_of_main_base():
+    client, session_manager, _, _ = make_client(
+        make_response("m2"),
+        make_response("s2"),
+        make_response("m3"),
+        make_response("s4"),
+        make_response("m5"),
+        token_build_mode="tito",
+        tito_model="qwen3_5",
+    )
+
+    def post(messages: list[dict]) -> None:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"X-Session-Id": "sess-lineage", "X-Instance-Id": "inst-lineage"},
+            json={"model": "fake-model", "messages": messages},
+        )
+        assert response.status_code == 200
+
+    post([{"role": "user", "content": "m1"}])
+    main_after_m2 = list(session_manager.get_session("sess-lineage").full_messages)
+    post([{"role": "user", "content": "s1"}])
+    post(main_after_m2 + [{"role": "user", "content": "s2"}])
+    main_after_m3 = list(session_manager.get_session("sess-lineage").full_messages)
+    post([{"role": "user", "content": "s3"}])
+    post(main_after_m3 + [{"role": "user", "content": "s4"}])
+
+    session = session_manager.get_session("sess-lineage")
+    steps = session.steps
+    assert steps[2].route_base_step_id == steps[0].step_id
+    assert steps[4].route_base_step_id == steps[2].step_id
+    assert [step.route_type for step in steps] == [
+        "create",
+        "create",
+        "append",
+        "create",
+        "append",
+    ]
+
+    finalized = client.post(
+        "/session/finalize",
+        json={"session_id": "sess-lineage", "instance_id": "inst-lineage"},
+    )
+    assert finalized.status_code == 200
+    assert finalized.json()["num_segments"] == 3
+    assert finalized.json()["num_timeline_segments"] == 5
+
+    lineage = client.post("/trajectory/read", json={"trajectory_id": "sess-lineage"})
+    assert lineage.status_code == 200
+    lineage_items = lineage.json()["data"]
+    assert len(lineage_items) == 3
+    assert {item["extra_info"]["segment_view"] for item in lineage_items} == {"lineage"}
+    assert [item["extra_info"]["lineage_index"] for item in lineage_items] == [0, 1, 2]
+    assert [item["extra_info"]["num_steps"] for item in lineage_items] == [3, 1, 1]
+    assert_concat_mask_for_outputs(lineage_items[0], ["m2", "m3", "m5"])
+
+    timeline = client.post(
+        "/trajectory/read",
+        json={"trajectory_id": "sess-lineage", "segment_view": "timeline"},
+    )
+    assert timeline.status_code == 200
+    timeline_items = timeline.json()["data"]
+    assert len(timeline_items) == 5
+    assert {item["extra_info"]["segment_view"] for item in timeline_items} == {"timeline"}
+    assert [item["extra_info"]["route_base_step_id"] for item in timeline_items] == [
+        None,
+        None,
+        steps[0].step_id,
+        None,
+        steps[2].step_id,
+    ]
+
+    drained = client.post(
+        "/trajectory/read",
+        json={
+            "trajectory_id": "sess-lineage",
+            "segment_view": "timeline",
+            "drain": True,
+        },
+    )
+    assert len(drained.json()["data"]) == 5
+    empty = client.post("/trajectory/read", json={"trajectory_id": "sess-lineage"})
+    assert empty.json()["data"] == []
+
+
+def test_tito_lineage_routing_preserves_thinking_when_agent_message_appends():
+    def send_message_parser(text: str):
+        if text.strip() != "call-send":
+            return text, None
+        return None, [
+            {
+                "id": "callabcdef12",
+                "type": "function",
+                "index": 0,
+                "function": {
+                    "name": "send_message",
+                    "arguments": json.dumps(
+                        {"target": "/root", "message": "Answer: 5"}
+                    ),
+                },
+            }
+        ]
+
+    client, session_manager, _, _ = make_client(
+        make_response("<think>\nNeed to report.\n</think>\n\ncall-send"),
+        make_response("Answer: 5"),
+        tokenizer=QwenJinjaTokenizer(),
+        token_build_mode="tito",
+        tito_model="qwen3_5",
+        model_reasoning_type="qwen3_5",
+        reasoning_parse_backend="local",
+        tool_call_parser=send_message_parser,
+    )
+
+    first = client.post(
+        "/v1/chat/completions",
+        headers={"X-Session-Id": "sess-preserve-thinking", "X-Instance-Id": "inst"},
+        json={
+            "model": "fake-model",
+            "messages": [{"role": "user", "content": "root task"}],
+            "tools": make_tools("send_message"),
+        },
+    )
+    assert first.status_code == 200
+    session = session_manager.get_session("sess-preserve-thinking")
+    assert session is not None
+    assert session.latest_step.route_type == "create"
+
+    second_messages = session.full_messages + [
+        {"role": "tool", "tool_call_id": "callabcdef12", "content": ""},
+        {
+            "role": "user",
+            "content": '{"type":"agent_message","author":"/root","recipient":"/root"}',
+        },
+    ]
+    second = client.post(
+        "/v1/chat/completions",
+        headers={"X-Session-Id": "sess-preserve-thinking", "X-Instance-Id": "inst"},
+        json={
+            "model": "fake-model",
+            "messages": second_messages,
+            "tools": make_tools("send_message"),
+        },
+    )
+    assert second.status_code == 200
+
+    steps = session_manager.get_session("sess-preserve-thinking").steps
+    assert [step.route_type for step in steps] == ["create", "append"]
+    assert steps[1].route_base_step_id == steps[0].step_id
+    assert steps[1].lineage_id == steps[0].lineage_id
+    assert steps[1].segment_boundary_before is False
+    assert steps[1].concat_incremental_tokenization_failed is False
+
+    finalized = client.post(
+        "/session/finalize",
+        json={"session_id": "sess-preserve-thinking", "instance_id": "inst"},
+    )
+    assert finalized.status_code == 200
+    assert finalized.json()["num_segments"] == 1
+
+    lineage = client.post(
+        "/trajectory/read", json={"trajectory_id": "sess-preserve-thinking"}
+    )
+    assert lineage.status_code == 200
+    items = lineage.json()["data"]
+    assert len(items) == 1
+    assert items[0]["extra_info"]["num_steps"] == 2
+
+
+def test_finalize_rejects_request_token_build_mode_without_finalizing_session():
     client, _, _, _ = make_client(make_response("hello"))
     first = client.post(
         "/v1/chat/completions",
@@ -3892,7 +4166,7 @@ def test_finalize_rejects_request_trajectory_build_mode_without_finalizing_sessi
         json={
             "session_id": "sess-bad-mode",
             "instance_id": "inst-bad-mode",
-            "trajectory_build_modes": ["last_step", "concat"],
+            "token_build_modes": ["snapshot", "tito"],
         },
     )
     assert rejected_batch.status_code == 400
@@ -3902,7 +4176,7 @@ def test_finalize_rejects_request_trajectory_build_mode_without_finalizing_sessi
         json={
             "session_id": "sess-bad-mode",
             "instance_id": "inst-bad-mode",
-            "trajectory_build_mode": "both",
+            "token_build_mode": "both",
         },
     )
     assert rejected.status_code == 400
@@ -3912,7 +4186,7 @@ def test_finalize_rejects_request_trajectory_build_mode_without_finalizing_sessi
         json={"session_id": "sess-bad-mode", "instance_id": "inst-bad-mode"},
     )
     assert finalized.status_code == 200
-    assert finalized.json()["trajectory_build_mode"] == "last_step"
+    assert finalized.json()["token_build_mode"] == "snapshot"
 
 
 def test_streaming_tool_calls_stay_in_one_implicit_turn_without_false_rewrite():
@@ -3967,7 +4241,7 @@ def test_streaming_tool_calls_stay_in_one_implicit_turn_without_false_rewrite():
     assert finalized.status_code == 200
     assert finalized.json()["history_rewritten"] is False
     assert finalized.json()["num_turns"] == 1
-    assert finalized.json()["num_segments"] == 1
+    assert finalized.json()["num_segments"] == 2
 
 
 def test_tool_call_history_replay_without_index_and_minified_arguments_is_append_only():
@@ -4042,7 +4316,7 @@ def test_tool_call_history_replay_without_index_and_minified_arguments_is_append
     )
     assert finalized.status_code == 200
     assert finalized.json()["history_rewritten"] is False
-    assert finalized.json()["num_segments"] == 1
+    assert finalized.json()["num_segments"] == 2
 
 
 def test_openclaw_sanitized_legacy_tool_call_replay_is_append_only():
@@ -4096,7 +4370,7 @@ def test_openclaw_sanitized_legacy_tool_call_replay_is_append_only():
     )
     assert finalized.status_code == 200
     assert finalized.json()["history_rewritten"] is False
-    assert finalized.json()["num_segments"] == 1
+    assert finalized.json()["num_segments"] == 2
 
 
 def test_finalize_exact_read_and_batch_drain_for_explicit_multi_turn_sessions():
@@ -4155,31 +4429,30 @@ def test_finalize_exact_read_and_batch_drain_for_explicit_multi_turn_sessions():
     assert finalized.json()["trajectory_id"] == "sess-multi"
     assert finalized.json()["num_steps"] == 3
     assert finalized.json()["num_turns"] == 2
-    assert finalized.json()["num_segments"] == 1
+    assert finalized.json()["num_segments"] == 3
 
     exact = client.post("/trajectory/read", json={"trajectory_id": "sess-multi"})
     assert exact.status_code == 200
     exact_data = exact.json()["data"]
-    assert len(exact_data) == 1
-    assert exact_data[0]["turn_id"] == "turn-2"
+    assert len(exact_data) == 3
+    assert exact_data[2]["turn_id"] == "turn-2"
     assert exact_data[0]["segment_index"] == 0
-    assert exact_data[0]["segment_count"] == 1
-    assert_dense_alignment(exact_data[0], ["first", "second", "third"])
-    assert exact_data[0]["extra_info"]["num_steps"] == 3
-    assert exact_data[0]["extra_info"]["num_turns"] == 2
-    assert exact_data[0]["extra_info"]["turn_ids"] == ["turn-1", "turn-2"]
-    assert exact_data[0]["extra_info"]["trajectory_num_segments"] == 1
+    assert exact_data[0]["segment_count"] == 3
+    assert_dense_alignment(exact_data[0], ["first"])
+    assert_dense_alignment(exact_data[1], ["second"])
+    assert_dense_alignment(exact_data[2], ["third"])
+    assert exact_data[0]["extra_info"]["num_steps"] == 1
+    assert exact_data[2]["extra_info"]["num_turns"] == 1
+    assert exact_data[2]["extra_info"]["turn_ids"] == ["turn-2"]
+    assert exact_data[0]["extra_info"]["trajectory_num_segments"] == 3
     assert exact_data[0]["extra_info"]["segment_reason"] == "initial"
     assert exact_data[0]["extra_info"]["segment_reasons"] == ["initial"]
     assert_alignment_metadata(exact_data[0], mask_template_equivalent=True)
-    assert exact_data[0]["extra_info"]["prompt_assistant_token_count"] == len("first") + len(
-        "second"
-    )
-    assert exact_data[0]["extra_info"]["output_token_count"] == len("third")
+    assert exact_data[2]["extra_info"]["output_token_count"] == len("third")
 
     exact_legacy = client.post("/trajectory/read", json={"session_id": "sess-multi"})
     assert exact_legacy.status_code == 200
-    assert len(exact_legacy.json()["data"]) == 1
+    assert len(exact_legacy.json()["data"]) == 3
 
     drained = client.post(
         "/trajectory/read",
@@ -4188,9 +4461,9 @@ def test_finalize_exact_read_and_batch_drain_for_explicit_multi_turn_sessions():
     assert drained.status_code == 200
     drained_groups = drained.json()["data"]
     assert len(drained_groups) == 1
-    assert len(drained_groups[0]) == 1
-    assert drained_groups[0][0]["turn_id"] == "turn-2"
-    assert drained_groups[0][0]["extra_info"]["turn_ids"] == ["turn-1", "turn-2"]
+    assert len(drained_groups[0]) == 3
+    assert drained_groups[0][2]["turn_id"] == "turn-2"
+    assert drained_groups[0][2]["extra_info"]["turn_ids"] == ["turn-2"]
 
     empty = client.post(
         "/trajectory/read",
@@ -4377,11 +4650,11 @@ def test_empty_response_step_keeps_mask_on_last_step_output_only():
     )
     assert finalized.status_code == 200
 
-    item = client.post("/trajectory/read", json={"trajectory_id": "sess-empty"}).json()["data"][0]
+    items = client.post("/trajectory/read", json={"trajectory_id": "sess-empty"}).json()["data"]
+    item = items[0]
     assert_alignment_metadata(item, mask_template_equivalent=True)
-    assert item["extra_info"]["prompt_assistant_token_count"] == 0
-    assert item["extra_info"]["output_token_count"] == len("done")
-    assert_dense_alignment(item, ["done"])
+    assert item["extra_info"]["output_token_count"] == 0
+    assert_dense_alignment(items[1], ["done"])
 
 
 def test_missing_prompt_logprobs_falls_back_to_last_step_output_only():
@@ -4415,13 +4688,13 @@ def test_missing_prompt_logprobs_falls_back_to_last_step_output_only():
     )
     item = client.post("/trajectory/read", json={"trajectory_id": "sess-mismatch"}).json()[
         "data"
-    ][0]
+    ][1]
     assert_alignment_metadata(
         item,
         mask_template_equivalent=False,
         mask_fallback_reason="all_logprobs_invalid",
     )
-    assert item["extra_info"]["prompt_assistant_token_count"] == 0
+    assert item["extra_info"]["output_token_count"] == len("good")
     assert_dense_alignment(item, ["good"])
 
 
@@ -4456,7 +4729,7 @@ def test_template_mismatch_falls_back_to_last_step_output_only():
     )
     item = client.post(
         "/trajectory/read", json={"trajectory_id": "sess-prefix-empty"}
-    ).json()["data"][0]
+    ).json()["data"][1]
     assert_alignment_metadata(
         item,
         mask_template_equivalent=False,
@@ -4496,7 +4769,7 @@ def test_assistant_mask_length_mismatch_falls_back_to_last_step_output_only():
     )
     item = client.post("/trajectory/read", json={"trajectory_id": "sess-prefix"}).json()[
         "data"
-    ][0]
+    ][1]
     assert_alignment_metadata(
         item,
         mask_template_equivalent=False,
@@ -4551,7 +4824,7 @@ def test_tools_change_splits_segment_without_marking_history_rewrite():
     assert items[1]["extra_info"]["segment_reason"] == "tools_changed"
     assert items[1]["extra_info"]["segment_reasons"] == ["tools_changed"]
     assert_dense_alignment(items[0], ["alpha"])
-    assert_dense_alignment(items[1], ["alpha", "beta"])
+    assert_dense_alignment(items[1], ["beta"])
     assert_alignment_metadata(items[0], mask_template_equivalent=True)
     assert_alignment_metadata(items[1], mask_template_equivalent=True)
 
@@ -4602,10 +4875,7 @@ def test_rewrite_and_tools_change_prioritize_history_rewrite():
         "data"
     ]
     assert items[1]["extra_info"]["segment_reason"] == "history_rewrite"
-    assert items[1]["extra_info"]["segment_reasons"] == [
-        "history_rewrite",
-        "tools_changed",
-    ]
+    assert items[1]["extra_info"]["segment_reasons"] == ["history_rewrite"]
 
 
 def test_none_and_empty_tools_split_when_tokenizer_distinguishes_them():
