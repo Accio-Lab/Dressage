@@ -119,6 +119,8 @@ PYTHONPATH=/root/Megatron-LM python tools/convert_hf_to_torch_dist.py \
 
 ```bash
 cd /root/Dressage
+git submodule update --init --recursive
+git submodule status --recursive
 bash examples/scripts/run_blackbox_qwen3.5_4b_async_local.sh
 ```
 
