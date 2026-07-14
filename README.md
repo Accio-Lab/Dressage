@@ -106,7 +106,10 @@ For reproducible environments, pin a dated tag such as
 hf download Qwen/Qwen3.5-4B \
   --local-dir /root/Qwen3.5-4B
 
-cd /root/Dressage/slime
+cd /root/Dressage
+git submodule update --init --recursive
+git submodule status --recursive
+cd slime
 source scripts/models/qwen3.5-4B.sh
 
 PYTHONPATH=/root/Megatron-LM python tools/convert_hf_to_torch_dist.py \
@@ -119,8 +122,6 @@ PYTHONPATH=/root/Megatron-LM python tools/convert_hf_to_torch_dist.py \
 
 ```bash
 cd /root/Dressage
-git submodule update --init --recursive
-git submodule status --recursive
 bash examples/scripts/run_blackbox_qwen3.5_4b_async_local.sh
 ```
 
