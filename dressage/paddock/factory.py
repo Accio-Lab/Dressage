@@ -20,7 +20,7 @@ def load_object(path: str) -> Any:
     return getattr(importlib.import_module(module_path), attr)
 
 
-def create_paddock_from_env() -> Paddock:
+def create_paddock_from_env(*, mode: str | None = None) -> Paddock:
     """Create the configured paddock.
 
     ``DRESSAGE_PADDOCK_CLASS`` remains the explicit advanced override.  The
@@ -32,7 +32,9 @@ def create_paddock_from_env() -> Paddock:
     if class_path:
         return load_object(class_path)()
 
-    mode = (os.environ.get("DRESSAGE_PADDOCK_MODE") or paddock_mode()).strip().lower()
+    mode = (
+        mode or os.environ.get("DRESSAGE_PADDOCK_MODE") or paddock_mode()
+    ).strip().lower()
     if mode == "blackbox":
         from dressage.paddock.blackbox.paddock import BlackboxAgentPaddock
 

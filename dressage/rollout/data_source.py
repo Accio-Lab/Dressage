@@ -41,6 +41,9 @@ except ImportError:
         rollout_log_probs: list[float] | None = None
         remove_sample: bool = False
         metadata: dict = field(default_factory=dict)
+        generate_function_path: str | None = None
+        train_metadata: dict | None = None
+        teacher_log_probs: list[float] | None = None
 
         class Status(Enum):
             PENDING = "pending"
@@ -115,10 +118,56 @@ class DressageDataSource(RolloutDataSourceWithBuffer):
         multimodal_keys = getattr(args, "multimodal_keys", None)
         apply_chat_template = getattr(args, "apply_chat_template", False)
 
-        prompt_data = getattr(args, "prompt_data", None) or os.environ.get("PROMPT_DATA")
+        prompt_data = getattr(args, "prompt_data", None) or os.environ.get(
+            "PROMPT_DATA"
+        )
         self._use_text_first = multimodal_keys is None
 
-        if self._use_text_first and prompt_data:
+        # A MOPD config may own a weighted collection of datasets.  Keep the
+        # legacy single --prompt-data path unchanged when no datasets are
+        # declared in that config.
+        self._mixture_samples: list[list[Sample]] | None = None
+        self._mixture_weights: list[float] = []
+        self._mixture_current: list[float] = []
+        self._mixture_offsets: list[int] = []
+        self._mixture_epochs: list[int] = []
+        mopd_config_path = getattr(args, "mopd_teacher_config", None) or os.environ.get(
+            "DRESSAGE_MOPD_TEACHER_CONFIG"
+        )
+        if self._use_text_first and mopd_config_path:
+            from dressage.rollout.mopd import load_mopd_config
+
+            mopd_config = load_mopd_config(str(mopd_config_path))
+            if mopd_config.datasets:
+                self._mixture_samples = []
+                for dataset in mopd_config.datasets:
+                    dataset_samples = self._load_text_first(
+                        dataset.path,
+                        prompt_key,
+                        label_key,
+                        metadata_key,
+                        metadata_overrides=dataset.metadata,
+                        generate_function_path=dataset.generate_function_path,
+                    )
+                    if not dataset_samples:
+                        raise ValueError(
+                            f"MOPD dataset {dataset.name!r} has no valid samples: {dataset.path}"
+                        )
+                    self._mixture_samples.append(dataset_samples)
+                    self._mixture_weights.append(dataset.weight)
+                self._mixture_current = [0.0] * len(self._mixture_samples)
+                self._mixture_offsets = [0] * len(self._mixture_samples)
+                self._mixture_epochs = [0] * len(self._mixture_samples)
+                self._samples = None
+                logger.info(
+                    "DressageDataSource: loaded MOPD mixture datasets=%s weights=%s",
+                    [dataset.name for dataset in mopd_config.datasets],
+                    self._mixture_weights,
+                )
+
+        if self._mixture_samples is not None:
+            pass
+        elif self._use_text_first and prompt_data:
             self._samples = self._load_text_first(
                 prompt_data, prompt_key, label_key, metadata_key
             )
@@ -142,6 +191,8 @@ class DressageDataSource(RolloutDataSourceWithBuffer):
         prompt_key: str,
         label_key: str | None,
         metadata_key: str,
+        metadata_overrides: dict[str, Any] | None = None,
+        generate_function_path: str | None = None,
     ) -> list[Sample]:
         """Load JSONL as plain-text samples with metadata passthrough."""
         samples = []
@@ -149,23 +200,54 @@ class DressageDataSource(RolloutDataSourceWithBuffer):
             prompt = data.get(prompt_key, "")
             label = data.get(label_key) if label_key else data.get("label")
 
-            meta = data.get(metadata_key) or {}
+            meta = dict(data.get(metadata_key) or {})
             for key in (
-                "agent_mode", "env_type", "env_args", "tool_set",
-                "agent_id", "reward_fn",
+                "agent_mode",
+                "env_type",
+                "env_args",
+                "tool_set",
+                "agent_id",
+                "reward_fn",
             ):
                 if key in data and key not in meta:
                     meta[key] = data[key]
 
             for key, val in data.items():
-                if key not in (prompt_key, "label", metadata_key, label_key) and key not in meta:
+                if (
+                    key not in (prompt_key, "label", metadata_key, label_key)
+                    and key not in meta
+                ):
                     meta[key] = val
 
-            samples.append(Sample(
-                prompt=prompt,
-                label=str(label) if label is not None else None,
-                metadata=meta,
-            ))
+            # Dataset-level routing is authoritative. In particular, it must
+            # not collide with task-local fields such as ALFWorld's task_type.
+            if metadata_overrides:
+                meta.update(copy.deepcopy(metadata_overrides))
+
+            # Slime natively dispatches on this per-sample field. Dataset
+            # routing is resolved once here; no MOPD generate wrapper is needed.
+            sample_generate_path = (
+                generate_function_path
+                or data.get("generate_function_path")
+                or meta.get("generate_function_path")
+            )
+            samples.append(
+                Sample(
+                    prompt=prompt,
+                    label=str(label) if label is not None else None,
+                    metadata=meta,
+                    generate_function_path=(
+                        str(sample_generate_path).strip()
+                        if sample_generate_path
+                        else None
+                    ),
+                    train_metadata=(
+                        {"teacher_id": str(meta["teacher_id"])}
+                        if meta.get("teacher_id") not in (None, "")
+                        else None
+                    ),
+                )
+            )
 
         logger.info("DressageDataSource: loaded %d samples from %s", len(samples), path)
         return samples
@@ -178,6 +260,33 @@ class DressageDataSource(RolloutDataSourceWithBuffer):
         random.shuffle(self._samples)
         self.epoch_id = epoch_id
 
+    def _next_mixture_sample(self) -> Sample:
+        """Select a source by smooth weighted round-robin and return one row."""
+        assert self._mixture_samples is not None
+        total_weight = sum(self._mixture_weights)
+        for index, weight in enumerate(self._mixture_weights):
+            self._mixture_current[index] += weight
+        dataset_index = max(
+            range(len(self._mixture_current)),
+            key=lambda index: (self._mixture_current[index], -index),
+        )
+        self._mixture_current[dataset_index] -= total_weight
+
+        dataset = self._mixture_samples[dataset_index]
+        offset = self._mixture_offsets[dataset_index]
+        if offset >= len(dataset):
+            self._mixture_epochs[dataset_index] += 1
+            if getattr(self.args, "rollout_shuffle", False):
+                seed = int(getattr(self.args, "rollout_seed", 42))
+                rng = random.Random(
+                    seed + self._mixture_epochs[dataset_index] * 1009 + dataset_index
+                )
+                rng.shuffle(dataset)
+            offset = 0
+        sample = dataset[offset]
+        self._mixture_offsets[dataset_index] = offset + 1
+        return sample
+
     def get_samples(self, num_samples: int) -> list[list[Sample]]:
         """Return num_samples prompt groups. Each group has n_samples_per_prompt clones."""
         buffer_samples = self._get_samples_from_buffer(num_samples)
@@ -186,24 +295,29 @@ class DressageDataSource(RolloutDataSourceWithBuffer):
         if num_samples == 0:
             return buffer_samples
 
-        if self._samples is None:
+        if self._mixture_samples is not None:
+            base_samples = [self._next_mixture_sample() for _ in range(num_samples)]
+        elif self._samples is None:
             return buffer_samples + super().get_samples(num_samples)
+        else:
+            base_samples = []
+            for _ in range(num_samples):
+                if self.sample_offset >= len(self._samples):
+                    self.epoch_id += 1
+                    if getattr(self.args, "rollout_shuffle", False):
+                        self._shuffle(self.epoch_id)
+                    self.sample_offset = 0
+
+                if self.sample_offset >= len(self._samples):
+                    break
+
+                base_samples.append(self._samples[self.sample_offset])
+                self.sample_offset += 1
 
         n_per = getattr(self.args, "n_samples_per_prompt", 1)
         groups = []
 
-        for _ in range(num_samples):
-            if self.sample_offset >= len(self._samples):
-                self.epoch_id += 1
-                if getattr(self.args, "rollout_shuffle", False):
-                    self._shuffle(self.epoch_id)
-                self.sample_offset = 0
-
-            if self.sample_offset >= len(self._samples):
-                break
-
-            base_sample = self._samples[self.sample_offset]
-            self.sample_offset += 1
+        for base_sample in base_samples:
 
             group = []
             for _ in range(n_per):
@@ -240,6 +354,8 @@ class DressageDataSource(RolloutDataSourceWithBuffer):
         pass
 
     def __len__(self) -> int:
+        if self._mixture_samples is not None:
+            return sum(len(dataset) for dataset in self._mixture_samples)
         if self._samples is not None:
             return len(self._samples)
         return 0

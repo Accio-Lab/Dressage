@@ -4,11 +4,12 @@ Registered via ``--custom-convert-samples-to-train-data-path``.
 
 This file is an intentional near-verbatim copy of
 ``slime.ray.rollout.RolloutManager._convert_samples_to_train_data``
-(current slime, ``slime/ray/rollout.py``).  The ONLY delta is the
-``rollout_mask_sums``
-computation: when the estimator is GRPO / Reinforce++ baseline, we
-substitute prompt-equal denominators (``M_P × N_P / gbs``) for slime's
-default trajectory-equal per-rollout mask totals.
+(current slime, ``slime/ray/rollout.py``).  Its training-semantic delta is
+the ``rollout_mask_sums`` computation: when the estimator is GRPO /
+Reinforce++ baseline, we substitute prompt-equal denominators
+(``M_P × N_P / gbs``) for slime's default trajectory-equal per-rollout mask
+totals.  MOPD also encodes its per-sample teacher route in slime's existing
+train-side ``prompt`` passthrough slot.
 
 When updating slime, diff this file against the new
 ``_convert_samples_to_train_data`` and carry over any additions.
@@ -16,6 +17,7 @@ When updating slime, diff this file against the new
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 _PROMPT_EQUAL_ESTIMATORS = ("grpo", "reinforce_plus_plus_baseline")
@@ -106,7 +108,9 @@ def convert_samples_to_train_data(args: Any, samples: list) -> dict:
         # we could use key to select the reward.
         "rewards": rewards,
         "raw_reward": raw_rewards,
-        "truncated": [1 if sample.status == sample.Status.TRUNCATED else 0 for sample in samples],
+        "truncated": [
+            1 if sample.status == sample.Status.TRUNCATED else 0 for sample in samples
+        ],
         "sample_indices": [sample.index for sample in samples],
         "rollout_ids": rollout_ids,
     }
@@ -141,40 +145,88 @@ def convert_samples_to_train_data(args: Any, samples: list) -> dict:
     mask_sums_per_sample = [sum(m) for m in loss_masks]
     if getattr(args, "advantage_estimator", None) in _PROMPT_EQUAL_ESTIMATORS:
         train_data["rollout_mask_sums"] = _prompt_equal_rollout_mask_sums(
-            args, samples, loss_masks,
+            args,
+            samples,
+            loss_masks,
         )
     else:
         rollout_total_mask: dict[int, int] = {}
         for rid, ms in zip(rollout_id_list, mask_sums_per_sample, strict=True):
             rollout_total_mask[rid] = rollout_total_mask.get(rid, 0) + ms
-        train_data["rollout_mask_sums"] = [rollout_total_mask[rid] for rid in rollout_id_list]
+        train_data["rollout_mask_sums"] = [
+            rollout_total_mask[rid] for rid in rollout_id_list
+        ]
 
     # Overwrite raw_reward when available. Mixed-source batches may only
     # populate this field for a subset of samples (e.g. SWE but not code).
     if any(sample.metadata and "raw_reward" in sample.metadata for sample in samples):
         train_data["raw_reward"] = [
-            sample.metadata["raw_reward"] if sample.metadata and "raw_reward" in sample.metadata else sample.reward
+            (
+                sample.metadata["raw_reward"]
+                if sample.metadata and "raw_reward" in sample.metadata
+                else sample.reward
+            )
             for sample in samples
         ]
 
     # For rollout buffer
     if samples[0].metadata and "round_number" in samples[0].metadata:
-        train_data["round_number"] = [sample.metadata["round_number"] for sample in samples]
+        train_data["round_number"] = [
+            sample.metadata["round_number"] for sample in samples
+        ]
 
     # Add rollout log probabilities for off-policy correction
     if samples[0].rollout_log_probs is not None:
-        train_data["rollout_log_probs"] = [sample.rollout_log_probs for sample in samples]
+        train_data["rollout_log_probs"] = [
+            sample.rollout_log_probs for sample in samples
+        ]
 
     if samples[0].rollout_routed_experts is not None:
-        train_data["rollout_routed_experts"] = [sample.rollout_routed_experts for sample in samples]
+        train_data["rollout_routed_experts"] = [
+            sample.rollout_routed_experts for sample in samples
+        ]
 
     if samples[0].train_metadata is not None:
         train_data["metadata"] = [sample.train_metadata for sample in samples]
 
     if any(sample.multimodal_train_inputs is not None for sample in samples):
-        train_data["multimodal_train_inputs"] = [sample.multimodal_train_inputs for sample in samples]
+        train_data["multimodal_train_inputs"] = [
+            sample.multimodal_train_inputs for sample in samples
+        ]
 
-    if samples[0].teacher_log_probs is not None:
-        train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
+    mopd_enabled = bool(
+        getattr(args, "mopd_teacher_config", None)
+        or os.environ.get("DRESSAGE_MOPD_TEACHER_CONFIG")
+    )
+    if mopd_enabled:
+        if (
+            not bool(getattr(args, "use_opd", False))
+            or getattr(args, "opd_type", None) != "megatron"
+        ):
+            raise ValueError(
+                "MOPD train conversion requires --use-opd --opd-type megatron"
+            )
+        from dressage.rollout.mopd import (
+            collect_mopd_teacher_ids,
+            load_mopd_config,
+            make_mopd_route_payload,
+            mopd_config_path,
+        )
+
+        config_path = mopd_config_path(args)
+        assert config_path is not None
+        teacher_ids = collect_mopd_teacher_ids(samples, load_mopd_config(config_path))
+        route_payloads = [
+            make_mopd_route_payload(teacher_id) for teacher_id in teacher_ids
+        ]
+
+        # Slime already DP-partitions and forwards this train-side field.  It
+        # is deliberately not Sample.prompt: rollout generation and tokenization
+        # are complete before this converter runs.
+        train_data["prompt"] = route_payloads
+    elif samples[0].teacher_log_probs is not None:
+        train_data["teacher_log_probs"] = [
+            sample.teacher_log_probs for sample in samples
+        ]
 
     return train_data

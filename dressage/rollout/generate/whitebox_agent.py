@@ -207,7 +207,9 @@ class PaddockWhiteboxAgent(WhiteboxAgent):
     @property
     def paddock(self) -> Any:
         if self._paddock is None:
-            self._paddock = get_paddock_from_env(allow_whitebox_mode=True)
+            self._paddock = get_paddock_from_env(
+                allow_whitebox_mode=True, mode="whitebox"
+            )
         return self._paddock
 
     async def setup(self, sample: Any) -> None:
