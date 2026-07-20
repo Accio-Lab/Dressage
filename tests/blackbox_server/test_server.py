@@ -176,6 +176,8 @@ def test_http_requests_are_logged(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
         response = client.get("/health")
 
     assert response.status_code == 200
+    assert response.json() == {"healthy": True, "version": "1.1.0"}
+    assert client.app.version == "1.1.0"
     assert any(
         record.name == "blackbox_server.http"
         and "request completed" in record.message

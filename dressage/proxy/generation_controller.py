@@ -37,6 +37,21 @@ class GenerationStaleEpoch(RuntimeError):
         self.current_epoch = current_epoch
 
 
+class GenerationVersionUnavailable(RuntimeError):
+    """SGLang omitted a real weight version for a version-pinned request."""
+
+
+class GenerationVersionMismatch(RuntimeError):
+    """SGLang served a different weight version than the pinned batch."""
+
+    def __init__(self, *, expected: str, observed: str) -> None:
+        super().__init__(
+            f"SGLang served weight version {observed!r}; expected {expected!r}"
+        )
+        self.expected = expected
+        self.observed = observed
+
+
 _PREEMPT_FINISH_REASONS = {
     "abort",
     "aborted",
@@ -294,7 +309,26 @@ class GenerationController:
             if not input_texts:
                 input_texts = list(response.input_token_texts[: len(input_ids)])
 
-            version = self._response_version(response, expected_version) or "unknown"
+            observed_version = self._response_version(response)
+            version_error: RuntimeError | None = None
+            if expected_version is not None:
+                if observed_version is None:
+                    version_error = GenerationVersionUnavailable(
+                        "SGLang response omitted weight_version for a version-pinned request"
+                    )
+                elif str(observed_version) != str(expected_version):
+                    version_error = GenerationVersionMismatch(
+                        expected=str(expected_version),
+                        observed=str(observed_version),
+                    )
+            if version_error is not None:
+                async with self._pause_lock:
+                    self._active.pop(active.request_id, None)
+                    active.state = "quiesced"
+                    active.quiesced_event.set()
+                raise version_error
+
+            version = observed_version or "unknown"
             if version != "unknown":
                 self._current_version = version
             preempted = forced_preempted or self._is_preempted(response)
@@ -572,6 +606,34 @@ class GenerationController:
             result["readiness"] = readiness
         return result
 
+    async def synchronize_version(
+        self, version: str, *, reason: str = "backend_snapshot"
+    ) -> dict[str, Any]:
+        """Synchronize cached control-plane state at a quiescent batch boundary."""
+
+        normalized = str(version).strip()
+        if not normalized:
+            raise ValueError("version must be non-empty")
+        async with self._pause_lock:
+            if self._active or self._paused or self._shutting_down:
+                return {
+                    "status": "busy",
+                    "reason": reason,
+                    "version": self._current_version,
+                    "rollout_epoch": self._rollout_epoch,
+                }
+            changed = self._current_version != normalized
+            self._current_version = normalized
+            if changed:
+                self._rollout_epoch += 1
+            return {
+                "status": "synchronized",
+                "reason": reason,
+                "changed": changed,
+                "version": self._current_version,
+                "rollout_epoch": self._rollout_epoch,
+            }
+
     async def shutdown(self, *, timeout_seconds: float = 5.0) -> dict[str, Any]:
         async with self._pause_lock:
             already_shutting_down = self._shutting_down
@@ -750,7 +812,8 @@ class GenerationController:
             reason = str(finish_reason or "").lower()
         return reason in _PREEMPT_FINISH_REASONS
 
-    def _response_version(self, response: SGLangResponse, expected_version: str | None) -> str | None:
+    @staticmethod
+    def _response_version(response: SGLangResponse) -> str | None:
         value = None
         if hasattr(response, "weight_version"):
             value = response.weight_version
@@ -758,7 +821,7 @@ class GenerationController:
             value = response.meta_info.get("weight_version")
         if value is not None:
             return str(value)
-        return expected_version or self._current_version
+        return None
 
     def _raise_if_shutting_down(self) -> None:
         if self._shutting_down:

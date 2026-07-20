@@ -12,7 +12,6 @@ from .reasoning_parser import (
     canonicalize_reasoning_content,
     parse_qwen3_reasoning,
 )
-from .server import create_app
 from .session_manager import (
     Lineage,
     Route,
@@ -58,3 +57,13 @@ __all__ = [
     "canonicalize_reasoning_content",
     "parse_qwen3_reasoning",
 ]
+
+
+def __getattr__(name: str):
+    if name == "create_app":
+        # Keep lightweight clients importable in Harbor's control process
+        # without importing the tokenizer/server stack.
+        from .server import create_app
+
+        return create_app
+    raise AttributeError(name)

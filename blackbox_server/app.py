@@ -10,6 +10,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 
+from blackbox_server import __version__
 from blackbox_server.api import health_router, rollout_router, sessions_router
 from blackbox_server.config import BlackboxServerConfig
 from blackbox_server.core.errors import ApiError
@@ -39,7 +40,7 @@ async def lifespan(app: FastAPI):
 
 
 def create_app(config: BlackboxServerConfig | None = None) -> FastAPI:
-    app = FastAPI(title="BlackboxServer", version="1.0.0", lifespan=lifespan)
+    app = FastAPI(title="BlackboxServer", version=__version__, lifespan=lifespan)
     app.state.server = BlackboxServer(config or BlackboxServerConfig.from_env())
 
     @app.middleware("http")

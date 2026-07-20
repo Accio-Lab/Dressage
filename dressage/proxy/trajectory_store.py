@@ -120,13 +120,8 @@ class TrajectoryStore:
             item for item in items if cls._item_segment_view(item) == selected_view
         ]
 
-    def write(self, item: TrajectorySegment) -> None:
-        with self._lock:
-            self._by_instance.setdefault(item.instance_id, []).append(item)
-            self._by_trajectory.setdefault(item.trajectory_id, []).append(item)
-            self._instance_timestamps[item.instance_id] = time.time()
-
-    def write_dict(self, data: dict) -> TrajectorySegment:
+    @staticmethod
+    def _item_from_dict(data: dict) -> TrajectorySegment:
         trajectory_id = data.get("trajectory_id") or data.get("session_id")
         if trajectory_id is None:
             trajectory_id = str(uuid.uuid4())
@@ -147,7 +142,7 @@ class TrajectoryStore:
                 f"{len(data['full_versions'])}, tokens has {token_count}"
             )
 
-        item = TrajectorySegment(
+        return TrajectorySegment(
             uid=data.get("uid", str(uuid.uuid4())),
             trajectory_id=trajectory_id,
             turn_id=data["turn_id"],
@@ -172,8 +167,128 @@ class TrajectoryStore:
             finish_reason=data.get("finish_reason", "stop"),
             extra_info=data.get("extra_info", {}),
         )
-        self.write(item)
-        return item
+
+    def _write_items(self, items: list[TrajectorySegment]) -> None:
+        """Commit a prepared batch while holding one store lock.
+
+        All schema conversion happens before this method is entered.  The
+        snapshots make the remaining in-memory mutation transactional even if
+        an unexpected exception is raised while updating one of the indexes.
+        """
+
+        if not items:
+            return
+        instance_ids = {item.instance_id for item in items}
+        trajectory_ids = {item.trajectory_id for item in items}
+        missing = object()
+        with self._lock:
+            previous_instances = {
+                key: list(self._by_instance[key]) if key in self._by_instance else missing
+                for key in instance_ids
+            }
+            previous_trajectories = {
+                key: (
+                    list(self._by_trajectory[key])
+                    if key in self._by_trajectory
+                    else missing
+                )
+                for key in trajectory_ids
+            }
+            previous_timestamps = {
+                key: self._instance_timestamps.get(key, missing)
+                for key in instance_ids
+            }
+            try:
+                for item in items:
+                    self._by_instance.setdefault(item.instance_id, []).append(item)
+                    self._by_trajectory.setdefault(item.trajectory_id, []).append(item)
+                committed_at = time.time()
+                for instance_id in instance_ids:
+                    self._instance_timestamps[instance_id] = committed_at
+            except BaseException:
+                for key, value in previous_instances.items():
+                    if value is missing:
+                        self._by_instance.pop(key, None)
+                    else:
+                        self._by_instance[key] = value
+                for key, value in previous_trajectories.items():
+                    if value is missing:
+                        self._by_trajectory.pop(key, None)
+                    else:
+                        self._by_trajectory[key] = value
+                for key, value in previous_timestamps.items():
+                    if value is missing:
+                        self._instance_timestamps.pop(key, None)
+                    else:
+                        self._instance_timestamps[key] = value
+                raise
+
+    def write(self, item: TrajectorySegment) -> None:
+        self._write_items([item])
+
+    def write_many(self, records: list[dict]) -> list[TrajectorySegment]:
+        """Validate every record, then atomically publish the complete batch."""
+
+        items = [self._item_from_dict(data) for data in records]
+        self._validate_finalized_batch(items)
+        self._write_items(items)
+        return items
+
+    @classmethod
+    def _validate_finalized_batch(cls, items: list[TrajectorySegment]) -> None:
+        """Validate all views when records declare an atomic finalization."""
+
+        if not items:
+            return
+        marked = any(
+            "finalization_id" in item.extra_info
+            or "finalization_complete" in item.extra_info
+            for item in items
+        )
+        if not marked:
+            return
+
+        finalization_ids = {
+            item.extra_info.get("finalization_id") for item in items
+        }
+        if (
+            len(finalization_ids) != 1
+            or not isinstance(next(iter(finalization_ids)), str)
+            or not next(iter(finalization_ids))
+            or any(
+                item.extra_info.get("finalization_complete") is not True
+                for item in items
+            )
+        ):
+            raise ValueError("finalized trajectory batch has inconsistent markers")
+        if len({item.trajectory_id for item in items}) != 1 or len(
+            {item.instance_id for item in items}
+        ) != 1:
+            raise ValueError("finalized trajectory batch mixes trajectory identities")
+
+        by_view: dict[str, list[TrajectorySegment]] = {}
+        for item in items:
+            view = cls._item_segment_view(item)
+            if view not in {"lineage", "timeline"}:
+                raise ValueError("finalized trajectory batch has invalid segment_view")
+            by_view.setdefault(view, []).append(item)
+        for view, view_items in by_view.items():
+            counts = {item.segment_count for item in view_items}
+            indices = [item.segment_index for item in view_items]
+            if (
+                len(counts) != 1
+                or isinstance(next(iter(counts)), bool)
+                or next(iter(counts)) != len(view_items)
+                or any(isinstance(index, bool) for index in indices)
+                or len(indices) != len(set(indices))
+                or set(indices) != set(range(len(view_items)))
+            ):
+                raise ValueError(
+                    f"finalized trajectory {view} segments are not the complete 0..N-1 set"
+                )
+
+    def write_dict(self, data: dict) -> TrajectorySegment:
+        return self.write_many([data])[0]
 
     def read_trajectory(
         self,

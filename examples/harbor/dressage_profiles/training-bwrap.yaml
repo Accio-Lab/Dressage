@@ -1,0 +1,67 @@
+schema_version: dressage.harbor/v1
+execution_mode: training
+
+environment:
+  mode: bwrap
+  runtime_root: /tmp/dressage-harbor
+
+gateway:
+  listen_host: 127.0.0.1
+  listen_port: 39100
+  log_level: warning
+  limits:
+    max_active_routes: 8
+    max_inflight_global: 16
+    max_inflight_per_route: 4
+    queue_timeout_sec: 30.0
+    drain_timeout_sec: 60.0
+    request_body_max_bytes: 16777216
+    request_header_max_bytes: 65536
+    sse_idle_timeout_sec: 300.0
+    route_ttl_sec: 7200.0
+    tombstone_ttl_sec: 300.0
+    max_tombstones: 128
+
+backend:
+  dressage_proxy_url: http://127.0.0.1:8800
+  router_api_path: /v1
+  sticky_header_name: X-SMG-Routing-Key
+  service_api_key_env: DRESSAGE_PROXY_API_KEY
+  service_api_key_header: Authorization
+  service_api_key_scheme: Bearer
+  verify_tls: true
+
+security:
+  routing_guarantee: enforced
+  allow_model_listing: false
+  require_tls_for_non_loopback: true
+  additional_agent_egress_hosts: []
+
+trajectory:
+  max_steps: 40
+  default_temperature: null
+  require_trainable_tokens: true
+
+artifacts:
+  mode: both
+  root: /tmp/dressage-harbor/artifacts/training-bwrap
+  fsync: true
+  file_mode: 384
+  dir_mode: 448
+
+agent_protocol_overrides: {}
+
+training:
+  model_override: Qwen/Qwen3.5-4B
+  reward_key: reward
+  group_max_retries: 1
+  failed_group_policy: replace
+  max_replacement_groups: 8
+  replacement_exhausted_policy: abort_batch
+  min_live_group_ratio: 1.0
+  require_single_weight_version: true
+  sampling:
+    mode: force
+    temperature: 1.0
+    top_p: 1.0
+    seed_policy: per_attempt_request

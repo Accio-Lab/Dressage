@@ -119,6 +119,19 @@ def test_legacy_no_parent_traj_id_falls_back_to_per_sample_grpo():
     assert normalized == [pytest.approx(-1.0), pytest.approx(1.0)]
 
 
+def test_remove_sample_is_excluded_from_reward_normalization():
+    samples = [
+        SampleLike(group_index=0, index=0, reward=1.0),
+        SampleLike(group_index=0, index=1, reward=100.0, remove_sample=True),
+        SampleLike(group_index=0, index=2, reward=3.0),
+    ]
+
+    raw, normalized = reward_post_process(_grpo_args(), samples)
+
+    assert raw == [1.0, 100.0, 3.0]
+    assert normalized == [pytest.approx(-1.0), 100.0, pytest.approx(1.0)]
+
+
 def test_no_normalization_passthrough():
     args = _grpo_args(normalize=False)
     samples = [
@@ -309,6 +322,28 @@ def test_multi_segment_equal_rewards_yield_zero_advantage():
     )
     _, normalized = reward_post_process(_grpo_args(), samples)
     assert all(abs(n) < 1e-9 for n in normalized)
+
+
+@pytest.mark.parametrize(
+    ("rewards", "expected"),
+    [
+        ([0.0, 0.0], [0.0, 0.0]),
+        ([1.0, 1.0], [0.0, 0.0]),
+        ([0.0, 1.0], [-0.5, 0.5]),
+    ],
+)
+def test_binary_reward_groups_keep_zero_variance_behavior(rewards, expected):
+    samples = _real_samples(
+        group_index=0,
+        trajectories=[
+            ("t1", rewards[0], 1),
+            ("t2", rewards[1], 1),
+        ],
+    )
+
+    _, normalized = reward_post_process(_grpo_args(), samples)
+
+    assert normalized == pytest.approx(expected)
 
 
 def test_multi_segment_with_std_normalization():

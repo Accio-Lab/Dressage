@@ -6,7 +6,7 @@ import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import httpx
 from fastapi import FastAPI, Request
@@ -62,6 +62,14 @@ class RolloutLLMProxy:
         max_steps: int | None = DEFAULT_PROXY_MAX_STEPS,
         default_temperature: float | None = None,
         debug_log_dir: str | Path | None = None,
+        upstream_headers: Mapping[str, str] | None = None,
+        expected_version: str | None = None,
+        model_override: str | None = None,
+        sampling_mode: str | None = None,
+        sampling_temperature: float | None = None,
+        sampling_top_p: float | None = None,
+        sampling_seed_base: int | None = None,
+        verify_tls: bool = True,
     ) -> None:
         self.upstream_origin = upstream_origin.rstrip("/")
         self.router_api_path = router_api_path.rstrip("/") or "/"
@@ -70,13 +78,30 @@ class RolloutLLMProxy:
         self.sticky_header_name = sticky_header_name
         self.max_steps = max_steps
         self.default_temperature = default_temperature
+        self.model_override = model_override
+        if sampling_mode not in {None, "fill_missing", "force"}:
+            raise ValueError("sampling_mode must be 'fill_missing', 'force', or None")
+        self.sampling_mode = sampling_mode
+        self.sampling_temperature = sampling_temperature
+        self.sampling_top_p = sampling_top_p
+        self.sampling_seed_base = sampling_seed_base
+        self._sampling_request_sequence = 0
+        self.verify_tls = verify_tls
         self.debug_log_dir = Path(debug_log_dir) if debug_log_dir is not None else None
+        self.upstream_headers = {
+            str(key): str(value) for key, value in (upstream_headers or {}).items()
+        }
+        self._static_upstream_header_names = {
+            key.lower() for key in self.upstream_headers
+        }
         self._client: httpx.AsyncClient | None = None
         self._turn_scope: _TurnScope | None = None
         self._scope_lock = asyncio.Lock()
         self._paused = False
         self._pause_reason: str | None = None
-        self._current_version: str | None = None
+        self._current_version = (
+            str(expected_version) if expected_version is not None else None
+        )
         self._resume_event = asyncio.Event()
         self._resume_event.set()
         self._pause_state_changed = asyncio.Event()
@@ -327,18 +352,25 @@ class RolloutLLMProxy:
         return f"{base}{endpoint}"
 
     async def _control_post(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
-        headers = {
-            "X-Session-Id": self.bound_session_id,
-            "X-Instance-Id": self.bound_instance_id,
-        }
+        headers = dict(self.upstream_headers)
+        self._set_header(headers, "X-Session-Id", self.bound_session_id)
+        self._set_header(headers, "X-Instance-Id", self.bound_instance_id)
         if self._current_version is not None:
-            headers["X-Dressage-Expected-Version"] = str(self._current_version)
+            self._set_header(
+                headers,
+                "X-Dressage-Expected-Version",
+                str(self._current_version),
+            )
         url = self._control_url(endpoint)
         client = self._client
         if client is not None:
             response = await client.post(url, json=payload, headers=headers)
         else:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(None), trust_env=False) as temp_client:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(None),
+                trust_env=False,
+                verify=self.verify_tls,
+            ) as temp_client:
                 response = await temp_client.post(url, json=payload, headers=headers)
         response.raise_for_status()
         data = response.json() if response.content else {}
@@ -350,6 +382,8 @@ class RolloutLLMProxy:
             self._client = httpx.AsyncClient(
                 timeout=httpx.Timeout(None),
                 limits=httpx.Limits(max_connections=100),
+                trust_env=False,
+                verify=self.verify_tls,
             )
             try:
                 yield
@@ -432,7 +466,7 @@ class RolloutLLMProxy:
                 type(parsed_body).__name__,
             )
 
-        LOGGER.info(
+        LOGGER.debug(
             "[PROXY REQUEST] %s /%s -> %s (is_chat=%s, is_anthropic=%s, is_responses=%s, stream=%s)",
             request.method,
             path,
@@ -442,9 +476,9 @@ class RolloutLLMProxy:
             is_responses,
             original_stream,
         )
-        LOGGER.info("[PROXY REQUEST] Body content: %s", self._preview_bytes(body_bytes, limit=1000))
-        LOGGER.info("[PROXY REQUEST] Body size: %d bytes", len(body_bytes) if body_bytes else 0)
-        LOGGER.info("[PROXY REQUEST] Path: /%s, Upstream: %s", path, upstream_url)
+        LOGGER.debug("[PROXY REQUEST] Body content: %s", self._preview_bytes(body_bytes, limit=1000))
+        LOGGER.debug("[PROXY REQUEST] Body size: %d bytes", len(body_bytes) if body_bytes else 0)
+        LOGGER.debug("[PROXY REQUEST] Path: /%s, Upstream: %s", path, upstream_url)
 
         snapshot = await self._enter_chat_request() if is_model_request else None
         turn_id = snapshot.turn_id if snapshot else None
@@ -457,11 +491,11 @@ class RolloutLLMProxy:
 
         if is_model_request and body_json is not None:
             tools = body_json.get("tools")
-            LOGGER.info(
+            LOGGER.debug(
                 "[PROXY REQUEST] Top-level request keys: %s",
                 sorted(body_json.keys()),
             )
-            LOGGER.info(
+            LOGGER.debug(
                 "[PROXY REQUEST] model=%s, msg_count=%d, original_stream=%s, has_stream_options=%s, tool_count=%d",
                 body_json.get("model"),
                 len(body_json.get("messages", [])),
@@ -487,6 +521,34 @@ class RolloutLLMProxy:
                     converted_body=body_json,
                 )
 
+            # Anthropic Messages and OpenAI Responses have already been
+            # normalized to an OpenAI chat body at this point.  Apply the
+            # training model policy to every supported model protocol, not
+            # only requests that arrived at /chat/completions.
+            if (
+                is_model_request
+                and self.model_override is not None
+                and "model" in body_json
+            ):
+                body_json["model"] = self.model_override
+
+            if self.sampling_mode is not None:
+                for key, value in (
+                    ("temperature", self.sampling_temperature),
+                    ("top_p", self.sampling_top_p),
+                ):
+                    if value is not None and (
+                        self.sampling_mode == "force" or body_json.get(key) is None
+                    ):
+                        body_json[key] = value
+                if self.sampling_seed_base is not None and (
+                    self.sampling_mode == "force" or body_json.get("seed") is None
+                ):
+                    body_json["seed"] = (
+                        self.sampling_seed_base + self._sampling_request_sequence
+                    )
+                self._sampling_request_sequence += 1
+
             if (
                 body_json.get("temperature") is None
                 and self.default_temperature is not None
@@ -503,12 +565,12 @@ class RolloutLLMProxy:
                 body_json["stream_options"] = stream_options
             elif "stream_options" in body_json:
                 removed_stream_options = body_json.pop("stream_options")
-                LOGGER.info(
+                LOGGER.debug(
                     "[PROXY REQUEST] Removed stream_options because upstream stream=false: %s",
                     json.dumps(removed_stream_options, ensure_ascii=False),
                 )
 
-            LOGGER.info(
+            LOGGER.debug(
                 "[PROXY REQUEST] Final upstream stream=%s, has_stream_options=%s",
                 body_json.get("stream"),
                 "stream_options" in body_json,
@@ -516,8 +578,8 @@ class RolloutLLMProxy:
 
             if body_json != original_request:
                 body_bytes = json.dumps(body_json, ensure_ascii=False).encode("utf-8")
-                LOGGER.info("[PROXY REQUEST] Final body size: %d bytes", len(body_bytes))
-                LOGGER.info(
+                LOGGER.debug("[PROXY REQUEST] Final body size: %d bytes", len(body_bytes))
+                LOGGER.debug(
                     "[PROXY REQUEST] Final body preview: %s",
                     self._preview_bytes(body_bytes, limit=500),
                 )
@@ -528,16 +590,16 @@ class RolloutLLMProxy:
             is_anthropic=is_anthropic,
             turn_id=turn_id,
         )
-        LOGGER.info("[PROXY REQUEST] Forwarding with headers: %s", list(headers.keys()))
+        LOGGER.debug("[PROXY REQUEST] Forwarding with headers: %s", list(headers.keys()))
         if is_model_request:
-            LOGGER.info(
+            LOGGER.debug(
                 "[PROXY REQUEST] Sticky header %s=%s",
                 self.sticky_header_name,
                 headers.get(self.sticky_header_name),
             )
 
         if is_anthropic and is_streaming:
-            LOGGER.info("[PROXY REQUEST] Using Anthropic streaming proxy")
+            LOGGER.debug("[PROXY REQUEST] Using Anthropic streaming proxy")
             return await self._stream_anthropic_messages_proxy(
                 upstream_url,
                 body_bytes,
@@ -545,7 +607,7 @@ class RolloutLLMProxy:
                 snapshot,
             )
         if is_chat and is_streaming:
-            LOGGER.info("[PROXY REQUEST] Using streaming proxy")
+            LOGGER.debug("[PROXY REQUEST] Using streaming proxy")
             return await self._stream_proxy(
                 upstream_url,
                 body_bytes,
@@ -553,7 +615,7 @@ class RolloutLLMProxy:
                 snapshot,
             )
         if is_responses and is_streaming:
-            LOGGER.info("[PROXY REQUEST] Using OpenAI Responses streaming proxy")
+            LOGGER.debug("[PROXY REQUEST] Using OpenAI Responses streaming proxy")
             return await self._stream_openai_responses_proxy(
                 upstream_url,
                 body_bytes,
@@ -562,7 +624,7 @@ class RolloutLLMProxy:
                 original_responses_request or {},
             )
         if is_anthropic:
-            LOGGER.info("[PROXY REQUEST] Using Anthropic plain proxy")
+            LOGGER.debug("[PROXY REQUEST] Using Anthropic plain proxy")
             return await self._plain_anthropic_messages_proxy(
                 request.method,
                 upstream_url,
@@ -571,7 +633,7 @@ class RolloutLLMProxy:
                 snapshot,
             )
         if is_responses:
-            LOGGER.info("[PROXY REQUEST] Using OpenAI Responses plain proxy")
+            LOGGER.debug("[PROXY REQUEST] Using OpenAI Responses plain proxy")
             return await self._plain_openai_responses_proxy(
                 request.method,
                 upstream_url,
@@ -580,7 +642,7 @@ class RolloutLLMProxy:
                 snapshot,
                 original_responses_request or {},
             )
-        LOGGER.info("[PROXY REQUEST] Using plain proxy")
+        LOGGER.debug("[PROXY REQUEST] Using plain proxy")
         return await self._plain_proxy(
             request.method,
             upstream_url,
@@ -640,6 +702,8 @@ class RolloutLLMProxy:
             if is_anthropic and key_lower.startswith("x-stainless-"):
                 continue
             headers[key] = value
+        for key, value in self.upstream_headers.items():
+            self._set_header(headers, key, value)
         if is_chat:
             self._set_header(headers, self.sticky_header_name, self.bound_session_id)
             self._set_header(headers, "X-Session-Id", self.bound_session_id)
@@ -650,7 +714,10 @@ class RolloutLLMProxy:
             if self._current_version is not None:
                 self._set_header(headers, "X-Dressage-Expected-Version", str(self._current_version))
             self._set_header(headers, "Accept-Encoding", "identity")
-        LOGGER.info("[PROXY REQUEST] upstream request headers: %s", headers)
+        LOGGER.debug(
+            "[PROXY REQUEST] upstream request headers: %s",
+            self._redact_headers(headers),
+        )
         return headers
 
     @staticmethod
@@ -1225,7 +1292,7 @@ class RolloutLLMProxy:
         assert self._client is not None
         request_headers = dict(headers)
         request_headers["content-length"] = str(len(body))
-        LOGGER.info("[PROXY REQUEST] Setting content-length: %d", len(body))
+        LOGGER.debug("[PROXY REQUEST] Setting content-length: %d", len(body))
         return await self._client.request(method=method, url=url, content=body, headers=request_headers)
 
     async def _send_stream_request(
@@ -1237,7 +1304,7 @@ class RolloutLLMProxy:
         assert self._client is not None
         request_headers = dict(headers)
         request_headers["content-length"] = str(len(body))
-        LOGGER.info("[PROXY REQUEST] Setting content-length: %d", len(body))
+        LOGGER.debug("[PROXY REQUEST] Setting content-length: %d", len(body))
         request = self._client.build_request("POST", url, content=body, headers=request_headers)
         return await self._client.send(request, stream=True)
 
@@ -1450,13 +1517,22 @@ class RolloutLLMProxy:
         except (UnicodeDecodeError, json.JSONDecodeError):
             return None
 
-    @staticmethod
-    def _redact_headers(headers: dict[str, str]) -> dict[str, str]:
+    def _redact_headers(self, headers: dict[str, str]) -> dict[str, str]:
         redacted: dict[str, str] = {}
         for key, value in headers.items():
             lower = key.lower()
             if (
-                lower in {"authorization", "proxy-authorization", "cookie", "set-cookie", "x-api-key"}
+                lower in self._static_upstream_header_names
+                or lower
+                in {
+                    "authorization",
+                    "proxy-authorization",
+                    "cookie",
+                    "set-cookie",
+                    "x-api-key",
+                    "api-key",
+                    "apikey",
+                }
                 or "token" in lower
                 or lower.endswith("-api-key")
             ):
