@@ -7,6 +7,7 @@ import os
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -59,9 +60,12 @@ from blackbox_server.core.models import (
     SessionStats,
     StatusResponse,
     TraceEvent,
+    TurnCancelResponse,
     TurnContext,
     TurnRecord,
     TurnStatus,
+    TurnStatusResponse,
+    TurnSubmitResponse,
     utcnow,
 )
 from blackbox_server.core.monitoring import BackendMonitor
@@ -80,6 +84,26 @@ _TURN_MODE_KEY = "__bbs_turn_mode"
 _TURN_MODE_SINGLE = "single"
 _TURN_MODE_EXPLICIT = "explicit"
 _DEFAULT_TURN_ID_KEY = "__bbs_default_turn_id"
+_ACTIVE_TURN_STATUSES = frozenset({TurnStatus.QUEUED, TurnStatus.INFLIGHT})
+_TERMINAL_TURN_STATUSES = frozenset(
+    {
+        TurnStatus.COMMITTED,
+        TurnStatus.FAILED,
+        TurnStatus.CANCELLED,
+        TurnStatus.UNKNOWN,
+    }
+)
+_MAX_TURN_WAIT_SECONDS = 60.0
+
+
+@dataclass
+class TurnSubmission:
+    """Result of accepting (or replaying) a turn submission."""
+
+    turn_id: str
+    status: TurnStatus
+    idempotent_replay: bool
+    instance_id: str | None = None
 
 
 class BlackboxServer:
@@ -95,6 +119,8 @@ class BlackboxServer:
         self._session_store = SessionStore()
         self._monitor: BackendMonitor | None = None
         self._active_cmd_processes: dict[str, asyncio.subprocess.Process] = {}
+        self._turn_events: dict[tuple[str, str], asyncio.Event] = {}
+        self._active_turn_tasks: dict[str, asyncio.Task[None]] = {}
         self._active_requests = 0
         self._request_counter_lock = asyncio.Lock()
         self._no_inflight_requests = asyncio.Event()
@@ -197,6 +223,7 @@ class BlackboxServer:
         self._shutdown_started = True
         self._state = ServerState.SHUTTING_DOWN
         await self._terminate_all_active_cmds()
+        await self._terminate_all_active_turns()
         try:
             await asyncio.wait_for(
                 self._no_inflight_requests.wait(),
@@ -382,7 +409,13 @@ class BlackboxServer:
             "adapter": adapter_state,
         }
 
-    async def send_message(self, session_id: str, request: MessageRequest) -> MessageResponse:
+    async def submit_turn(self, session_id: str, request: MessageRequest) -> TurnSubmission:
+        """Accept (or idempotently replay) a turn and start background execution.
+
+        Runs the short admission critical section under ``session_lock`` and then
+        releases the lock, spawning ``_run_turn`` for the actual backend call.
+        """
+
         self._ensure_state_ready_for_messages()
         await self._wait_if_paused()
         self._validate_identifier("session_id", session_id)
@@ -445,33 +478,31 @@ class BlackboxServer:
                         "Same turn_id was already used with a different request body.",
                         details={"session_id": session_id, "turn_id": effective_turn_id},
                     )
-                if existing.status == TurnStatus.COMMITTED and existing.response is not None:
-                    return MessageResponse(
-                        request_id="",
-                        session_id=session_id,
-                        instance_id=self._response_instance_id(),
-                        turn_id=effective_turn_id,
-                        state=session.state,
-                        idempotent_replay=True,
-                        outputs=existing.response.outputs,
-                        backend=BackendRef(
-                            type=self._binding_context.binding.blackbox_type,
-                            backend_session_id=existing.response.backend_session_id,
-                        ),
-                        usage=existing.response.usage,
-                    )
-                if existing.status == TurnStatus.INFLIGHT:
-                    raise ApiError(
-                        409,
-                        "conflict",
-                        "Same turn_id is still in flight.",
-                        details={"session_id": session_id, "turn_id": effective_turn_id},
-                    )
+                # Same turn_id + same fingerprint: idempotent replay of the
+                # existing record regardless of its state.  COMMITTED replays the
+                # result, QUEUED/INFLIGHT re-attach to the same execution, and the
+                # remaining terminal states are returned as-is for the client to
+                # decide the next step.
+                return TurnSubmission(
+                    turn_id=effective_turn_id,
+                    status=existing.status,
+                    idempotent_replay=True,
+                    instance_id=self._response_instance_id(),
+                )
+
+            # Distinct turn_id while another turn is still active: at most one
+            # active turn per session.
+            active_turn_id = self._active_turn_id(session)
+            if active_turn_id is not None:
                 raise ApiError(
                     409,
                     "conflict",
-                    "Same turn_id is in unknown state and the session is desynced.",
-                    details={"session_id": session_id, "turn_id": effective_turn_id},
+                    "Session already has an active turn in progress.",
+                    details={
+                        "session_id": session_id,
+                        "turn_id": effective_turn_id,
+                        "active_turn_id": active_turn_id,
+                    },
                 )
 
             if not await self._adapter_health_with_retry("before_send_message"):
@@ -482,109 +513,303 @@ class BlackboxServer:
             session.turn_ledger[effective_turn_id] = TurnRecord(
                 turn_id=effective_turn_id,
                 request_fingerprint=request_fingerprint,
-                status=TurnStatus.INFLIGHT,
+                status=TurnStatus.QUEUED,
                 request_messages=request.messages,
                 created_at=now,
                 updated_at=now,
             )
+            self._turn_events[(bound_session_id, effective_turn_id)] = asyncio.Event()
+            task = asyncio.create_task(
+                self._run_turn(bound_session_id, effective_turn_id, request)
+            )
+            self._active_turn_tasks[bound_session_id] = task
+            return TurnSubmission(
+                turn_id=effective_turn_id,
+                status=TurnStatus.QUEUED,
+                idempotent_replay=False,
+                instance_id=self._response_instance_id(),
+            )
+
+    async def send_message(self, session_id: str, request: MessageRequest) -> MessageResponse:
+        """Synchronous facade: submit a turn and block until it settles.
+
+        Preserves the exact HTTP status codes / error semantics of the original
+        request-bound implementation by reconstructing them from the turn record.
+        """
+
+        submission = await self.submit_turn(session_id, request)
+        bound_session_id = self._binding_context.binding.bound_session_id
+
+        if submission.status in _ACTIVE_TURN_STATUSES:
+            event = self._turn_events.get((bound_session_id, submission.turn_id))
+            if event is not None:
+                await event.wait()
+
+        session = await self._session_store.get(bound_session_id)
+        session_lock = await self._session_store.get_lock(bound_session_id)
+        if session is None or session_lock is None:
+            raise ApiError(
+                500,
+                "internal_error",
+                "Bound session was not initialized.",
+                details={"session_id": bound_session_id},
+            )
+
+        async with session_lock:
+            record = session.turn_ledger.get(submission.turn_id)
+            if record is None:
+                raise ApiError(
+                    500,
+                    "internal_error",
+                    "Turn record disappeared before completion.",
+                    details={"session_id": session_id, "turn_id": submission.turn_id},
+                )
+            if record.status == TurnStatus.COMMITTED and record.response is not None:
+                return self._build_committed_message_response(
+                    session_id=session_id,
+                    session=session,
+                    record=record,
+                    idempotent_replay=submission.idempotent_replay,
+                )
+            self._raise_from_turn_error(session_id, record)
+
+    async def _run_turn(
+        self,
+        session_id: str,
+        turn_id: str,
+        request: MessageRequest,
+    ) -> None:
+        """Background execution of a submitted turn (does not hold session_lock)."""
+
+        session = await self._session_store.get(session_id)
+        session_lock = await self._session_store.get_lock(session_id)
+        try:
+            if session is None or session_lock is None:
+                return
+
+            async with session_lock:
+                record = session.turn_ledger.get(turn_id)
+                if record is None or record.status != TurnStatus.QUEUED:
+                    return
+                record.status = TurnStatus.INFLIGHT
+                record.updated_at = utcnow()
 
             turn_context = TurnContext(
-                turn_id=effective_turn_id,
-                request_fingerprint=request_fingerprint,
+                turn_id=turn_id,
+                request_fingerprint=record.request_fingerprint,
                 metadata=request.metadata,
                 deadline_seconds=self._effective_config.backend_timeout,
             )
+
+            outcome: tuple[str, Any, dict[str, Any] | None]
             try:
                 adapter_response = await self._wait_for_backend_call_excluding_pause(
                     self._adapter.send_message(session, turn_context, request.messages),
                     timeout=self._effective_config.backend_timeout,
                 )
-                session.backend_session_id = adapter_response.backend_session_id
-                session.conversation_history.extend(request.messages)
-                session.conversation_history.extend(adapter_response.outputs)
-                session.trace_events.extend(adapter_response.trace_events)
-                session.turn_count += 1
-                session.updated_at = utcnow()
-                turn_record = session.turn_ledger[effective_turn_id]
-                turn_record.status = TurnStatus.COMMITTED
-                turn_record.response = adapter_response
-                turn_record.updated_at = utcnow()
-                return MessageResponse(
-                    request_id="",
-                    session_id=session_id,
-                    instance_id=self._response_instance_id(),
-                    turn_id=effective_turn_id,
-                    state=session.state,
-                    idempotent_replay=False,
-                    outputs=adapter_response.outputs,
-                    backend=BackendRef(
-                        type=self._binding_context.binding.blackbox_type,
-                        backend_session_id=adapter_response.backend_session_id,
-                    ),
-                    usage=adapter_response.usage,
+                outcome = ("commit", adapter_response, None)
+            except asyncio.CancelledError:
+                async with session_lock:
+                    self._finalize_interrupted_turn_locked(session, turn_id)
+                return
+            except asyncio.TimeoutError:
+                outcome = (
+                    "unknown",
+                    None,
+                    {
+                        "error": "backend_timeout",
+                        "message": "Backend call exceeded backend_timeout.",
+                        "http_status": 504,
+                    },
                 )
-            except asyncio.TimeoutError as exc:
-                await self._handle_unknown_turn(
-                    session=session,
-                    turn_id=effective_turn_id,
-                    error="backend_timeout",
-                    message="Backend call exceeded backend_timeout.",
-                )
-                raise ApiError(
-                    504,
-                    "backend_timeout",
-                    "Backend call exceeded backend_timeout.",
-                    details={"session_id": session_id, "turn_id": effective_turn_id},
-                ) from exc
             except BackendContextOverflowError as exc:
-                await self._handle_unknown_turn(
-                    session=session,
-                    turn_id=effective_turn_id,
-                    error="context_overflow",
-                    message=str(exc),
-                )
-                raise ApiError(
-                    413,
-                    "context_overflow",
-                    str(exc),
-                    details={
-                        "session_id": session_id,
-                        "turn_id": effective_turn_id,
-                        **exc.details(),
+                outcome = (
+                    "unknown",
+                    None,
+                    {
+                        "error": "context_overflow",
+                        "message": str(exc),
+                        "http_status": 413,
+                        "extra_details": exc.details(),
                     },
-                ) from exc
+                )
             except BackendMaxStepsExceededError as exc:
-                await self._handle_unknown_turn(
-                    session=session,
-                    turn_id=effective_turn_id,
-                    error="max_steps_exceeded",
-                    message=str(exc),
-                )
-                raise ApiError(
-                    429,
-                    "max_steps_exceeded",
-                    str(exc),
-                    details={
-                        "session_id": session_id,
-                        "turn_id": effective_turn_id,
-                        **exc.details(),
+                outcome = (
+                    "unknown",
+                    None,
+                    {
+                        "error": "max_steps_exceeded",
+                        "message": str(exc),
+                        "http_status": 429,
+                        "extra_details": exc.details(),
                     },
-                ) from exc
-            except (BackendTransportError, BackendProtocolError, BackendProcessError) as exc:
-                await self._handle_unknown_turn(
-                    session=session,
-                    turn_id=effective_turn_id,
-                    error="backend_error",
-                    message=str(exc),
                 )
-                if isinstance(exc, BackendProcessError):
-                    await self._mark_backend_error("backend_process_error")
+            except (BackendTransportError, BackendProtocolError, BackendProcessError) as exc:
+                outcome = (
+                    "unknown",
+                    None,
+                    {
+                        "error": "backend_error",
+                        "message": f"Backend request failed: {exc}",
+                        "http_status": 502,
+                        "process_error": isinstance(exc, BackendProcessError),
+                    },
+                )
+            except Exception as exc:
+                LOGGER.exception(
+                    "unexpected error while running turn %s for session %s",
+                    turn_id,
+                    session_id,
+                )
+                outcome = (
+                    "unknown",
+                    None,
+                    {
+                        "error": "internal_error",
+                        "message": f"Unexpected backend failure: {exc}",
+                        "http_status": 500,
+                    },
+                )
+
+            async with session_lock:
+                record = session.turn_ledger.get(turn_id)
+                if record is None or record.status != TurnStatus.INFLIGHT:
+                    # Turn was aborted/cancelled concurrently; do not commit.
+                    return
+                if outcome[0] == "commit":
+                    adapter_response = outcome[1]
+                    session.backend_session_id = adapter_response.backend_session_id
+                    session.conversation_history.extend(request.messages)
+                    session.conversation_history.extend(adapter_response.outputs)
+                    session.trace_events.extend(adapter_response.trace_events)
+                    session.turn_count += 1
+                    session.updated_at = utcnow()
+                    record.status = TurnStatus.COMMITTED
+                    record.response = adapter_response
+                    record.updated_at = utcnow()
+                else:
+                    error_kwargs = dict(outcome[2] or {})
+                    process_error = bool(error_kwargs.pop("process_error", False))
+                    await self._handle_unknown_turn(
+                        session=session,
+                        turn_id=turn_id,
+                        error=error_kwargs["error"],
+                        message=error_kwargs["message"],
+                        http_status=error_kwargs.get("http_status"),
+                        extra_details=error_kwargs.get("extra_details"),
+                    )
+                    if process_error:
+                        await self._mark_backend_error("backend_process_error")
+        finally:
+            event = self._turn_events.get((session_id, turn_id))
+            if event is not None:
+                event.set()
+            current = asyncio.current_task()
+            if self._active_turn_tasks.get(session_id) is current:
+                self._active_turn_tasks.pop(session_id, None)
+
+    async def get_turn(
+        self,
+        session_id: str,
+        turn_id: str,
+        *,
+        wait_seconds: float = 0.0,
+    ) -> TurnStatusResponse:
+        self._validate_identifier("session_id", session_id)
+        self._validate_identifier("turn_id", turn_id)
+        bound_session_id = self._require_bound_session_match(session_id)
+        session = await self._session_store.get(bound_session_id) if bound_session_id else None
+        session_lock = (
+            await self._session_store.get_lock(bound_session_id) if bound_session_id else None
+        )
+        if session is None or session_lock is None:
+            raise ApiError(404, "not_found", "Session does not exist.", details={"session_id": session_id})
+
+        record = session.turn_ledger.get(turn_id)
+        if record is None:
+            raise ApiError(
+                404,
+                "not_found",
+                "Turn does not exist.",
+                details={"session_id": session_id, "turn_id": turn_id},
+            )
+
+        if wait_seconds and wait_seconds > 0 and record.status in _ACTIVE_TURN_STATUSES:
+            clamped = min(float(wait_seconds), _MAX_TURN_WAIT_SECONDS)
+            event = self._turn_events.get((bound_session_id, turn_id))
+            if event is not None:
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(event.wait(), timeout=clamped)
+
+        async with session_lock:
+            record = session.turn_ledger.get(turn_id)
+            if record is None:
                 raise ApiError(
-                    502,
-                    "backend_error",
-                    f"Backend request failed: {exc}",
-                    details={"session_id": session_id, "turn_id": effective_turn_id},
-                ) from exc
+                    404,
+                    "not_found",
+                    "Turn does not exist.",
+                    details={"session_id": session_id, "turn_id": turn_id},
+                )
+            return self._build_turn_status_response(session_id, session, record)
+
+    async def cancel_turn(self, session_id: str, turn_id: str) -> TurnCancelResponse:
+        self._validate_identifier("session_id", session_id)
+        self._validate_identifier("turn_id", turn_id)
+        bound_session_id = self._require_bound_session_match(session_id)
+        session = await self._session_store.get(bound_session_id) if bound_session_id else None
+        session_lock = (
+            await self._session_store.get_lock(bound_session_id) if bound_session_id else None
+        )
+        if session is None or session_lock is None:
+            raise ApiError(404, "not_found", "Session does not exist.", details={"session_id": session_id})
+
+        cancel_inflight = False
+        async with session_lock:
+            record = session.turn_ledger.get(turn_id)
+            if record is None:
+                raise ApiError(
+                    404,
+                    "not_found",
+                    "Turn does not exist.",
+                    details={"session_id": session_id, "turn_id": turn_id},
+                )
+            if record.status == TurnStatus.QUEUED:
+                record.status = TurnStatus.CANCELLED
+                record.error = {
+                    "error": "cancelled",
+                    "message": "Turn cancelled before execution.",
+                    "http_status": 499,
+                    "details": {"session_id": session_id, "turn_id": turn_id},
+                }
+                record.updated_at = utcnow()
+                session.updated_at = utcnow()
+                event = self._turn_events.get((bound_session_id, turn_id))
+                if event is not None:
+                    event.set()
+                status = "cancelled"
+            elif record.status == TurnStatus.INFLIGHT:
+                cancel_inflight = True
+                status = "cancel_requested"
+            else:
+                status = record.status.value
+            state = session.state
+
+        if cancel_inflight:
+            task = self._active_turn_tasks.get(bound_session_id)
+            if task is not None:
+                task.cancel()
+            if self._adapter is not None:
+                with contextlib.suppress(Exception):
+                    await self._adapter.abort_session(session)
+
+        return TurnCancelResponse(
+            request_id="",
+            session_id=session_id,
+            instance_id=self._response_instance_id(),
+            turn_id=turn_id,
+            status=status,
+            state=state,
+        )
 
     async def execute_cmd(self, session_id: str, request: ExecuteCmdRequest) -> ExecuteCmdResponse:
         self._ensure_state_ready_for_messages()
@@ -627,6 +852,14 @@ class BlackboxServer:
                     "conflict",
                     "Session is desynced and cannot execute commands.",
                     details={"session_id": session_id, "state": session.state},
+                )
+            active_turn_id = self._active_turn_id(session)
+            if active_turn_id is not None:
+                raise ApiError(
+                    409,
+                    "conflict",
+                    "Session has an active turn in progress and cannot execute commands.",
+                    details={"session_id": session_id, "active_turn_id": active_turn_id},
                 )
 
             try:
@@ -711,6 +944,10 @@ class BlackboxServer:
                     mode="noop",
                 )
 
+            active_turn_task = self._active_turn_tasks.get(session_id)
+            if active_turn_task is not None:
+                active_turn_task.cancel()
+
             if self._adapter is not None:
                 with contextlib.suppress(Exception):
                     await self._adapter.abort_session(session)
@@ -720,10 +957,18 @@ class BlackboxServer:
 
             now = utcnow()
             for turn_record in session.turn_ledger.values():
-                if turn_record.status == TurnStatus.INFLIGHT:
+                if turn_record.status in _ACTIVE_TURN_STATUSES:
                     turn_record.status = TurnStatus.UNKNOWN
-                    turn_record.error = {"error": "aborted", "message": "Session was aborted while turn was in flight."}
+                    turn_record.error = {
+                        "error": "aborted",
+                        "message": "Session was aborted while turn was in flight.",
+                        "http_status": 409,
+                        "details": {"session_id": session_id, "turn_id": turn_record.turn_id},
+                    }
                     turn_record.updated_at = now
+                    event = self._turn_events.get((session_id, turn_record.turn_id))
+                    if event is not None:
+                        event.set()
 
             return AbortResponse(
                 request_id="",
@@ -749,6 +994,126 @@ class BlackboxServer:
             known_backends=KNOWN_BACKENDS,
         )
 
+    @staticmethod
+    def _active_turn_id(session: SessionContext) -> str | None:
+        for record in session.turn_ledger.values():
+            if record.status in _ACTIVE_TURN_STATUSES:
+                return record.turn_id
+        return None
+
+    def _build_committed_message_response(
+        self,
+        *,
+        session_id: str,
+        session: SessionContext,
+        record: TurnRecord,
+        idempotent_replay: bool,
+    ) -> MessageResponse:
+        assert record.response is not None
+        assert self._binding_context is not None
+        return MessageResponse(
+            request_id="",
+            session_id=session_id,
+            instance_id=self._response_instance_id(),
+            turn_id=record.turn_id,
+            state=session.state,
+            idempotent_replay=idempotent_replay,
+            outputs=record.response.outputs,
+            backend=BackendRef(
+                type=self._binding_context.binding.blackbox_type,
+                backend_session_id=record.response.backend_session_id,
+            ),
+            usage=record.response.usage,
+        )
+
+    def _raise_from_turn_error(self, session_id: str, record: TurnRecord) -> None:
+        """Reconstruct the original synchronous ApiError from a turn record."""
+
+        error = record.error or {}
+        http_status = int(error.get("http_status") or 500)
+        code = str(error.get("error") or "backend_error")
+        message = str(error.get("message") or "Turn failed.")
+        details = error.get("details")
+        if not isinstance(details, dict):
+            details = {"session_id": session_id, "turn_id": record.turn_id}
+        raise ApiError(http_status, code, message, details=details)
+
+    def _build_turn_status_response(
+        self,
+        session_id: str,
+        session: SessionContext,
+        record: TurnRecord,
+    ) -> TurnStatusResponse:
+        outputs = None
+        usage = None
+        backend = None
+        error = None
+        if record.status == TurnStatus.COMMITTED and record.response is not None:
+            outputs = record.response.outputs
+            usage = record.response.usage
+            assert self._binding_context is not None
+            backend = BackendRef(
+                type=self._binding_context.binding.blackbox_type,
+                backend_session_id=record.response.backend_session_id,
+            )
+        elif record.status in _TERMINAL_TURN_STATUSES:
+            error = record.error
+        return TurnStatusResponse(
+            request_id="",
+            session_id=session_id,
+            instance_id=self._response_instance_id(),
+            turn_id=record.turn_id,
+            status=record.status,
+            state=session.state,
+            outputs=outputs,
+            usage=usage,
+            backend=backend,
+            error=error,
+            created_at=record.created_at,
+            updated_at=record.updated_at,
+        )
+
+    def _finalize_interrupted_turn_locked(self, session: SessionContext, turn_id: str) -> None:
+        """Settle a turn interrupted by cancellation or shutdown.
+
+        Must be called while holding the session lock.  During shutdown the turn
+        is treated as UNKNOWN (session -> DESYNCED, mirroring the timeout path);
+        an explicit cancel maps to CANCELLED.
+        """
+
+        record = session.turn_ledger.get(turn_id)
+        if record is None or record.status in _TERMINAL_TURN_STATUSES:
+            return
+        now = utcnow()
+        if self._shutdown_started:
+            record.status = TurnStatus.UNKNOWN
+            record.error = {
+                "error": "server_shutdown",
+                "message": "Server shut down while the turn was in flight.",
+                "http_status": 504,
+                "details": {"session_id": session.session_id, "turn_id": turn_id},
+            }
+            if session.state != SessionState.ABORTED:
+                session.state = SessionState.DESYNCED
+        else:
+            record.status = TurnStatus.CANCELLED
+            record.error = {
+                "error": "cancelled",
+                "message": "Turn cancelled while in flight.",
+                "http_status": 499,
+                "details": {"session_id": session.session_id, "turn_id": turn_id},
+            }
+        record.updated_at = now
+        session.updated_at = now
+
+    async def _terminate_all_active_turns(self) -> None:
+        tasks = [task for task in self._active_turn_tasks.values() if not task.done()]
+        if not tasks:
+            return
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
     async def _mark_backend_error(self, reason: str) -> None:
         if self._state == ServerState.ERROR:
             return
@@ -763,10 +1128,18 @@ class BlackboxServer:
         turn_id: str,
         error: str,
         message: str,
+        http_status: int | None = None,
+        extra_details: dict[str, Any] | None = None,
     ) -> None:
         turn_record = session.turn_ledger[turn_id]
         turn_record.status = TurnStatus.UNKNOWN
-        turn_record.error = {"error": error, "message": message}
+        details: dict[str, Any] = {"session_id": session.session_id, "turn_id": turn_id}
+        if extra_details:
+            details.update(extra_details)
+        error_payload: dict[str, Any] = {"error": error, "message": message, "details": details}
+        if http_status is not None:
+            error_payload["http_status"] = http_status
+        turn_record.error = error_payload
         turn_record.updated_at = utcnow()
         if session.state != SessionState.ABORTED:
             session.state = SessionState.DESYNCED

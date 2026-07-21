@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 import httpx
@@ -77,7 +78,36 @@ async def _run_blackbox_agent_paddock_uses_provider_and_blackbox_client():
             assert "runtime_root" not in body
             return httpx.Response(200, json={"ok": True})
         if request.url.path == "/v1/sessions/traj-1/messages":
-            return httpx.Response(200, json={"response": "done"})
+            # Async submit acknowledgement (202) with the caller-supplied turn_id.
+            body = json.loads(request.content.decode())
+            assert body["mode"] == "async"
+            return httpx.Response(
+                202,
+                json={
+                    "request_id": "req-1",
+                    "session_id": "traj-1",
+                    "turn_id": body["turn_id"],
+                    "status": "queued",
+                    "idempotent_replay": False,
+                },
+            )
+        if request.url.path.startswith("/v1/sessions/traj-1/turns/"):
+            turn_id = request.url.path.rsplit("/", 1)[-1]
+            return httpx.Response(
+                200,
+                json={
+                    "request_id": "req-1",
+                    "session_id": "traj-1",
+                    "turn_id": turn_id,
+                    "status": "committed",
+                    "state": "active",
+                    "outputs": [{"role": "assistant", "content": "done"}],
+                    "backend": {"type": "opencode", "backend_session_id": "oc-1"},
+                    "usage": {"total_tokens": 1},
+                    "created_at": "2026-05-29T00:00:00Z",
+                    "updated_at": "2026-05-29T00:00:01Z",
+                },
+            )
         if request.url.path == "/v1/sessions/traj-1/execute_cmd":
             return httpx.Response(200, json={"returncode": 0, "stdout": "Python\n"})
         raise AssertionError(f"unexpected path {request.url.path}")
@@ -101,7 +131,8 @@ async def _run_blackbox_agent_paddock_uses_provider_and_blackbox_client():
     assert provider.created[0].metadata == {"paddock_mode": "blackbox"}
 
     assert await paddock.register_agent(state, instance_id="inst", session_id="traj-1") == {"ok": True}
-    assert (await paddock.call_agent(state, session_id="traj-1", messages=[]))["response"] == "done"
+    call_payload = await paddock.call_agent(state, session_id="traj-1", messages=[])
+    assert call_payload["outputs"][0]["content"] == "done"
     assert (await paddock.execute_cmd(state, session_id="traj-1", cmd="python -V"))["returncode"] == 0
 
     await client.aclose()

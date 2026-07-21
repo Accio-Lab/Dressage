@@ -54,6 +54,7 @@ class BlackboxPaddock(Paddock):
         session_id: str,
         messages: list[dict[str, Any]],
         metadata: dict[str, Any] | None = None,
+        turn_id: str | None = None,
     ) -> dict[str, Any]:
         """Delegate to a blackbox agent and return its response payload."""
 

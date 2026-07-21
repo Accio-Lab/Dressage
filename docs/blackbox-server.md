@@ -33,7 +33,8 @@ Dressage Proxy → ⚡ SGLang Router
 
 - **Multi-Backend Support** — Pluggable adapter pattern supports `opencode` (code-editing agent via `opencode serve`), `openclaw` (OpenClaw Gateway via `/v1/chat/completions`), `claude_code` (Claude Code headless CLI via Anthropic Messages), and `codex` (Codex CLI via `codex exec --json`). Adding a new backend means implementing a single `BackendAdapter` class with `initialize`, `send_message`, `abort_session`, `health`, and `capabilities` methods; `pause` / `resume` can be overridden when the backend supports them.
 - **In-Process LLM Proxy** — Every BlackboxServer instance runs a lightweight HTTP proxy that intercepts all outgoing LLM calls from the backend agent. This proxy injects session headers (`X-Session-Id`, `X-Instance-Id`, `X-Turn-Id`), routing keys, and partial rollout markers transparently. The agent never knows its calls are being recorded.
-- **Turn Idempotency** — Each turn is identified by a `(turn_id, messages_hash)` tuple. Retrying the same turn with the same messages returns cached responses. Retrying with different messages returns `409 Conflict`. This makes the protocol safe for network retries without duplicating agent work.
+- **Turn Idempotency** — Each turn is identified by a `(turn_id, messages_hash)` tuple. Retrying the same turn with the same messages replays the cached result (committed) or re-attaches to the in-progress execution (queued/inflight) without starting a second agent run; retrying with different messages returns `409 Conflict`. This makes both synchronous calls and asynchronous submit retries safe without duplicating agent work.
+- **Sync + Async turns** — `POST /messages` accepts `mode="sync"` (default, request-bound) or `mode="async"` (submit + `202`, then long-poll `GET /turns/{turn_id}`). At most one turn is active per session; `execute_cmd` is rejected while a turn is active.
 - **Register & Rebind** — Registration is idempotent: calling `POST /v1/rollout/register` with the same parameters while the server is ready is a no-op. If parameters change, the server returns `409 Conflict` while active or desynced sessions still exist; only after no open sessions remain can it tear down and re-initialize with the new configuration.
 - **Health Monitoring** — A background poller periodically checks the backend agent process health. If the agent crashes or becomes unresponsive, the session is marked as `desynced` and the paddock is informed. This prevents silent failures where the agent dies but the rollout keeps waiting.
 - **Single-Session Guarantee** — One server instance manages exactly one agent process and one active session. This ensures clean turn-context attribution: every LLM call within a session is guaranteed to carry the correct session/turn headers. For parallel rollout, deploy one BlackboxServer per sandbox slot.
@@ -165,10 +166,12 @@ The BlackboxServer has a layered internal architecture — FastAPI routes on top
 
  | Method | Path | Purpose | Details |
  | :------- | :----- | :-------- | :-------- |
- | `POST` | `/v1/sessions/{id}/messages` | Send a user turn | Sends messages to agent, waits for completion. Supports turn idempotency via `turn_id`. |
- | `POST` | `/v1/sessions/{id}/execute_cmd` | Execute command | Run a shell command inside the sandbox. Returns stdout/stderr. |
+ | `POST` | `/v1/sessions/{id}/messages` | Submit a user turn | Body `mode` selects behaviour. `mode="sync"` (default) blocks until completion and returns the turn result (fully backward compatible). `mode="async"` accepts the turn and returns `202 Accepted` with `{turn_id, status}`; `turn_id` is **required** in async mode. Turn idempotency keyed on `(turn_id, messages_hash)`. |
+ | `GET` | `/v1/sessions/{id}/turns/{turn_id}` | Poll turn status | Long-poll a submitted turn. Optional `?wait=<seconds>` (clamped to 60) blocks until the turn settles or the wait expires (then returns the current `queued`/`inflight` snapshot — never `504`). Terminal turns return outputs/usage/backend (committed) or `error` (failed/unknown/cancelled). |
+ | `POST` | `/v1/sessions/{id}/turns/{turn_id}/cancel` | Cancel a turn | `queued` turns are cancelled synchronously (`cancelled`); `inflight` turns are cancelled best-effort (`cancel_requested`); terminal turns return their current state idempotently. |
+ | `POST` | `/v1/sessions/{id}/execute_cmd` | Execute command | Run a shell command inside the sandbox. Rejected with `409` while a turn is `queued`/`inflight` (at most one active turn per session). Returns stdout/stderr. |
  | `GET` | `/v1/sessions/{id}` | Get session info | Returns session state, turn history, and metadata. |
- | `POST` | `/v1/sessions/{id}/abort` | Abort session | Cleanly stops the agent session and marks it as aborted. |
+ | `POST` | `/v1/sessions/{id}/abort` | Abort session | Cleanly stops the agent session, cancels any active turn, and marks it as aborted. |
 
 ## 🔄 Data Flow
 
@@ -197,27 +200,42 @@ Register Request (blackbox_type, router, bound_session_id, bound_instance_id, ..
 
 ### 2 Turn Execution
 
-For each turn via `POST /v1/sessions/{id}/messages`:
+A turn is submitted via `POST /v1/sessions/{id}/messages`. Submission is a short
+critical section that accepts the turn and starts a background execution task;
+the actual backend call runs outside the session lock. `mode="sync"` blocks the
+HTTP request until the turn settles (backward compatible); `mode="async"` returns
+`202` immediately and the client polls `GET /v1/sessions/{id}/turns/{turn_id}`.
 
 ```text
-Turn Request (turn_id, messages)
+Turn Submit (turn_id, messages, mode)
         │
-        ├── Check idempotency ledger
-        │   ├── Same (turn_id, messages_hash)? → return cached response
-        │   └── Same turn_id, different messages? → 409 Conflict
+        ├── Admission (under session lock)
+        │   ├── Same (turn_id, messages_hash)?
+        │   │   ├── committed        → idempotent replay of the cached result
+        │   │   ├── queued/inflight  → re-attach to the same execution (no new work)
+        │   │   └── terminal error   → return the existing terminal record
+        │   ├── Same turn_id, different messages? → 409 Conflict
+        │   └── Different turn_id while one is active? → 409 Conflict (active_turn_id)
         │
-        ├── Set proxy context → (session_id, turn_id)
-        │   └── All subsequent LLM calls carry these headers
+        ├── Create TurnRecord(status=queued) + completion event
+        ├── Spawn background task, release lock, return (202 for async)
         │
-        ├── Forward messages to backend agent
-        │   └── Agent runs its logic (code editing, reasoning, etc.)
-        │   └── Agent makes LLM calls → proxy → SGLang
-        │   └── Every token is recorded by Dressage proxy
-        │
-        ├── Store response in idempotency ledger
-        │
-        └── Return agent response to paddock
+        └── Background task (no session lock held)
+            ├── status → inflight
+            ├── Set proxy context → (session_id, turn_id)
+            ├── Forward messages to backend agent (pause-aware, backend_timeout)
+            │   └── Agent makes LLM calls → proxy → SGLang (recorded)
+            ├── Re-acquire lock to commit:
+            │   ├── success           → status committed + response
+            │   ├── timeout           → status unknown (session desynced, 504)
+            │   ├── overflow/steps    → status unknown (413 / 429)
+            │   └── cancel/shutdown   → status cancelled / unknown
+            └── Set completion event (wakes sync waiters and long-polls)
 ```
+
+Turn status lifecycle: `queued → inflight → {committed | failed | cancelled | unknown}`.
+`error.http_status` on a terminal record preserves the original synchronous HTTP
+status so both the sync facade and polling clients surface identical errors.
 
 ### 3 Session Termination
 
@@ -299,7 +317,7 @@ curl -X POST http://127.0.0.1:23456/v1/rollout/register \
     }'
 ```
 
-### Send a Message
+### Send a Message (synchronous)
 
 ```bash
 curl -X POST http://127.0.0.1:23456/v1/sessions/sess-001/messages \
@@ -308,6 +326,25 @@ curl -X POST http://127.0.0.1:23456/v1/sessions/sess-001/messages \
     "turn_id": "turn-001",
     "messages": [{"role": "user", "content": "Fix the bug in main.py"}]
   }'
+```
+
+### Send a Message (asynchronous submit + poll)
+
+```bash
+# Submit (turn_id is required for async) -> 202 Accepted
+curl -X POST http://127.0.0.1:23456/v1/sessions/sess-001/messages \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "turn_id": "turn-001",
+    "mode": "async",
+    "messages": [{"role": "user", "content": "Fix the bug in main.py"}]
+  }'
+
+# Long-poll until the turn settles (wait is clamped to 60s)
+curl "http://127.0.0.1:23456/v1/sessions/sess-001/turns/turn-001?wait=30"
+
+# Cancel an in-flight turn (best effort)
+curl -X POST http://127.0.0.1:23456/v1/sessions/sess-001/turns/turn-001/cancel
 ```
 
 ### Check Status

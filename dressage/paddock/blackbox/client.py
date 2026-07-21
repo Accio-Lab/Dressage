@@ -3,16 +3,33 @@
 from __future__ import annotations
 
 import logging
+import os
+import time
 from typing import Any
+from uuid import uuid4
 
 import httpx
 
 from dressage.paddock.blackbox.common.command import build_execute_cmd_payload
-from dressage.paddock.blackbox.common.http_retry import post_json_with_retry
+from dressage.paddock.blackbox.common.http_retry import (
+    get_json_with_retry,
+    post_json_with_retry,
+)
 from dressage.paddock.blackbox.common.utils import _env_float, _env_int
 from dressage.sandbox.types import SandboxEndpoint
 
 logger = logging.getLogger(__name__)
+
+# Terminal turn states reported by the async turn status endpoint.
+_TURN_COMMITTED = "committed"
+_TURN_ERROR_STATES = frozenset({"failed", "unknown", "cancelled"})
+_TURN_ACTIVE_STATES = frozenset({"queued", "inflight"})
+
+# Client-side /messages submission mode. "async" submits + long-polls (default);
+# "sync" issues a request-bound call and returns the result directly.
+_CALL_MODE_ENV = "DRESSAGE_BLACKBOX_AGENT_CALL_MODE"
+_DEFAULT_CALL_MODE = "async"
+_VALID_CALL_MODES = frozenset({"sync", "async"})
 
 
 class BlackboxServerClient:
@@ -79,15 +96,136 @@ class BlackboxServerClient:
         session_id: str,
         messages: list[dict[str, Any]],
         metadata: dict[str, Any] | None = None,
+        turn_id: str | None = None,
     ) -> dict[str, Any]:
-        response = await self._post_agent_with_retry(
+        """Submit an agent turn asynchronously and poll until it settles.
+
+        A stable ``turn_id`` is generated once (when the caller does not supply
+        one) and reused across the whole submit retry cycle, making the submit
+        POST idempotent: a retried submit re-attaches to the same server-side
+        turn instead of starting a second execution.
+        """
+        if turn_id is None:
+            turn_id = f"turn-{uuid4().hex}"
+        call_mode = self._resolve_call_mode()
+        submit_response = await self._post_agent_with_retry(
             endpoint,
             f"/v1/sessions/{session_id}/messages",
-            json={"messages": messages, "metadata": metadata or {}},
+            json={
+                "turn_id": turn_id,
+                "mode": call_mode,
+                "messages": messages,
+                "metadata": metadata or {},
+            },
             operation="call_agent",
             trajectory_id=trajectory_id,
         )
-        return response.json()
+        if call_mode == "sync":
+            # The server blocks until completion and returns the full result
+            # (or raises the semantic HTTP error), matching the legacy body.
+            return submit_response.json()
+        submit_data = submit_response.json()
+        idempotent_replay = bool(submit_data.get("idempotent_replay", False))
+        return await self._poll_turn(
+            endpoint,
+            trajectory_id=trajectory_id,
+            session_id=session_id,
+            turn_id=turn_id,
+            idempotent_replay=idempotent_replay,
+        )
+
+    @staticmethod
+    def _resolve_call_mode() -> str:
+        raw = os.environ.get(_CALL_MODE_ENV)
+        if raw is None or raw == "":
+            return _DEFAULT_CALL_MODE
+        mode = raw.strip().lower()
+        if mode not in _VALID_CALL_MODES:
+            logger.warning(
+                "invalid %s=%r; falling back to %r",
+                _CALL_MODE_ENV,
+                raw,
+                _DEFAULT_CALL_MODE,
+            )
+            return _DEFAULT_CALL_MODE
+        return mode
+
+    async def _poll_turn(
+        self,
+        endpoint: SandboxEndpoint,
+        *,
+        trajectory_id: str,
+        session_id: str,
+        turn_id: str,
+        idempotent_replay: bool,
+    ) -> dict[str, Any]:
+        poll_wait = _env_float(
+            "DRESSAGE_BLACKBOX_AGENT_POLL_WAIT_SEC", 30.0, min_value=0.0
+        )
+        total_timeout = _env_float(
+            "DRESSAGE_BLACKBOX_AGENT_POLL_TOTAL_TIMEOUT_SEC", 0.0, min_value=0.0
+        )
+        deadline = time.monotonic() + total_timeout if total_timeout > 0 else None
+        url = f"{endpoint.url.rstrip('/')}/v1/sessions/{session_id}/turns/{turn_id}"
+        while True:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"blackbox turn poll exceeded total timeout for "
+                    f"session_id={session_id} turn_id={turn_id}"
+                )
+            response = await self._get_turn_with_retry(
+                url,
+                params={"wait": poll_wait},
+                operation="poll_turn",
+                trajectory_id=trajectory_id,
+                headers=endpoint.headers,
+            )
+            data = response.json()
+            status = str(data.get("status") or "")
+            if status == _TURN_COMMITTED:
+                return self._committed_call_payload(data, idempotent_replay=idempotent_replay)
+            if status in _TURN_ERROR_STATES:
+                self._raise_turn_error(data, url)
+            # queued / inflight (or unknown transient) -> keep polling.
+
+    @staticmethod
+    def _committed_call_payload(
+        data: dict[str, Any],
+        *,
+        idempotent_replay: bool,
+    ) -> dict[str, Any]:
+        """Assemble a payload matching the legacy synchronous ``/messages`` body."""
+        return {
+            "request_id": data.get("request_id", ""),
+            "session_id": data.get("session_id"),
+            "instance_id": data.get("instance_id"),
+            "turn_id": data.get("turn_id"),
+            "state": data.get("state"),
+            "idempotent_replay": idempotent_replay,
+            "outputs": data.get("outputs") or [],
+            "backend": data.get("backend"),
+            "usage": data.get("usage"),
+        }
+
+    @staticmethod
+    def _raise_turn_error(data: dict[str, Any], url: str) -> None:
+        """Reconstruct the equivalent HTTP error for a terminal-failed turn."""
+        error = data.get("error")
+        if not isinstance(error, dict):
+            error = {}
+        http_status = int(error.get("http_status") or 502)
+        body = {
+            "error": error.get("error", "backend_error"),
+            "message": error.get("message", "blackbox turn failed"),
+            "details": error.get("details") if isinstance(error.get("details"), dict) else {},
+        }
+        request = httpx.Request("GET", url)
+        response = httpx.Response(http_status, json=body, request=request)
+        raise httpx.HTTPStatusError(
+            f"blackbox turn {body['error']} (HTTP {http_status})",
+            request=request,
+            response=response,
+        )
 
     async def execute_cmd(
         self,
@@ -143,15 +281,8 @@ class BlackboxServerClient:
         if self._owns_client:
             await self._client.aclose()
 
-    async def _post_agent_with_retry(
-        self,
-        endpoint: SandboxEndpoint,
-        path: str,
-        *,
-        json: dict[str, Any],
-        operation: str,
-        trajectory_id: str,
-    ) -> httpx.Response:
+    @staticmethod
+    def _retry_config() -> tuple[int, float, float, float]:
         max_attempts = _env_int(
             "DRESSAGE_BLACKBOX_AGENT_REQUEST_MAX_ATTEMPTS",
             _env_int(
@@ -188,6 +319,18 @@ class BlackboxServerClient:
             ),
             min_value=0.0,
         )
+        return max_attempts, initial_delay, max_delay, jitter_fraction
+
+    async def _post_agent_with_retry(
+        self,
+        endpoint: SandboxEndpoint,
+        path: str,
+        *,
+        json: dict[str, Any],
+        operation: str,
+        trajectory_id: str,
+    ) -> httpx.Response:
+        max_attempts, initial_delay, max_delay, jitter_fraction = self._retry_config()
         return await post_json_with_retry(
             self._client,
             f"{endpoint.url.rstrip('/')}{path}",
@@ -201,4 +344,29 @@ class BlackboxServerClient:
             log_prefix="blackbox server",
             logger=logger,
             headers=endpoint.headers,
+        )
+
+    async def _get_turn_with_retry(
+        self,
+        url: str,
+        *,
+        params: dict[str, Any],
+        operation: str,
+        trajectory_id: str,
+        headers: dict[str, str] | None = None,
+    ) -> httpx.Response:
+        max_attempts, initial_delay, max_delay, jitter_fraction = self._retry_config()
+        return await get_json_with_retry(
+            self._client,
+            url,
+            params=params,
+            operation=operation,
+            trajectory_id=trajectory_id,
+            max_attempts=max_attempts,
+            initial_delay=initial_delay,
+            max_delay=max_delay,
+            jitter_fraction=jitter_fraction,
+            log_prefix="blackbox server",
+            logger=logger,
+            headers=headers,
         )
