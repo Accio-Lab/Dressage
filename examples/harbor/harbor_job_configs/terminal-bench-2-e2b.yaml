@@ -1,0 +1,22 @@
+job_name: terminal-bench-2-e2b
+jobs_dir: /root/dressage-harbor/jobs/terminal-bench-2
+
+n_attempts: 1
+n_concurrent_trials: 4
+
+retry:
+  max_retries: 1
+
+environment:
+  type: e2b
+  delete: true
+
+agents:
+- name: claude-code
+  model_name: Qwen/Qwen3.5-4B
+  n_concurrent: 4
+
+datasets:
+- name: terminal-bench/terminal-bench-2
+  ref: latest
+  n_tasks: 5

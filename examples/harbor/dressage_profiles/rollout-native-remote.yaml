@@ -1,0 +1,52 @@
+schema_version: dressage.harbor/v1
+execution_mode: rollout
+
+environment:
+  mode: native
+
+gateway:
+  listen_host: 0.0.0.0
+  listen_port: 39100
+  advertise_url: https://replace-me.invalid
+  log_level: warning
+  limits:
+    max_active_routes: 4
+    max_inflight_global: 8
+    max_inflight_per_route: 4
+    queue_timeout_sec: 30.0
+    drain_timeout_sec: 60.0
+    request_body_max_bytes: 16777216
+    request_header_max_bytes: 65536
+    sse_idle_timeout_sec: 300.0
+    route_ttl_sec: 7200.0
+    tombstone_ttl_sec: 300.0
+    max_tombstones: 64
+
+backend:
+  dressage_proxy_url: http://127.0.0.1:8800
+  router_api_path: /v1
+  sticky_header_name: X-SMG-Routing-Key
+  service_api_key_env: DRESSAGE_PROXY_API_KEY
+  service_api_key_header: Authorization
+  service_api_key_scheme: Bearer
+  verify_tls: true
+
+security:
+  routing_guarantee: configure_only
+  allow_model_listing: false
+  require_tls_for_non_loopback: true
+  additional_agent_egress_hosts: []
+
+trajectory:
+  max_steps: 40
+  default_temperature: 1.0
+  require_trainable_tokens: true
+
+artifacts:
+  mode: both
+  root: /tmp/dressage-harbor/artifacts/rollout-native-remote
+  fsync: true
+  file_mode: 384
+  dir_mode: 448
+
+agent_protocol_overrides: {}

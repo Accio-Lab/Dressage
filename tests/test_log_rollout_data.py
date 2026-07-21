@@ -53,6 +53,31 @@ def test_rollout_hook_filters_no_loss_samples_from_trajectory_mean():
     assert extra_metrics["rollout/raw_reward_trajectory_mean"] == pytest.approx(1.0)
 
 
+def test_rollout_hook_selects_configured_reward_from_mapping():
+    samples = [
+        SimpleNamespace(
+            metadata={"parent_traj_id": "harbor-trial", "segment_index": 0},
+            reward={"reward": 0.75, "aux": 12.0},
+            response_length=1,
+            loss_mask=[1],
+            remove_sample=False,
+        )
+    ]
+    extra_metrics = {}
+
+    assert (
+        log_rollout_data(
+            0,
+            SimpleNamespace(reward_key="reward"),
+            samples,
+            extra_metrics,
+            0.0,
+        )
+        is False
+    )
+    assert extra_metrics["rollout/raw_reward_trajectory_mean"] == pytest.approx(0.75)
+
+
 def test_rollout_hook_defines_staleness_wandb_step_metric(monkeypatch):
     calls = []
 

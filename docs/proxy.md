@@ -36,7 +36,7 @@ The proxy runs as a standalone FastAPI service (CLI: `dressage-proxy`) and is de
 - **Weight Version Tracking** — Every generated token is stamped with the model weight version that produced it. When a trajectory spans multiple weight updates (partial rollout), `--record-token-versions` stores the per-token versions and `--mask-nonlast-version-tokens` marks tokens from older versions for selective loss masking.
 - **Routing Replay (R3)** — For Mixture-of-Experts (MoE) models, the proxy captures routed expert IDs per generated token via `--use-rollout-routing-replay`. This data is stored as base64-encoded chunks and forwarded to training for faithful MoE routing replay.
 - **Configurable Parsers** — Pluggable tool call and reasoning extraction backends (`local`, `sglang_api`, `hybrid`). Both parser backends default to `sglang_api`; `local` parses model output directly, and `hybrid` tries SGLang first with local fallback. Reasoning parsers extract `<think>` blocks for models like Qwen3.
-- **Version and Context Safety** — Non-partial trajectories are rejected if the model weight version or rollout epoch changes mid-trajectory (`trajectory_version_changed`). Proxy-side context checks return stable `context_overflow` payloads and can clamp `max_tokens` to the remaining context window.
+- **Version and Context Safety** — Non-partial trajectories are rejected if the model weight version or rollout epoch changes mid-trajectory (`trajectory_version_changed`). Proxy-side context checks return stable `context_overflow` payloads and clamp generation to the exact remaining context budget. `--max-output-tokens` is an optional additional per-request hard cap.
 
 ## 🧱 Core Modules
 
@@ -231,7 +231,6 @@ dressage-proxy \
   --sglang-router-url http://<sglang-router-host>:<port> \
   --token-build-model qwen3_5 \
   --context-window 32768 \
-  --no-dynamic-max-tokens \
   --rollout-temperature 1.0 \
   --record-token-versions \
   --mask-nonlast-version-tokens \
@@ -241,6 +240,21 @@ dressage-proxy \
   --model-tool-call-type qwen3_5 \
   --model-reasoning-type qwen3
 ```
+
+Output limits are resolved independently for each request:
+
+- An Agent-provided `max_tokens` limits that model call.
+- `--max-output-tokens`, when explicitly configured, is a Proxy-wide hard cap.
+- With dynamic context limiting enabled, `context_window - prompt_tokens` is
+  the physical budget. The Proxy uses the full remainder, including a final
+  single token, and combines it with any request or Proxy cap using `min(...)`.
+- If neither request nor CLI supplies a limit, the remaining context is used.
+  If `--context-window` is also absent, the Proxy omits `max_new_tokens` and the
+  backend chooses its default ([SGLang 0.5.12 SamplingParams](https://github.com/sgl-project/sglang/blob/v0.5.12.post1/python/sglang/srt/sampling/sampling_params.py)
+  defaults to 128).
+
+`--no-dynamic-max-tokens` disables only the context-derived clamp. It does not
+change the request or optional CLI cap.
 
 ### Using the Proxy Client
 

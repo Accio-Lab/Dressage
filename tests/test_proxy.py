@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -11,6 +12,7 @@ from typing import Any
 from fastapi.testclient import TestClient
 import httpx
 from jinja2 import Environment, StrictUndefined
+import pytest
 
 from dressage.proxy import StepRecord, TrajectoryItem, TrajectorySegment, TurnRecord
 from dressage.proxy.last_step import (
@@ -187,12 +189,14 @@ class FakeSGLangClient:
         list_workers_error: Exception | None = None,
         parse_function_call_responses: list[dict | Exception | None] | None = None,
         separate_reasoning_responses: list[dict | Exception | None] | None = None,
+        weight_versions: dict[str, str] | None = None,
     ):
         self._responses = list(responses)
         self._workers = list(workers or [])
         self._list_workers_error = list_workers_error
         self._parse_function_call_responses = list(parse_function_call_responses or [])
         self._separate_reasoning_responses = list(separate_reasoning_responses or [])
+        self._weight_versions = weight_versions
         self._simulate_worker_discovery = workers is not None or list_workers_error is not None
         self.last_routing_key = None
         self.last_parse_routing_key = None
@@ -201,6 +205,13 @@ class FakeSGLangClient:
         self.list_workers_calls = []
         self.parse_function_call_calls = []
         self.separate_reasoning_calls = []
+        self.get_weight_versions_calls = 0
+
+    async def get_weight_versions(self):
+        self.get_weight_versions_calls += 1
+        if self._weight_versions is None:
+            raise RuntimeError("weight-version snapshot unavailable in fake client")
+        return dict(self._weight_versions)
 
     async def generate(
         self,
@@ -780,6 +791,7 @@ def make_client(
     record_token_versions: bool = False,
     mask_nonlast_version_tokens: bool = False,
     rollout_temperature: float = 1.0,
+    max_output_tokens: int | None = None,
     context_window: int | None = None,
     dynamic_max_tokens: bool = True,
     use_rollout_routing_replay: bool = False,
@@ -807,6 +819,7 @@ def make_client(
         record_token_versions=record_token_versions,
         mask_nonlast_version_tokens=mask_nonlast_version_tokens,
         rollout_temperature=rollout_temperature,
+        max_output_tokens=max_output_tokens,
         context_window=context_window,
         dynamic_max_tokens=dynamic_max_tokens,
         use_rollout_routing_replay=use_rollout_routing_replay,
@@ -855,15 +868,129 @@ def test_proxy_defaults_sglang_router_url_from_env(monkeypatch):
 
     assert result.status_code == 200
     assert result.json()["config"]["sglang_router_url"] == "http://router.env"
+    assert result.json()["config"]["max_output_tokens"] is None
 
 
-def test_proxy_health_reports_rollout_temperature():
-    client, _, _, _ = make_client(make_response("hello"), rollout_temperature=0.7)
+def test_proxy_health_reports_sampling_limits():
+    client, _, _, _ = make_client(
+        make_response("hello"),
+        rollout_temperature=0.7,
+        max_output_tokens=2048,
+    )
 
     result = client.get("/health")
 
     assert result.status_code == 200
-    assert result.json()["config"]["rollout_temperature"] == 0.7
+    config = result.json()["config"]
+    assert config["rollout_temperature"] == 0.7
+    assert config["max_output_tokens"] == 2048
+
+
+def test_integration_capabilities_require_auth_and_report_version():
+    tokenizer = FakeTokenizer()
+    tokenizer.chat_template = "{{ messages }}"
+    app = create_app(
+        sglang_router_url="http://router.test",
+        tokenizer_path="/models/tokenizer",
+        tokenizer=tokenizer,
+        session_manager=SessionManager(),
+        trajectory_store=TrajectoryStore(min_group_size=1, group_timeout=0.0),
+        sglang_client=FakeSGLangClient(
+            [make_response("hello")],
+            weight_versions={"http://worker.test": "weights-v7"},
+        ),
+        api_key="proxy-secret",
+        token_build_mode="snapshot",
+        token_build_model="qwen3_5",
+        record_token_versions=True,
+        partial_rollout=False,
+    )
+    client = TestClient(app)
+
+    unauthorized = client.get("/integration/capabilities")
+    assert unauthorized.status_code == 401
+
+    headers = {"Authorization": "Bearer proxy-secret"}
+    resumed = client.post(
+        "/v1/rollout/resume",
+        headers=headers,
+        json={"version": "weights-v7"},
+    )
+    assert resumed.status_code == 200
+
+    result = client.get("/integration/capabilities", headers=headers)
+    assert result.status_code == 200
+    assert result.json() == {
+        "schema_version": "dressage.proxy.integration/v1",
+        "token_build_mode": "snapshot",
+        "token_build_model": "qwen3_5",
+        "tokenizer_id": "/models/tokenizer",
+        "chat_template_fingerprint": hashlib.sha256(
+            tokenizer.chat_template.encode("utf-8")
+        ).hexdigest(),
+        "record_token_versions": True,
+        "mask_nonlast_version_tokens": False,
+        "max_output_tokens": None,
+        "partial_rollout": False,
+        "max_partial_rollout_preempts": None,
+        "current_weight_version": "weights-v7",
+        "cached_weight_version": "weights-v7",
+        "weight_version_authoritative": True,
+        "weight_versions_consistent": True,
+        "weight_version_source": "worker_snapshot",
+        "weight_version_worker_count": 1,
+        "supports_expected_version": True,
+    }
+
+
+def test_integration_capabilities_rejects_inconsistent_worker_versions():
+    app = create_app(
+        tokenizer=FakeTokenizer(),
+        session_manager=SessionManager(),
+        trajectory_store=TrajectoryStore(min_group_size=1, group_timeout=0.0),
+        sglang_client=FakeSGLangClient(
+            [make_response("hello")],
+            weight_versions={"worker-a": "v7", "worker-b": "v8"},
+        ),
+        api_key="no-auth",
+    )
+
+    payload = TestClient(app).get("/integration/capabilities").json()
+
+    assert payload["weight_version_authoritative"] is True
+    assert payload["weight_versions_consistent"] is False
+    assert payload["current_weight_version"] is None
+    assert payload["weight_version_worker_count"] == 2
+
+
+@pytest.mark.parametrize(
+    ("observed_version", "error_code"),
+    [
+        (None, "weight_version_unavailable"),
+        ("v8", "weight_version_mismatch"),
+    ],
+)
+def test_version_pinned_generation_requires_matching_observed_version(
+    observed_version, error_code
+):
+    response = make_response("hello")
+    if observed_version is not None:
+        response.meta_info = {"weight_version": observed_version}
+    client, _, trajectory_store, _ = make_client(response)
+
+    result = client.post(
+        "/v1/chat/completions",
+        headers={
+            "X-Session-Id": f"sess-{error_code}",
+            "X-Instance-Id": "instance-a",
+            "X-Dressage-Expected-Version": "v7",
+        },
+        json={"model": "fake-model", "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert result.status_code == 502
+    assert result.json()["detail"]["error"] == error_code
+    assert trajectory_store.stats()["total_items"] == 0
 
 
 def test_proxy_health_reports_rollout_routing_replay():
@@ -1049,6 +1176,104 @@ def test_trajectory_store_write_dict_requires_full_segment_fields():
         raise AssertionError("Expected legacy trajectory segment payload to fail")
 
 
+def test_trajectory_store_write_many_validates_before_publishing_any_record():
+    trajectory_store = TrajectoryStore(min_group_size=1, group_timeout=0.0)
+    valid = {
+        "trajectory_id": "atomic-sess",
+        "turn_id": "1",
+        "instance_id": "atomic-inst",
+        "messages": [{"role": "assistant", "content": "done"}],
+        "tools": None,
+        "tokens": [1, 2],
+        "full_logprobs": [0.0, -0.1],
+        "full_loss_mask": [0, 1],
+        "aligned_response_length": 1,
+    }
+    invalid = {**valid, "turn_id": "2"}
+    invalid.pop("full_logprobs")
+
+    with pytest.raises(ValueError, match="full_logprobs"):
+        trajectory_store.write_many([valid, invalid])
+
+    assert trajectory_store.stats()["total_items"] == 0
+    assert trajectory_store.read_trajectory("atomic-sess") == []
+
+    partial = {
+        **valid,
+        "segment_index": 0,
+        "segment_count": 2,
+        "extra_info": {
+            "segment_view": "timeline",
+            "finalization_complete": True,
+            "finalization_id": "final-atomic",
+        },
+    }
+    with pytest.raises(ValueError, match="complete 0..N-1"):
+        trajectory_store.write_many([partial])
+    assert trajectory_store.stats()["total_items"] == 0
+
+
+def test_finalize_is_idempotent_and_marks_complete_segment_set():
+    client, _, trajectory_store, _ = make_client(make_response("done"))
+    generated = client.post(
+        "/v1/chat/completions",
+        headers={"X-Session-Id": "final-once", "X-Instance-Id": "instance-once"},
+        json={"model": "fake-model", "messages": [{"role": "user", "content": "go"}]},
+    )
+    assert generated.status_code == 200
+
+    payload = {"session_id": "final-once", "instance_id": "instance-once"}
+    first = client.post("/session/finalize", json=payload)
+    second = client.post("/session/finalize", json=payload)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json() == first.json()
+    assert trajectory_store.stats()["total_items"] == 1
+    segment = trajectory_store.read_trajectory("final-once")[0]
+    assert segment["segment_index"] == 0
+    assert segment["segment_count"] == 1
+    assert segment["extra_info"]["finalization_complete"] is True
+    assert (
+        segment["extra_info"]["finalization_id"]
+        == first.json()["finalization_id"]
+    )
+
+
+def test_finalize_write_failure_preserves_active_session_and_empty_store():
+    class FailingTrajectoryStore(TrajectoryStore):
+        def write_many(self, records):
+            raise RuntimeError("injected atomic write failure")
+
+    session_manager = SessionManager()
+    trajectory_store = FailingTrajectoryStore(min_group_size=1, group_timeout=0.0)
+    app = create_app(
+        sglang_router_url="http://router.test",
+        tokenizer=FakeTokenizer(),
+        session_manager=session_manager,
+        trajectory_store=trajectory_store,
+        sglang_client=FakeSGLangClient([make_response("done")]),
+        token_build_mode="snapshot",
+    )
+    client = TestClient(app, raise_server_exceptions=False)
+    generated = client.post(
+        "/v1/chat/completions",
+        headers={"X-Session-Id": "final-fail", "X-Instance-Id": "instance-fail"},
+        json={"model": "fake-model", "messages": [{"role": "user", "content": "go"}]},
+    )
+    assert generated.status_code == 200
+
+    finalized = client.post(
+        "/session/finalize",
+        json={"session_id": "final-fail", "instance_id": "instance-fail"},
+    )
+
+    assert finalized.status_code == 500
+    assert session_manager.get_session("final-fail") is not None
+    assert session_manager.get_finalization_result("final-fail") is None
+    assert trajectory_store.stats()["total_items"] == 0
+
+
 def test_local_reasoning_backend_rejects_unsupported_model_at_startup():
     try:
         create_app(
@@ -1084,6 +1309,7 @@ def test_parse_args_defaults_to_sglang_api_parser_backends(monkeypatch):
     assert args.reasoning_parse_backend == "sglang_api"
     assert args.model_reasoning_type is None
     assert args.context_window is None
+    assert args.max_output_tokens is None
     assert args.dynamic_max_tokens is True
 
 
@@ -1107,6 +1333,31 @@ def test_parse_args_rejects_non_positive_context_window(monkeypatch):
         assert exc.code == 2
     else:
         raise AssertionError("Expected --context-window=0 to fail")
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_parse_args_rejects_non_positive_max_output_tokens(monkeypatch, value):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "dressage.proxy.server",
+            "--tokenizer-path",
+            "fake-tokenizer",
+            "--max-output-tokens",
+            value,
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        parse_args()
+
+    assert exc_info.value.code == 2
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_create_app_rejects_non_positive_max_output_tokens(value):
+    with pytest.raises(ValueError, match="max_output_tokens must be greater than 0"):
+        create_app(max_output_tokens=value)
 
 
 def test_parse_args_can_disable_dynamic_max_tokens(monkeypatch):
@@ -1204,7 +1455,7 @@ def test_chat_completion_clamps_max_tokens_to_remaining_context():
     client, _, _, _ = make_client(
         tokenizer=tokenizer,
         sglang_client=sglang_client,
-        context_window=len(prompt_ids) + 1,
+        context_window=len(prompt_ids) + 2,
     )
 
     response = client.post(
@@ -1241,7 +1492,170 @@ def test_chat_completion_preserves_smaller_requested_max_tokens():
     assert sglang_client.calls[0]["sampling_params"]["max_new_tokens"] == 2
 
 
-def test_chat_completion_can_disable_dynamic_max_tokens():
+def test_chat_completion_uses_requested_max_tokens_without_proxy_cap():
+    sglang_client = FakeSGLangClient([make_response("a")])
+    client, _, _, _ = make_client(sglang_client=sglang_client)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "fake-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 512,
+        },
+    )
+
+    assert response.status_code == 200
+    assert sglang_client.calls[0]["sampling_params"]["max_new_tokens"] == 512
+
+
+def test_chat_completion_caps_explicit_max_tokens():
+    tokenizer = FakeTokenizer()
+    empty_messages = [{"role": "user", "content": ""}]
+    empty_prompt_ids = tokenizer.apply_chat_template(
+        empty_messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+    )["input_ids"]
+    messages = [
+        {"role": "user", "content": "x" * (18534 - len(empty_prompt_ids))}
+    ]
+    prompt_ids = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+    )["input_ids"]
+    assert len(prompt_ids) == 18534
+    sglang_client = FakeSGLangClient([make_response("a")])
+    client, _, _, _ = make_client(
+        tokenizer=tokenizer,
+        sglang_client=sglang_client,
+        max_output_tokens=2048,
+        context_window=49152,
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "fake-model",
+            "messages": messages,
+            "max_tokens": 30618,
+        },
+    )
+
+    assert response.status_code == 200
+    assert sglang_client.calls[0]["sampling_params"]["max_new_tokens"] == 2048
+
+
+def test_chat_completion_preserves_request_below_output_cap():
+    sglang_client = FakeSGLangClient([make_response("a")])
+    client, _, _, _ = make_client(
+        sglang_client=sglang_client,
+        max_output_tokens=2048,
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "fake-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 512,
+        },
+    )
+
+    assert response.status_code == 200
+    assert sglang_client.calls[0]["sampling_params"]["max_new_tokens"] == 512
+
+
+def test_chat_completion_combines_output_cap_with_remaining_context():
+    tokenizer = FakeTokenizer()
+    messages = [{"role": "user", "content": "hi"}]
+    prompt_ids = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+    )["input_ids"]
+    sglang_client = FakeSGLangClient([make_response("a")])
+    client, _, _, _ = make_client(
+        tokenizer=tokenizer,
+        sglang_client=sglang_client,
+        context_window=len(prompt_ids) + 1025,
+        max_output_tokens=2048,
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "fake-model", "messages": messages, "max_tokens": 30618},
+    )
+
+    assert response.status_code == 200
+    assert sglang_client.calls[0]["sampling_params"]["max_new_tokens"] == 1024
+
+
+def test_chat_completion_uses_capped_default_when_max_tokens_is_missing():
+    sglang_client = FakeSGLangClient([make_response("a")])
+    client, _, _, _ = make_client(
+        sglang_client=sglang_client,
+        max_output_tokens=2048,
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "fake-model",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert sglang_client.calls[0]["sampling_params"]["max_new_tokens"] == 2048
+
+
+def test_chat_completion_omits_max_new_tokens_without_request_cli_or_context_limit():
+    sglang_client = FakeSGLangClient([make_response("a")])
+    client, _, _, _ = make_client(sglang_client=sglang_client)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "fake-model",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert "max_new_tokens" not in sglang_client.calls[0]["sampling_params"]
+
+
+def test_chat_completion_uses_full_remaining_context_without_request_or_cli_limit():
+    tokenizer = FakeTokenizer()
+    messages = [{"role": "user", "content": "hi"}]
+    prompt_ids = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+    )["input_ids"]
+    sglang_client = FakeSGLangClient([make_response("a")])
+    client, _, _, _ = make_client(
+        tokenizer=tokenizer,
+        sglang_client=sglang_client,
+        context_window=len(prompt_ids) + 7,
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "fake-model", "messages": messages},
+    )
+
+    assert response.status_code == 200
+    assert sglang_client.calls[0]["sampling_params"]["max_new_tokens"] == 6
+
+
+def test_chat_completion_rejects_when_only_reserved_context_token_remains():
     tokenizer = FakeTokenizer()
     messages = [{"role": "user", "content": "hi"}]
     prompt_ids = tokenizer.apply_chat_template(
@@ -1255,6 +1669,67 @@ def test_chat_completion_can_disable_dynamic_max_tokens():
         tokenizer=tokenizer,
         sglang_client=sglang_client,
         context_window=len(prompt_ids) + 1,
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "fake-model", "messages": messages},
+    )
+
+    assert response.status_code == 413
+    assert response.json()["error"] == "context_overflow"
+    assert sglang_client.calls == []
+
+
+def test_partial_rollout_uses_remaining_context_as_cumulative_output_limit():
+    tokenizer = FakeTokenizer()
+    messages = [{"role": "user", "content": "hi"}]
+    prompt_ids = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+    )["input_ids"]
+    sglang_client = FakeSGLangClient(
+        [
+            make_response("a", finish_reason="abort"),
+            make_response("b"),
+        ]
+    )
+    client, _, _, _ = make_client(
+        tokenizer=tokenizer,
+        sglang_client=sglang_client,
+        context_window=len(prompt_ids) + 3,
+        partial_rollout=True,
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "fake-model", "messages": messages},
+    )
+
+    assert response.status_code == 200
+    assert [
+        call["sampling_params"]["max_new_tokens"]
+        for call in sglang_client.calls
+    ] == [2, 1]
+
+
+def test_chat_completion_can_disable_dynamic_max_tokens():
+    tokenizer = FakeTokenizer()
+    messages = [{"role": "user", "content": "hi"}]
+    prompt_ids = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+    )["input_ids"]
+    sglang_client = FakeSGLangClient([make_response("a")])
+    client, _, _, _ = make_client(
+        tokenizer=tokenizer,
+        sglang_client=sglang_client,
+        context_window=len(prompt_ids) + 2,
+        max_output_tokens=2,
         dynamic_max_tokens=False,
     )
 
@@ -1264,7 +1739,33 @@ def test_chat_completion_can_disable_dynamic_max_tokens():
     )
 
     assert response.status_code == 200
-    assert sglang_client.calls[0]["sampling_params"]["max_new_tokens"] == 3
+    assert sglang_client.calls[0]["sampling_params"]["max_new_tokens"] == 2
+
+
+def test_chat_completion_can_disable_context_derived_max_tokens():
+    tokenizer = FakeTokenizer()
+    messages = [{"role": "user", "content": "hi"}]
+    prompt_ids = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+    )["input_ids"]
+    sglang_client = FakeSGLangClient([make_response("a")])
+    client, _, _, _ = make_client(
+        tokenizer=tokenizer,
+        sglang_client=sglang_client,
+        context_window=len(prompt_ids) + 2,
+        dynamic_max_tokens=False,
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "fake-model", "messages": messages},
+    )
+
+    assert response.status_code == 200
+    assert "max_new_tokens" not in sglang_client.calls[0]["sampling_params"]
 
 
 def test_chat_completion_context_window_input_output_overflow_records_input_only_step():
@@ -1280,7 +1781,7 @@ def test_chat_completion_context_window_input_output_overflow_records_input_only
     client, session_manager, _, _ = make_client(
         tokenizer=tokenizer,
         sglang_client=sglang_client,
-        context_window=len(prompt_ids) + 1,
+        context_window=len(prompt_ids) + 2,
     )
 
     response = client.post(
@@ -1352,7 +1853,7 @@ def test_concat_context_window_output_overflow_records_only_context_delta():
         ),
         token_build_mode="tito",
         tito_model="qwen3_5",
-        context_window=len(second_prompt_ids) + 1,
+        context_window=len(second_prompt_ids) + 2,
     )
 
     first = client.post(
@@ -1677,6 +2178,49 @@ def test_sglang_router_client_generate_sends_logprob_start_len():
     assert output_only.input_token_logprobs_raw == [0.0, 0.0]
     assert output_only.input_logprobs_invalid is False
     assert output_only.all_logprobs_invalid is False
+
+
+def test_sglang_router_client_get_weight_versions_probes_stable_topology():
+    worker_calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/workers":
+            return httpx.Response(
+                200,
+                json={
+                    "workers": [
+                        {
+                            "url": "http://worker-a.test:30000",
+                            "is_healthy": True,
+                            "connection_mode": "Http",
+                        },
+                        {
+                            "url": "http://worker-b.test:30001",
+                            "is_healthy": True,
+                            "connection_mode": "Http",
+                        },
+                    ]
+                },
+            )
+        if request.url.path == "/get_weight_version":
+            worker_calls.append(str(request.url))
+            return httpx.Response(200, json={"weight_version": "v7"})
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    async def run_test():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), trust_env=False
+        ) as client:
+            router = SGLangRouterClient("http://router.test", client=client)
+            return await router.get_weight_versions(timeout_seconds=1.0)
+
+    versions = asyncio.run(run_test())
+
+    assert versions == {
+        "http://worker-a.test:30000": "v7",
+        "http://worker-b.test:30001": "v7",
+    }
+    assert len(worker_calls) == 2
 
 
 def test_sglang_response_normalizes_prompt_logprobs_and_all_tokens():

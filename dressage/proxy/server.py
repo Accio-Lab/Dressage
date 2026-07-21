@@ -30,6 +30,8 @@ from .generation_controller import (
     GenerationController,
     GenerationPreempted,
     GenerationStaleEpoch,
+    GenerationVersionMismatch,
+    GenerationVersionUnavailable,
     ProxyShuttingDown,
 )
 from .last_step import (
@@ -332,14 +334,14 @@ def _boundary_reasons(
 
 def _build_sampling_params(
     body: dict[str, Any],
-    default_max_tokens: int,
+    max_output_tokens: int | None,
     rollout_temperature: float,
 ) -> dict[str, Any]:
     temperature = body.get("temperature")
     if temperature is None:
         temperature = rollout_temperature
-    return {
-        "max_new_tokens": body.get("max_tokens") or default_max_tokens,
+    requested_max_tokens = body.get("max_tokens")
+    sampling_params = {
         "temperature": temperature,
         "top_p": body.get("top_p", 1.0),
         "top_k": body.get("top_k", -1),
@@ -347,6 +349,16 @@ def _build_sampling_params(
         "no_stop_trim": True,
         "spaces_between_special_tokens": False,
     }
+    if requested_max_tokens is not None and max_output_tokens is not None:
+        sampling_params["max_new_tokens"] = min(
+            requested_max_tokens,
+            max_output_tokens,
+        )
+    elif requested_max_tokens is not None:
+        sampling_params["max_new_tokens"] = requested_max_tokens
+    elif max_output_tokens is not None:
+        sampling_params["max_new_tokens"] = max_output_tokens
+    return sampling_params
 
 
 def _context_overflow_payload(
@@ -537,7 +549,7 @@ def create_app(
     model_reasoning_type: str | None = None,
     reasoning_parse_backend: Literal["local", "sglang_api", "hybrid"] = "sglang_api",
     model_mask_type: str | None = None,
-    default_max_tokens: int = 4096,
+    max_output_tokens: int | None = None,
     api_key: str = "no-auth",
     token_build_mode: TokenBuildMode = "tito",
     token_build_model: str = DEFAULT_TOKEN_BUILD_MODEL,
@@ -555,6 +567,8 @@ def create_app(
 
     if context_window is not None and context_window <= 0:
         raise ValueError("context_window must be greater than 0 when provided")
+    if max_output_tokens is not None and max_output_tokens <= 0:
+        raise ValueError("max_output_tokens must be greater than 0")
     if max_partial_rollout_preempts is not None and max_partial_rollout_preempts < 0:
         raise ValueError("max_partial_rollout_preempts must be greater than or equal to 0")
     if token_build_mode not in {"snapshot", "tito"}:
@@ -779,6 +793,13 @@ def create_app(
             await sglang_client.close()
 
     app = FastAPI(title="Dressage Proxy", lifespan=lifespan)
+
+    chat_template = getattr(tokenizer, "chat_template", None)
+    chat_template_fingerprint = (
+        hashlib.sha256(chat_template.encode("utf-8")).hexdigest()
+        if isinstance(chat_template, str) and chat_template
+        else None
+    )
 
     def _check_auth(request: Request) -> None:
         if api_key == "no-auth":
@@ -1554,10 +1575,11 @@ def create_app(
             prompt_tokens = len(input_ids)
             sampling_params = _build_sampling_params(
                 body,
-                default_max_tokens,
+                max_output_tokens,
                 rollout_temperature,
             )
-            max_tokens = int(sampling_params.get("max_new_tokens") or 0)
+            configured_max_tokens = sampling_params.get("max_new_tokens")
+            max_tokens = int(configured_max_tokens or 0)
 
             if context_window is not None and prompt_tokens >= context_window:
                 return JSONResponse(
@@ -1575,9 +1597,25 @@ def create_app(
                 )
 
             if dynamic_max_tokens and context_window is not None:
-                sampling_params["max_new_tokens"] = min(
-                    max_tokens,
-                    context_window - prompt_tokens,
+                remaining_context = context_window - prompt_tokens - 1
+                if remaining_context < 1:
+                    return JSONResponse(
+                        _context_overflow_payload(
+                            phase="input_output",
+                            context_window=context_window,
+                            input_tokens=prompt_tokens,
+                            output_tokens=0,
+                            max_tokens=max_tokens,
+                            session_id=session_id,
+                            turn_id=effective_turn_id,
+                            last_proxy_step_recorded=False,
+                        ),
+                        status_code=413,
+                    )
+                sampling_params["max_new_tokens"] = (
+                    remaining_context
+                    if configured_max_tokens is None
+                    else min(int(configured_max_tokens), remaining_context)
                 )
                 max_tokens = int(sampling_params["max_new_tokens"])
 
@@ -1617,6 +1655,27 @@ def create_app(
                     logprob_start_len=request_logprob_start_len,
                     context_window=context_window,
                 )
+            except GenerationVersionMismatch as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "error": "weight_version_mismatch",
+                        "expected": exc.expected,
+                        "observed": exc.observed,
+                        "session_id": session_id,
+                        "instance_id": instance_id,
+                    },
+                ) from exc
+            except GenerationVersionUnavailable as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "error": "weight_version_unavailable",
+                        "message": str(exc),
+                        "session_id": session_id,
+                        "instance_id": instance_id,
+                    },
+                ) from exc
             except GenerationStaleEpoch as exc:
                 logger.warning(
                     "reject non-partial rollout: error=trajectory_version_changed "
@@ -1677,14 +1736,11 @@ def create_app(
             response_version = (
                 response_versions[-1]
                 if response_versions
-                else router_response.weight_version
-                or expected_version
-                or generation_controller.current_version
-                or "unknown"
+                else router_response.weight_version or "unknown"
             )
             if len(response_versions) != len(response_token_ids):
                 response_versions = [str(response_version)] * len(response_token_ids)
-            request_version = expected_version or generation_controller.current_version or response_version
+            request_version = response_version
             _raise_if_cross_version_trajectory(
                 session=session,
                 candidate_versions=[*response_versions, response_version, request_version],
@@ -1911,24 +1967,38 @@ def create_app(
                 detail="token_build_mode is configured at proxy startup",
             )
 
+        cached_result = session_manager.get_finalization_result(session_id)
+        if cached_result is not None:
+            return cached_result
+
         session = session_manager.get_session(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
 
         async with session.request_lock:
-            session = session_manager.finalize_session(session_id)
-            if session is None:
-                raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+            # A concurrent duplicate may have waited on this same lock.  The
+            # cached response makes finalize idempotent without writing the
+            # trajectory a second time.
+            cached_result = session_manager.get_finalization_result(session_id)
+            if cached_result is not None:
+                return cached_result
+            if session_manager.get_session(session_id) is not session:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Session {session_id} not found",
+                )
             if not session.steps:
                 raise HTTPException(status_code=400, detail="Session has no turns")
 
             effective_instance_id = instance_id or session.instance_id
             trajectory_id = session.session_id
+            finalization_id = uuid.uuid4().hex
+            records: list[dict[str, Any]] = []
             if token_build_mode == "tito":
                 lineage_segments = _split_session_into_lineage_segments(session)
                 timeline_segments = _split_session_into_timeline_segments(session)
                 for segment_index, segment in enumerate(lineage_segments):
-                    trajectory_store.write_dict(
+                    records.append(
                         _build_tito_lineage_segment_record(
                             session=session,
                             trajectory_id=trajectory_id,
@@ -1940,7 +2010,7 @@ def create_app(
                         )
                     )
                 for segment_index, segment in enumerate(timeline_segments):
-                    trajectory_store.write_dict(
+                    records.append(
                         _build_step_snapshot_record(
                             session=session,
                             trajectory_id=trajectory_id,
@@ -1957,7 +2027,7 @@ def create_app(
             else:
                 timeline_segments = _split_session_into_timeline_segments(session)
                 for segment_index, segment in enumerate(timeline_segments):
-                    trajectory_store.write_dict(
+                    records.append(
                         _build_step_snapshot_record(
                             session=session,
                             trajectory_id=trajectory_id,
@@ -1972,21 +2042,45 @@ def create_app(
                 segment_count = len(timeline_segments)
                 timeline_segment_count = len(timeline_segments)
 
-        return {
-            "success": True,
-            "session_id": session_id,
-            "trajectory_id": trajectory_id,
-            "instance_id": effective_instance_id,
-            "num_steps": len(session.steps),
-            "num_turns": len(session.turn_ids),
-            "num_segments": segment_count,
-            "num_timeline_segments": timeline_segment_count,
-            "history_rewritten": session.history_rewritten,
-            "token_build_mode": token_build_mode,
-            "token_build_model": token_build_model,
-            "record_token_versions": record_token_versions,
-            "mask_nonlast_version_tokens": mask_nonlast_version_tokens,
-        }
+            for record in records:
+                extra_info = dict(record.get("extra_info") or {})
+                extra_info.update(
+                    {
+                        "finalization_complete": True,
+                        "finalization_id": finalization_id,
+                    }
+                )
+                record["extra_info"] = extra_info
+
+            finalization_result = {
+                "success": True,
+                "session_id": session_id,
+                "trajectory_id": trajectory_id,
+                "instance_id": effective_instance_id,
+                "finalization_id": finalization_id,
+                "num_steps": len(session.steps),
+                "num_turns": len(session.turn_ids),
+                "num_segments": segment_count,
+                "num_timeline_segments": timeline_segment_count,
+                "history_rewritten": session.history_rewritten,
+                "token_build_mode": token_build_mode,
+                "token_build_model": token_build_model,
+                "record_token_versions": record_token_versions,
+                "mask_nonlast_version_tokens": mask_nonlast_version_tokens,
+            }
+
+            # Record conversion validates every item before write_many enters
+            # its one-lock commit.  The active Session is removed only after
+            # the complete trajectory batch has been published.
+            trajectory_store.write_many(records)
+            finalized = session_manager.finalize_session(
+                session_id,
+                result=finalization_result,
+            )
+            if finalized is not session:  # defensive; request_lock owns finalize
+                raise RuntimeError("session changed during atomic finalization")
+
+        return finalization_result
 
     @app.post("/trajectory/read")
     async def trajectory_read(request: Request):
@@ -2067,6 +2161,66 @@ def create_app(
         _check_auth(request)
         return generation_controller.state()
 
+    @app.get("/integration/capabilities")
+    async def integration_capabilities(request: Request) -> dict[str, Any]:
+        _check_auth(request)
+        cached_weight_version = generation_controller.current_version
+        current_weight_version = cached_weight_version
+        weight_version_authoritative = False
+        weight_versions_consistent = False
+        weight_version_source = "generation_observation"
+        weight_version_worker_count = 0
+        probe = getattr(sglang_client, "get_weight_versions", None)
+        if callable(probe):
+            try:
+                worker_versions = await probe()
+            except Exception:
+                logger.warning(
+                    "could not obtain an authoritative SGLang weight-version snapshot",
+                    exc_info=True,
+                )
+                weight_version_source = "unavailable"
+            else:
+                weight_version_authoritative = True
+                weight_version_source = "worker_snapshot"
+                weight_version_worker_count = len(worker_versions)
+                unique_versions = {str(value) for value in worker_versions.values()}
+                weight_versions_consistent = (
+                    bool(worker_versions) and len(unique_versions) == 1
+                )
+                current_weight_version = (
+                    next(iter(unique_versions))
+                    if weight_versions_consistent
+                    else None
+                )
+                if current_weight_version is not None:
+                    synchronized = await generation_controller.synchronize_version(
+                        current_weight_version
+                    )
+                    if synchronized.get("status") != "synchronized":
+                        current_weight_version = None
+                        weight_version_authoritative = False
+                        weight_version_source = "controller_busy"
+        return {
+            "schema_version": "dressage.proxy.integration/v1",
+            "token_build_mode": token_build_mode,
+            "token_build_model": token_build_model,
+            "tokenizer_id": tokenizer_path or token_build_model,
+            "chat_template_fingerprint": chat_template_fingerprint,
+            "record_token_versions": record_token_versions,
+            "mask_nonlast_version_tokens": mask_nonlast_version_tokens,
+            "max_output_tokens": max_output_tokens,
+            "partial_rollout": partial_rollout,
+            "max_partial_rollout_preempts": max_partial_rollout_preempts,
+            "current_weight_version": current_weight_version,
+            "cached_weight_version": cached_weight_version,
+            "weight_version_authoritative": weight_version_authoritative,
+            "weight_versions_consistent": weight_versions_consistent,
+            "weight_version_source": weight_version_source,
+            "weight_version_worker_count": weight_version_worker_count,
+            "supports_expected_version": True,
+        }
+
     @app.get("/health")
     async def health():
         return {
@@ -2080,6 +2234,7 @@ def create_app(
                 "token_build_model": token_build_model,
                 "record_token_versions": record_token_versions,
                 "mask_nonlast_version_tokens": mask_nonlast_version_tokens,
+                "max_output_tokens": max_output_tokens,
                 "rollout_temperature": rollout_temperature,
                 "context_window": context_window,
                 "dynamic_max_tokens": dynamic_max_tokens,
@@ -2102,7 +2257,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tokenizer-path", required=True, help="HF tokenizer path")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8800)
-    parser.add_argument("--default-max-tokens", type=int, default=4096)
+    parser.add_argument(
+        "--max-output-tokens",
+        type=_positive_int,
+        default=None,
+        help="Optional hard cap applied to max_tokens on every model request.",
+    )
     parser.add_argument(
         "--context-window",
         type=_positive_int,
@@ -2113,7 +2273,7 @@ def parse_args() -> argparse.Namespace:
         "--no-dynamic-max-tokens",
         action="store_false",
         dest="dynamic_max_tokens",
-        help="Disable clamping max_tokens to the remaining context window.",
+        help="Disable deriving or clamping max_new_tokens from remaining context.",
     )
     parser.add_argument(
         "--rollout-temperature",
@@ -2207,7 +2367,7 @@ def main() -> None:
         model_reasoning_type=args.model_reasoning_type,
         reasoning_parse_backend=args.reasoning_parse_backend,
         model_mask_type=args.model_mask_type,
-        default_max_tokens=args.default_max_tokens,
+        max_output_tokens=args.max_output_tokens,
         api_key=args.api_key,
         token_build_mode=args.token_build_mode,
         token_build_model=args.token_build_model,
