@@ -31,18 +31,7 @@ def resolve_launch_values(
 
     primary = next(iter(config.teachers.values()))
     first_dataset = config.datasets[0].path if config.datasets else ""
-    modes = sorted(
-        {
-            (
-                "blackbox"
-                if dataset.generate_function_path
-                == "dressage.rollout.generate.blackbox_dispatch.generate"
-                else "whitebox"
-            )
-            for dataset in config.datasets
-            if dataset.generate_function_path
-        }
-    )
+    modes = sorted({dataset.agent_mode for dataset in config.datasets})
     return (
         first_dataset,
         ",".join(modes),
@@ -66,8 +55,6 @@ def main() -> None:
     for value in resolve_launch_values(
         args.config, validate_paths=not args.skip_path_validation
     ):
-        if "\n" in value:
-            raise ValueError("MOPD launch paths and values must not contain newlines")
         print(value)
 
 

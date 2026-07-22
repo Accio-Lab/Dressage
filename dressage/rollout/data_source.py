@@ -42,8 +42,6 @@ except ImportError:
         remove_sample: bool = False
         metadata: dict = field(default_factory=dict)
         generate_function_path: str | None = None
-        train_metadata: dict | None = None
-        teacher_log_probs: list[float] | None = None
 
         class Status(Enum):
             PENDING = "pending"
@@ -239,11 +237,6 @@ class DressageDataSource(RolloutDataSourceWithBuffer):
                     generate_function_path=(
                         str(sample_generate_path).strip()
                         if sample_generate_path
-                        else None
-                    ),
-                    train_metadata=(
-                        {"teacher_id": str(meta["teacher_id"])}
-                        if meta.get("teacher_id") not in (None, "")
                         else None
                     ),
                 )

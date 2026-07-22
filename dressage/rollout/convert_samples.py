@@ -194,11 +194,10 @@ def convert_samples_to_train_data(args: Any, samples: list) -> dict:
             sample.multimodal_train_inputs for sample in samples
         ]
 
-    mopd_enabled = bool(
-        getattr(args, "mopd_teacher_config", None)
-        or os.environ.get("DRESSAGE_MOPD_TEACHER_CONFIG")
+    config_path = getattr(args, "mopd_teacher_config", None) or os.environ.get(
+        "DRESSAGE_MOPD_TEACHER_CONFIG"
     )
-    if mopd_enabled:
+    if config_path:
         if (
             not bool(getattr(args, "use_opd", False))
             or getattr(args, "opd_type", None) != "megatron"
@@ -209,21 +208,16 @@ def convert_samples_to_train_data(args: Any, samples: list) -> dict:
         from dressage.rollout.mopd import (
             collect_mopd_teacher_ids,
             load_mopd_config,
-            make_mopd_route_payload,
-            mopd_config_path,
         )
 
-        config_path = mopd_config_path(args)
-        assert config_path is not None
-        teacher_ids = collect_mopd_teacher_ids(samples, load_mopd_config(config_path))
-        route_payloads = [
-            make_mopd_route_payload(teacher_id) for teacher_id in teacher_ids
-        ]
+        teacher_ids = collect_mopd_teacher_ids(
+            samples, load_mopd_config(str(config_path))
+        )
 
         # Slime already DP-partitions and forwards this train-side field.  It
         # is deliberately not Sample.prompt: rollout generation and tokenization
         # are complete before this converter runs.
-        train_data["prompt"] = route_payloads
+        train_data["prompt"] = teacher_ids
     elif samples[0].teacher_log_probs is not None:
         train_data["teacher_log_probs"] = [
             sample.teacher_log_probs for sample in samples

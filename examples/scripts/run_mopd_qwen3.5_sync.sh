@@ -192,8 +192,8 @@ PROXY_ARGS=(
   --tokenizer-path "${TOKENIZER_PATH}"
   --host "${PROXY_HOST}"
   --port "${PROXY_PORT}"
-  --trajectory-build-mode "${TRAJECTORY_BUILD_MODE}"
-  --trajectory-build-model "${TRAJECTORY_BUILD_MODEL}"
+  --token-build-mode "${TOKEN_BUILD_MODE}"
+  --token-build-model "${TOKEN_BUILD_MODEL}"
   --rollout-temperature "${ROLLOUT_TEMPERATURE:-1.0}"
   --context-window "${CONTEXT_WINDOW}"
 )

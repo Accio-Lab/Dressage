@@ -21,11 +21,7 @@ from slime.backends.megatron_utils.actor import MegatronTrainRayActor
 from slime.backends.megatron_utils.data import get_data_iterator
 from slime.utils.timer import Timer
 
-from dressage.rollout.mopd import (
-    MOPDTeacher,
-    load_mopd_config,
-    pop_mopd_teacher_ids_from_rollout_data,
-)
+from dressage.rollout.mopd import MOPDTeacher, load_mopd_config
 
 _SCORER_FIELDS = (
     "tokens",
@@ -33,7 +29,6 @@ _SCORER_FIELDS = (
     "multimodal_train_inputs",
     "total_lengths",
     "response_lengths",
-    "max_seq_lens",
     "rollout_top_p_token_ids",
     "rollout_top_p_token_offsets",
 )
@@ -57,9 +52,6 @@ def build_teacher_subset(
         for position, routed_id in enumerate(teacher_ids)
         if routed_id == teacher_id
     ]
-    if not selected_indices:
-        raise ValueError(f"MOPD teacher {teacher_id!r} has no local samples")
-
     old_to_new = {old: new for new, old in enumerate(selected_indices)}
     compact_microbatches: list[list[int]] = []
     for microbatch in rollout_data["micro_batch_indices"]:
@@ -143,17 +135,14 @@ class MOPDMegatronTrainRayActor(MegatronTrainRayActor):
             self.args.ckpt_step = old_step
 
     def _score_routed_teachers(self, rollout_data: dict[str, Any]) -> None:
-        # Slime natively forwards the train-side ``prompt`` field through its
-        # DP splitter.  Dressage uses that otherwise-unused channel for a
-        # versioned route payload, then removes it before stock slime logging
-        # attempts to reduce every remaining rollout-data field numerically.
-        teacher_ids = pop_mopd_teacher_ids_from_rollout_data(rollout_data)
+        # Slime DP-partitions the train-side ``prompt`` field. Dressage uses
+        # that otherwise-unused channel for one teacher ID per sample, then
+        # removes it before stock logging attempts numeric reduction.
+        teacher_ids = rollout_data.pop("prompt")
+        if len(teacher_ids) != len(rollout_data["tokens"]):
+            raise ValueError("MOPD teacher route count does not match sample count")
         if self.args.use_routing_replay:
             raise ValueError("Dressage routed MOPD does not yet support routing replay")
-
-        unknown = sorted(set(teacher_ids) - set(self.mopd_teacher_tags))
-        if unknown:
-            raise ValueError(f"unknown MOPD teacher id(s): {unknown}")
 
         routed_values: list[Any | None] = [None] * len(teacher_ids)
         produced_values = False

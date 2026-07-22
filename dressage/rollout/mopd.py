@@ -11,8 +11,6 @@ from typing import Any
 
 _BLACKBOX_GENERATE_PATH = "dressage.rollout.generate.blackbox_dispatch.generate"
 _ROLLOUT_MODES = frozenset({"blackbox", "whitebox"})
-MOPD_ROUTE_PAYLOAD_KIND = "dressage.mopd.teacher_route.v2"
-_MOPD_ROUTE_PAYLOAD_MARKER = "__dressage_payload__"
 
 
 def _optional_string(value: Any) -> str | None:
@@ -22,28 +20,22 @@ def _optional_string(value: Any) -> str | None:
     return text or None
 
 
-def _rollout_function_path(raw: dict[str, Any], *, owner: str) -> str | None:
-    nested = raw.get("rollout") or {}
-    if not isinstance(nested, dict):
-        raise ValueError(f"MOPD {owner} rollout must be an object")
-    mode = _optional_string(nested.get("mode") or raw.get("agent_mode"))
-    if mode is not None:
-        mode = mode.lower()
-        if mode not in _ROLLOUT_MODES:
-            expected = "|".join(sorted(_ROLLOUT_MODES))
-            raise ValueError(
-                f"MOPD {owner} agent_mode must be {expected}, got {mode!r}"
-            )
-    function_path = _optional_string(
-        nested.get("generate_function_path") or raw.get("generate_function_path")
-    )
+def _rollout_config(raw: dict[str, Any], *, owner: str) -> tuple[str, str | None]:
+    mode = _optional_string(raw.get("agent_mode"))
+    if mode is None:
+        raise ValueError(f"MOPD {owner} requires agent_mode")
+    mode = mode.lower()
+    if mode not in _ROLLOUT_MODES:
+        expected = "|".join(sorted(_ROLLOUT_MODES))
+        raise ValueError(f"MOPD {owner} agent_mode must be {expected}, got {mode!r}")
+    function_path = _optional_string(raw.get("generate_function_path"))
     if function_path is None and mode == "blackbox":
         function_path = _BLACKBOX_GENERATE_PATH
     if function_path is None and mode == "whitebox":
         raise ValueError(
             f"MOPD {owner} uses whitebox rollout and requires generate_function_path"
         )
-    return function_path
+    return mode, function_path
 
 
 @dataclass(frozen=True)
@@ -60,6 +52,7 @@ class MOPDDataset:
     teacher_id: str
     weight: float
     metadata: dict[str, Any]
+    agent_mode: str
     generate_function_path: str | None
 
 
@@ -141,9 +134,7 @@ class MOPDConfig:
                 )
             names.add(name)
 
-            teacher_id = _optional_string(
-                value.get("teacher_id") or value.get("teacher")
-            )
+            teacher_id = _optional_string(value.get("teacher_id"))
             if teacher_id is None:
                 raise ValueError(f"MOPD dataset {name!r} requires teacher_id")
             if teacher_id not in teachers:
@@ -158,6 +149,9 @@ class MOPDConfig:
                 raise ValueError(f"MOPD dataset {name!r} metadata must be an object")
             routed_metadata = dict(metadata)
             routed_metadata["teacher_id"] = teacher_id
+            agent_mode, generate_function_path = _rollout_config(
+                value, owner=f"dataset {name!r}"
+            )
             datasets.append(
                 MOPDDataset(
                     name=name,
@@ -165,9 +159,8 @@ class MOPDConfig:
                     teacher_id=teacher_id,
                     weight=weight,
                     metadata=routed_metadata,
-                    generate_function_path=_rollout_function_path(
-                        value, owner=f"dataset {name!r}"
-                    ),
+                    agent_mode=agent_mode,
+                    generate_function_path=generate_function_path,
                 )
             )
         return tuple(datasets)
@@ -216,14 +209,9 @@ def load_mopd_config(path: str | os.PathLike[str]) -> MOPDConfig:
     return replace(config, teachers=teachers, datasets=datasets, base_model=base_model)
 
 
-def mopd_config_path(args: Any) -> str | None:
-    value = getattr(args, "mopd_teacher_config", None) or os.environ.get(
-        "DRESSAGE_MOPD_TEACHER_CONFIG"
-    )
-    return str(value) if value else None
-
-
-def route_mopd_teacher(metadata: dict[str, Any], config: MOPDConfig) -> MOPDTeacher:
+def route_mopd_teacher(metadata: Any, config: MOPDConfig) -> MOPDTeacher:
+    if not isinstance(metadata, dict):
+        raise ValueError("MOPD sample metadata requires teacher_id")
     teacher_id = _optional_string(metadata.get("teacher_id"))
     if teacher_id is None:
         raise ValueError("MOPD sample metadata requires teacher_id")
@@ -232,27 +220,12 @@ def route_mopd_teacher(metadata: dict[str, Any], config: MOPDConfig) -> MOPDTeac
     return config.teachers[teacher_id]
 
 
-def prepare_mopd_sample(sample: Any, config: MOPDConfig) -> MOPDTeacher:
-    metadata = getattr(sample, "metadata", None)
-    if not isinstance(metadata, dict):
-        metadata = {}
-        sample.metadata = metadata
-    teacher = route_mopd_teacher(metadata, config)
-    metadata["teacher_id"] = teacher.teacher_id
-    train_metadata = getattr(sample, "train_metadata", None)
-    sample.train_metadata = (
-        dict(train_metadata) if isinstance(train_metadata, dict) else {}
-    )
-    sample.train_metadata["teacher_id"] = teacher.teacher_id
-    return teacher
-
-
 def collect_mopd_teacher_ids(samples: list[Any], config: MOPDConfig) -> list[str]:
     """Validate routes and return one teacher id per flattened train sample."""
     parent_routes: dict[str, str] = {}
     teacher_ids: list[str] = []
     for position, sample in enumerate(samples):
-        teacher = prepare_mopd_sample(sample, config)
+        teacher = route_mopd_teacher(getattr(sample, "metadata", None), config)
         parent_id = str(
             sample.metadata.get("parent_traj_id")
             or getattr(sample, "session_id", None)
@@ -266,43 +239,3 @@ def collect_mopd_teacher_ids(samples: list[Any], config: MOPDConfig) -> list[str
             )
         teacher_ids.append(teacher.teacher_id)
     return teacher_ids
-
-
-def make_mopd_route_payload(teacher_id: str) -> dict[str, str]:
-    normalized = _optional_string(teacher_id)
-    if normalized is None:
-        raise ValueError("MOPD route payload requires a non-empty teacher id")
-    return {
-        _MOPD_ROUTE_PAYLOAD_MARKER: MOPD_ROUTE_PAYLOAD_KIND,
-        "teacher_id": normalized,
-    }
-
-
-def parse_mopd_route_payloads(payloads: Any, *, expected_count: int) -> list[str]:
-    if not isinstance(payloads, list) or len(payloads) != expected_count:
-        size = len(payloads) if isinstance(payloads, list) else type(payloads).__name__
-        raise ValueError(
-            f"MOPD route payload count mismatch: {size} != {expected_count}"
-        )
-    teacher_ids = []
-    for position, payload in enumerate(payloads):
-        if (
-            not isinstance(payload, dict)
-            or payload.get(_MOPD_ROUTE_PAYLOAD_MARKER) != MOPD_ROUTE_PAYLOAD_KIND
-        ):
-            raise ValueError(f"invalid MOPD route payload at position {position}")
-        teacher_id = _optional_string(payload.get("teacher_id"))
-        if teacher_id is None:
-            raise ValueError(
-                f"MOPD route payload at position {position} requires teacher_id"
-            )
-        teacher_ids.append(teacher_id)
-    return teacher_ids
-
-
-def pop_mopd_teacher_ids_from_rollout_data(rollout_data: dict[str, Any]) -> list[str]:
-    payloads = rollout_data.pop("prompt", None)
-    tokens = rollout_data.get("tokens")
-    if not isinstance(tokens, list):
-        raise ValueError("MOPD rollout data requires a per-sample tokens list")
-    return parse_mopd_route_payloads(payloads, expected_count=len(tokens))

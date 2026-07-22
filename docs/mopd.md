@@ -46,9 +46,9 @@ Start from
 - `runtime_env_keys`: task-specific environment variables copied to Ray.
 
 There is no domain router or default teacher. The data source writes direct
-`metadata["teacher_id"]`, `train_metadata["teacher_id"]`, and the native
-`Sample.generate_function_path`. Multi-segment siblings must retain the same
-teacher ID; conversion fails before training if they disagree.
+`metadata["teacher_id"]` and the native `Sample.generate_function_path`.
+Conversion validates the route and fails before training if multi-segment
+siblings disagree.
 
 ## Per-step execution
 
