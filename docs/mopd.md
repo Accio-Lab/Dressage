@@ -87,5 +87,20 @@ GLOBAL_BATCH_SIZE=128 \
 bash examples/scripts/run_mopd_qwen3.5_sync.sh
 ```
 
+Enable W&B without placing credentials in the trainer command line:
+
+```bash
+USE_WANDB=1 \
+WANDB_PROJECT=slime-dev \
+WANDB_GROUP=mopd-alfworld-hotpotqa \
+bash examples/scripts/run_mopd_qwen3.5_sync.sh
+```
+
+In addition to Slime's global training metrics, Dressage logs per-teacher
+trainable-trajectory reward and sampled-token reverse-KL curves under
+`rollout/mopd/raw_reward_trainable_trajectory_mean/<teacher_id>` and
+`rollout/mopd/opd_reverse_kl_train_aggregation_mean/<teacher_id>`.
+`SEED` and `ROLLOUT_SEED` are forwarded explicitly by the launcher.
+
 No teacher process is started separately. Checkpoint paths are validated by
 the launcher, and all teacher loading happens inside the student actor group.

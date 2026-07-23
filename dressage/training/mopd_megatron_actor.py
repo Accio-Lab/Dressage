@@ -15,10 +15,14 @@ configuration schema or hard-coding MOPD route names.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
+import torch
+from megatron.core import mpu
 from slime.backends.megatron_utils.actor import MegatronTrainRayActor
-from slime.backends.megatron_utils.data import get_data_iterator
+from slime.backends.megatron_utils.cp_utils import get_sum_of_sample_mean
+from slime.backends.megatron_utils.data import gather_log_data, get_data_iterator
 from slime.utils.timer import Timer
 
 from dressage.rollout.mopd import MOPDTeacher, load_mopd_config
@@ -32,6 +36,59 @@ _SCORER_FIELDS = (
     "rollout_top_p_token_ids",
     "rollout_top_p_token_offsets",
 )
+
+
+def _metric_component(value: str) -> str:
+    """Return a stable W&B-safe path component for a configured teacher ID."""
+    component = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip()).strip("_")
+    return component or "unnamed"
+
+
+def _train_aggregation_mean_contribution(
+    values: list[torch.Tensor],
+    selected_indices: list[int],
+    rollout_data: dict[str, Any],
+) -> tuple[float, float]:
+    """Return a distributed sum/count pair using the policy-loss aggregation."""
+    rollout_mask_sums = rollout_data.get("rollout_mask_sums")
+    if rollout_mask_sums is None:
+        raise ValueError("MOPD train-aggregation metrics require rollout_mask_sums")
+
+    selected_indices = [
+        index
+        for index in selected_indices
+        if rollout_data["loss_masks"][index].sum().item() > 0
+        and rollout_mask_sums[index].item() > 0
+    ]
+    if not selected_indices:
+        return 0.0, 0.0
+
+    selected_values = [values[index] for index in selected_indices]
+    total_lengths = [rollout_data["total_lengths"][index] for index in selected_indices]
+    response_lengths = [
+        rollout_data["response_lengths"][index] for index in selected_indices
+    ]
+    loss_masks = [rollout_data["loss_masks"][index] for index in selected_indices]
+    sample_denoms = rollout_mask_sums[selected_indices]
+    reducer = get_sum_of_sample_mean(
+        total_lengths,
+        response_lengths,
+        loss_masks,
+        sample_denoms=sample_denoms,
+    )
+    local_sum = reducer(torch.cat(selected_values, dim=0)).item()
+
+    # Full masks/denominators are replicated on CP ranks. Fractional ownership
+    # makes flattened sibling segments add to the effective loss count.
+    local_count = (
+        sum(
+            rollout_data["loss_masks"][index].sum().item()
+            / rollout_mask_sums[index].item()
+            for index in selected_indices
+        )
+        / mpu.get_context_parallel_world_size()
+    )
+    return local_sum, local_count
 
 
 def build_teacher_subset(
@@ -95,6 +152,12 @@ class MOPDMegatronTrainRayActor(MegatronTrainRayActor):
         if args.debug_rollout_only or role != "actor" or not with_opd_teacher:
             return start_rollout_id
 
+        # Slime invokes this hook after OPD advantages are available and before
+        # its normal rollout-data logging. Chain any caller-provided hook.
+        self._base_rollout_data_postprocess = self.rollout_data_postprocess
+        self.rollout_data_postprocess = self._postprocess_mopd_metrics
+        self._active_mopd_teacher_ids: list[str] | None = None
+
         config_path = getattr(args, "mopd_teacher_config", None)
         if not config_path:
             import os
@@ -109,13 +172,21 @@ class MOPDMegatronTrainRayActor(MegatronTrainRayActor):
         # is initialization, not rollout wait time, so fence it out here.
         Timer().end("train_wait")
         self.mopd_teacher_tags: dict[str, str] = {}
+        self.mopd_teacher_metric_components: dict[str, str] = {}
         try:
             if self.args.offload_train:
                 self.wake_up()
             for teacher_id, teacher in load_mopd_config(config_path).teachers.items():
+                component = _metric_component(teacher_id)
+                if component in self.mopd_teacher_metric_components.values():
+                    raise ValueError(
+                        "MOPD teacher IDs must have distinct metric-safe names; "
+                        f"{teacher_id!r} collides at {component!r}"
+                    )
                 tag = f"teacher:{teacher_id}"
                 self._load_mopd_teacher(tag, teacher)
                 self.mopd_teacher_tags[teacher_id] = tag
+                self.mopd_teacher_metric_components[teacher_id] = component
             self._switch_model("actor")
         finally:
             if self.args.offload_train:
@@ -184,6 +255,53 @@ class MOPDMegatronTrainRayActor(MegatronTrainRayActor):
                 )
             rollout_data["teacher_log_probs"] = routed_values
 
+        self._active_mopd_teacher_ids = teacher_ids
+
+    def _postprocess_mopd_metrics(
+        self,
+        args: Any,
+        rollout_id: int,
+        rollout_data: dict[str, Any],
+    ) -> None:
+        """Log sampled-token reverse KL split by routed teacher."""
+        teacher_ids = self._active_mopd_teacher_ids
+        if not teacher_ids:
+            if self._base_rollout_data_postprocess is not None:
+                self._base_rollout_data_postprocess(args, rollout_id, rollout_data)
+            return
+        if not (
+            mpu.get_tensor_model_parallel_rank() == 0 and mpu.is_pipeline_last_stage()
+        ):
+            if self._base_rollout_data_postprocess is not None:
+                self._base_rollout_data_postprocess(args, rollout_id, rollout_data)
+            return
+
+        reverse_kls = rollout_data.get("opd_reverse_kl")
+        if reverse_kls is None or len(reverse_kls) != len(teacher_ids):
+            raise ValueError(
+                "MOPD opd_reverse_kl must contain one tensor per routed sample"
+            )
+
+        log_dict: dict[str, float | tuple[float, float]] = {}
+        for teacher_id, component in self.mopd_teacher_metric_components.items():
+            selected_indices = [
+                index
+                for index, routed_teacher_id in enumerate(teacher_ids)
+                if routed_teacher_id == teacher_id
+            ]
+            log_dict[f"mopd/opd_reverse_kl_train_aggregation_mean/{component}"] = (
+                _train_aggregation_mean_contribution(
+                    reverse_kls,
+                    selected_indices,
+                    rollout_data,
+                )
+            )
+
+        # Slime maps rollout/* to rollout/step in W&B.
+        gather_log_data("rollout", args, rollout_id, log_dict)
+        if self._base_rollout_data_postprocess is not None:
+            self._base_rollout_data_postprocess(args, rollout_id, rollout_data)
+
     def train_actor(
         self, rollout_id: int, rollout_data: dict[str, Any], external_data=None
     ) -> None:
@@ -196,6 +314,9 @@ class MOPDMegatronTrainRayActor(MegatronTrainRayActor):
         finally:
             Timer().end("train")
             Timer().start("train_wait")
-        return super().train_actor(
-            rollout_id, rollout_data, external_data=external_data
-        )
+        try:
+            return super().train_actor(
+                rollout_id, rollout_data, external_data=external_data
+            )
+        finally:
+            self._active_mopd_teacher_ids = None

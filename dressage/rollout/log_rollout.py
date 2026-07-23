@@ -1,9 +1,9 @@
 """Dressage rollout-side logging hook.
 
-Registered via ``--custom-rollout-log-function-path``.  Adds
-``raw_reward_trajectory_mean`` to the extra metrics dict, then returns
-``False`` so slime's default ``_log_rollout_data`` continues with its
-standard metric collection (response_len stats, reward stats, etc.).
+Registered via ``--custom-rollout-log-function-path``. Adds the historical
+aggregate trajectory reward and, for MOPD samples, one trainable-trajectory
+reward curve per routed teacher. It then returns ``False`` so slime's default
+``_log_rollout_data`` continues with its standard metric collection.
 
 The trajectory-mean metric gives a clean "fraction of trajectories that
 got reward 1.0" (for binary rewards) without multi-segment trajectories
@@ -12,11 +12,18 @@ contributing N times more weight than single-segment ones.
 
 from __future__ import annotations
 
+import re
+from collections import defaultdict
 from typing import Any
 
 from dressage.training.log_helpers import compute_trajectory_mean_raw_reward
 
 _STALENESS_WANDB_METRICS_DEFINED = False
+
+
+def _metric_component(value: str) -> str:
+    component = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip()).strip("_")
+    return component or "unnamed"
 
 
 def _define_staleness_wandb_metrics(args: Any) -> None:
@@ -49,6 +56,18 @@ def _sample_has_trainable_loss(sample: Any) -> bool:
     return any(int(value) != 0 for value in loss_mask)
 
 
+def _trajectory_key(sample: Any, metadata: dict[str, Any], position: int) -> str:
+    """Return a stable reward-aggregation key for a routed trajectory."""
+    value = (
+        metadata.get("parent_traj_id")
+        or metadata.get("session_id")
+        or getattr(sample, "session_id", None)
+        or metadata.get("rollout_id")
+        or getattr(sample, "rollout_id", None)
+    )
+    return str(value) if value not in (None, "") else f"sample:{position}"
+
+
 def log_rollout_data(
     rollout_id: int,
     args: Any,
@@ -72,27 +91,58 @@ def log_rollout_data(
     segment_indices: list[int] = []
     raw_rewards: list[float] = []
 
+    routed_parent_ids: dict[str, list[str]] = defaultdict(list)
+    routed_segment_indices: dict[str, list[int]] = defaultdict(list)
+    routed_rewards: dict[str, list[float]] = defaultdict(list)
+
     has_multi_segment = False
-    for sample in samples:
+    for position, sample in enumerate(samples):
         meta = getattr(sample, "metadata", None) or {}
         ptid = meta.get("parent_traj_id")
-        if ptid is None:
-            continue
-        has_multi_segment = True
+        if ptid is not None:
+            has_multi_segment = True
+
         if not _sample_has_trainable_loss(sample):
             continue
-        parent_traj_ids.append(str(ptid))
-        segment_indices.append(int(meta.get("segment_index", 0)))
+        trajectory_key = (
+            str(ptid) if ptid is not None else _trajectory_key(sample, meta, position)
+        )
+        segment_index = int(meta.get("segment_index", 0))
         r = getattr(sample, "reward", None)
-        raw_rewards.append(float(r) if r is not None else 0.0)
+        reward = float(r) if r is not None else 0.0
+        if ptid is not None:
+            parent_traj_ids.append(trajectory_key)
+            segment_indices.append(segment_index)
+            raw_rewards.append(reward)
 
-    if not has_multi_segment:
-        return False
+        teacher_id_value = meta.get("teacher_id")
+        teacher_id = (
+            str(teacher_id_value).strip()
+            if teacher_id_value not in (None, "")
+            else None
+        )
+        if teacher_id is not None:
+            routed_parent_ids[teacher_id].append(trajectory_key)
+            routed_segment_indices[teacher_id].append(segment_index)
+            routed_rewards[teacher_id].append(reward)
 
-    traj_mean = compute_trajectory_mean_raw_reward(
-        parent_traj_ids, raw_rewards, segment_indices
-    )
-    if traj_mean is not None:
-        extra_metrics["rollout/raw_reward_trajectory_mean"] = traj_mean
+    if has_multi_segment:
+        traj_mean = compute_trajectory_mean_raw_reward(
+            parent_traj_ids, raw_rewards, segment_indices
+        )
+        if traj_mean is not None:
+            extra_metrics["rollout/raw_reward_trajectory_mean"] = traj_mean
+
+    for teacher_id, teacher_parent_ids in routed_parent_ids.items():
+        routed_mean = compute_trajectory_mean_raw_reward(
+            teacher_parent_ids,
+            routed_rewards[teacher_id],
+            routed_segment_indices[teacher_id],
+        )
+        if routed_mean is not None:
+            extra_metrics[
+                "rollout/mopd/raw_reward_trainable_trajectory_mean/"
+                f"{_metric_component(teacher_id)}"
+            ] = routed_mean
 
     return False

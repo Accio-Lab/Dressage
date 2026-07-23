@@ -236,6 +236,7 @@ ROLLOUT_ARGS=(
   --rollout-max-response-len "${ROLLOUT_MAX_RESPONSE_LEN}"
   --rollout-max-context-len "${ROLLOUT_MAX_CONTEXT_LEN}"
   --rollout-temperature "${ROLLOUT_TEMPERATURE:-1.0}"
+  --rollout-seed "${ROLLOUT_SEED:-42}"
   --num-steps-per-rollout "${NUM_STEPS_PER_ROLLOUT:-1}"
   --global-batch-size "${GLOBAL_BATCH_SIZE:-128}"
   --balance-data
@@ -329,6 +330,7 @@ SGLANG_ARGS=(
 )
 
 MISC_ARGS=(
+  --seed "${SEED:-1234}"
   --custom-config-path "${SCRIPT_DIR}/default/dressage_staleness.yaml"
   --attention-dropout 0.0
   --hidden-dropout 0.0
