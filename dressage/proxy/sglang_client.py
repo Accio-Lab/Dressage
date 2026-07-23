@@ -362,6 +362,62 @@ class SGLangRouterClient:
             )
         return workers
 
+    async def get_weight_versions(
+        self, *, timeout_seconds: float = 5.0
+    ) -> dict[str, str]:
+        """Read the authoritative weight version from every healthy HTTP worker.
+
+        The router's ``/generate`` response only tells us which version served a
+        completed request.  That observation can be stale at the beginning of a
+        new synchronous rollout batch, so integration preflight probes the
+        workers' control-plane endpoint instead.  A partial snapshot is unsafe:
+        one failed worker probe fails the complete operation.
+        """
+
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        workers = self._candidate_workers(
+            await asyncio.wait_for(
+                self.list_workers(), timeout=timeout_seconds
+            )
+        )
+        if not workers:
+            raise RuntimeError(
+                "SGLang router reported no healthy HTTP workers for weight-version probing"
+            )
+
+        async def read(worker: SGLangWorkerInfo) -> tuple[str, str]:
+            response = await asyncio.wait_for(
+                self._client.get(f"{worker.url}/get_weight_version"),
+                timeout=timeout_seconds,
+            )
+            response.raise_for_status()
+            data = response.json()
+            if not isinstance(data, dict) or data.get("weight_version") is None:
+                raise ValueError(
+                    f"SGLang worker {worker.url!r} returned no weight_version"
+                )
+            version = str(data["weight_version"]).strip()
+            if not version:
+                raise ValueError(
+                    f"SGLang worker {worker.url!r} returned an empty weight_version"
+                )
+            return worker.url, version
+
+        pairs = await asyncio.gather(*(read(worker) for worker in workers))
+        final_workers = self._candidate_workers(
+            await asyncio.wait_for(
+                self.list_workers(), timeout=timeout_seconds
+            )
+        )
+        initial_urls = {worker.url for worker in workers}
+        final_urls = {worker.url for worker in final_workers}
+        if final_urls != initial_urls:
+            raise RuntimeError(
+                "SGLang worker topology changed during weight-version probing"
+            )
+        return dict(pairs)
+
     @staticmethod
     def _candidate_workers(workers: list[SGLangWorkerInfo]) -> list[SGLangWorkerInfo]:
         return [

@@ -31,6 +31,8 @@ def _compute_parent_groups(
     """
     parent_groups: dict[str, list[int]] = defaultdict(list)
     for i, s in enumerate(samples):
+        if getattr(s, "remove_sample", False):
+            continue
         ptid = s.metadata.get("parent_traj_id") if s.metadata else None
         if ptid:
             parent_groups[ptid].append(i)
@@ -82,6 +84,7 @@ def reward_post_process(
     For standard trajectories:
       - raw_rewards = [s.reward for s in samples]
       - rewards = normalize per group_index group (GRPO advantage).
+      - Samples marked remove_sample do not participate in normalization.
 
     For rewrite-aware segmented trajectories (samples carry
     ``metadata['parent_traj_id']``):
@@ -128,6 +131,8 @@ def reward_post_process(
     parent_representative_indices = set(parent_anchor.values())
     groups: dict[int, list[tuple[int, float]]] = defaultdict(list)
     for i, s in enumerate(samples):
+        if getattr(s, "remove_sample", False):
+            continue
         gi = s.group_index if s.group_index is not None else _NONE_GROUP
         if i in parent_representative_indices:
             groups[gi].append((i, raw_rewards[i]))

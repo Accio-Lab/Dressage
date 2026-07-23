@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
+import logging
 import threading
 import time
 import uuid
@@ -15,6 +17,9 @@ from .reasoning_parser import canonicalize_reasoning_content
 from .tool_call_ids import canonicalize_openclaw_tool_call_id
 
 IMPLICIT_TURN_ID_PREFIX = "__implicit_turn__:"
+
+
+logger = logging.getLogger(__name__)
 
 
 class SessionFinalizedError(RuntimeError):
@@ -216,6 +221,7 @@ class SessionManager:
         self._lock = threading.Lock()
         self._sessions: dict[str, Session] = {}
         self._finalized_session_ids: dict[str, float] = {}
+        self._finalization_results: dict[str, dict[str, Any]] = {}
         self._session_timeout = session_timeout
 
     @staticmethod
@@ -454,6 +460,11 @@ class SessionManager:
         with self._lock:
             session = self._sessions.get(session_id)
             if session is None:
+                logger.warning(
+                    "dropping trajectory step for missing session %s after "
+                    "possible stale-cleanup race",
+                    session_id,
+                )
                 return None
             if step_id is None:
                 step_id = session.next_step_id()
@@ -546,11 +557,26 @@ class SessionManager:
         with self._lock:
             return self._sessions.get(session_id)
 
-    def finalize_session(self, session_id: str) -> Session | None:
+    def get_finalization_result(self, session_id: str) -> dict[str, Any] | None:
+        """Return the cached response for an already finalized session."""
+
+        with self._lock:
+            self._cleanup_expired_locked()
+            result = self._finalization_results.get(session_id)
+            return None if result is None else copy.deepcopy(result)
+
+    def finalize_session(
+        self,
+        session_id: str,
+        *,
+        result: dict[str, Any] | None = None,
+    ) -> Session | None:
         with self._lock:
             session = self._sessions.pop(session_id, None)
             if session is not None:
                 self._finalized_session_ids[session_id] = time.time()
+                if result is not None:
+                    self._finalization_results[session_id] = copy.deepcopy(result)
             return session
 
     def active_count(self) -> int:
@@ -560,11 +586,17 @@ class SessionManager:
 
     def _cleanup_expired_locked(self) -> None:
         now = time.time()
-        expired = [
-            session_id
-            for session_id, session in self._sessions.items()
-            if now - session.last_active > self._session_timeout
-        ]
+        expired: list[str] = []
+        for session_id, session in self._sessions.items():
+            if now - session.last_active <= self._session_timeout:
+                continue
+            # A request can legitimately outlive the idle timeout.  Evicting
+            # while it owns request_lock would make its eventual record_step
+            # disappear and can turn a complete finalize into a partial one.
+            if session.request_lock.locked():
+                session.last_active = now
+                continue
+            expired.append(session_id)
         for session_id in expired:
             del self._sessions[session_id]
         expired_finalized = [
@@ -574,3 +606,4 @@ class SessionManager:
         ]
         for session_id in expired_finalized:
             del self._finalized_session_ids[session_id]
+            self._finalization_results.pop(session_id, None)

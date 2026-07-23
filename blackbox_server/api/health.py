@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Request
 
+from blackbox_server import __version__
 from blackbox_server.core.models import StatusResponse
 
 
@@ -10,7 +11,7 @@ router = APIRouter()
 
 @router.get("/health")
 async def health() -> dict[str, object]:
-    return {"healthy": True, "version": "1.0.0"}
+    return {"healthy": True, "version": __version__}
 
 
 @router.get("/v1/status", response_model=StatusResponse)

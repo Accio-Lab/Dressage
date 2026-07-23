@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 
 from blackbox_server.proxy.rollout_llm_proxy import RolloutLLMProxy
 
@@ -28,6 +30,14 @@ def _make_proxy(
     max_steps: int | None = 100,
     default_temperature: float | None = None,
     debug_log_dir: Any = None,
+    upstream_headers: dict[str, str] | None = None,
+    expected_version: str | None = None,
+    model_override: str | None = None,
+    sampling_mode: str | None = None,
+    sampling_temperature: float | None = None,
+    sampling_top_p: float | None = None,
+    sampling_seed_base: int | None = None,
+    verify_tls: bool = True,
 ) -> RolloutLLMProxy:
     return RolloutLLMProxy(
         upstream_origin="http://127.0.0.1:30000",
@@ -38,6 +48,14 @@ def _make_proxy(
         max_steps=max_steps,
         default_temperature=default_temperature,
         debug_log_dir=debug_log_dir,
+        upstream_headers=upstream_headers,
+        expected_version=expected_version,
+        model_override=model_override,
+        sampling_mode=sampling_mode,
+        sampling_temperature=sampling_temperature,
+        sampling_top_p=sampling_top_p,
+        sampling_seed_base=sampling_seed_base,
+        verify_tls=verify_tls,
     )
 
 
@@ -140,6 +158,56 @@ def test_rollout_proxy_forces_identity_encoding_for_model_requests():
     asyncio.run(run_test())
 
     assert captured["headers"]["accept-encoding"] == "identity"
+
+
+def test_rollout_proxy_static_headers_override_client_and_are_redacted(caplog):
+    proxy = _make_proxy(
+        upstream_headers={
+            "Authorization": "Bearer backend-secret",
+            "X-Backend-Credential": "backend-credential",
+        },
+        expected_version="weights-v7",
+    )
+
+    with caplog.at_level(
+        logging.DEBUG,
+        logger="blackbox_server.proxy.rollout_llm_proxy",
+    ):
+        headers = proxy._build_upstream_headers(
+            {
+                "authorization": "Bearer agent-secret",
+                "x-backend-credential": "agent-credential",
+                "x-request-id": "request-1",
+            },
+            is_chat=True,
+        )
+
+    normalized = {key.lower(): value for key, value in headers.items()}
+    assert normalized["authorization"] == "Bearer backend-secret"
+    assert normalized["x-backend-credential"] == "backend-credential"
+    assert normalized["x-dressage-expected-version"] == "weights-v7"
+    assert normalized["x-request-id"] == "request-1"
+    assert "backend-secret" not in caplog.text
+    assert "backend-credential" not in caplog.text
+    assert "agent-secret" not in caplog.text
+    assert "agent-credential" not in caplog.text
+    assert "<redacted>" in caplog.text
+    assert "[PROXY REQUEST]" in caplog.text
+
+
+def test_rollout_proxy_request_details_are_hidden_at_info(caplog):
+    proxy = _make_proxy()
+
+    with caplog.at_level(
+        logging.INFO,
+        logger="blackbox_server.proxy.rollout_llm_proxy",
+    ):
+        proxy._build_upstream_headers(
+            {"x-request-id": "request-1"},
+            is_chat=True,
+        )
+
+    assert "[PROXY REQUEST]" not in caplog.text
 
 
 def test_rollout_proxy_returns_non_retry_anthropic_error_for_unclassified_stream_5xx():
@@ -552,6 +620,26 @@ def test_rollout_proxy_coalesces_responses_message_and_function_call_history():
             ],
         }
     ]
+
+
+def test_rollout_proxy_protocol_bridges_do_not_inject_missing_max_tokens():
+    proxy = _make_proxy()
+
+    responses_payload = proxy._openai_responses_to_chat_completion(
+        {
+            "model": "proxy-model",
+            "input": "hello",
+        }
+    )
+    anthropic_payload = proxy._anthropic_messages_to_openai_chat_completion(
+        {
+            "model": "proxy-model",
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+    )
+
+    assert "max_tokens" not in responses_payload
+    assert "max_tokens" not in anthropic_payload
 
 
 def test_rollout_proxy_round_trips_responses_reasoning_message_and_function_call():
@@ -1694,6 +1782,7 @@ def test_rollout_proxy_does_not_inject_logprobs_for_non_stream_requests():
             "reasoning_content": "thinking",
         }
         assert requests == [{"model": "gpt-test", "messages": [], "stream": False}]
+        assert "max_tokens" not in requests[0]
 
     asyncio.run(run_test())
 
@@ -1738,6 +1827,121 @@ def test_rollout_proxy_injects_default_temperature_when_missing():
         ]
 
     asyncio.run(run_test())
+
+
+def test_rollout_proxy_overrides_existing_openai_chat_model_only():
+    proxy = _make_proxy(model_override="training-model")
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp-1",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            },
+        )
+
+    async def run_test() -> None:
+        proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await proxy.open_turn("turn-001", backend_session_id="oc-session-1")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.app),
+            base_url="http://proxy",
+        ) as client:
+            first = await client.post(
+                "/v1/chat/completions",
+                json={"model": "agent-model", "messages": [], "stream": False},
+            )
+            second = await client.post(
+                "/v1/chat/completions",
+                json={"messages": [], "stream": False},
+            )
+        await proxy.drain_turn(timeout=1.0)
+        await proxy.clear_turn()
+        await proxy._client.aclose()
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+
+    asyncio.run(run_test())
+
+    assert requests == [
+        {"model": "training-model", "messages": [], "stream": False},
+        {"messages": [], "stream": False},
+    ]
+
+
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        (
+            "/v1/messages",
+            {
+                "model": "agent-anthropic-model",
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        ),
+        (
+            "/v1/responses",
+            {"model": "agent-openai-model", "input": "hello"},
+        ),
+    ],
+)
+def test_rollout_proxy_overrides_model_after_protocol_conversion(path, payload):
+    proxy = _make_proxy(
+        model_override="training-model",
+        sampling_mode="force",
+        sampling_temperature=0.6,
+        sampling_top_p=0.9,
+        sampling_seed_base=700,
+    )
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp-1",
+                "model": "training-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            },
+        )
+
+    async def run_test() -> None:
+        proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await proxy.open_turn("turn-001", backend_session_id="session-1")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.app),
+            base_url="http://proxy",
+        ) as client:
+            response = await client.post(path, json=payload)
+        await proxy.drain_turn(timeout=1.0)
+        await proxy.clear_turn()
+        await proxy._client.aclose()
+
+        assert response.status_code == 200
+
+    asyncio.run(run_test())
+
+    assert requests[0]["model"] == "training-model"
+    assert requests[0]["temperature"] == 0.6
+    assert requests[0]["top_p"] == 0.9
+    assert requests[0]["seed"] == 700
 
 
 def test_rollout_proxy_preserves_explicit_zero_temperature():

@@ -1,6 +1,6 @@
 [project]
 name = "dressage-blackbox-server"
-version = "1.0.0"
+version = "1.1.0"
 description = "Standalone BlackboxServer HTTP adapter service for Dressage blackbox rollouts"
 requires-python = ">=3.10"
 dependencies = [

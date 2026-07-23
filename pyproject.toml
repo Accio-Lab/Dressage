@@ -15,6 +15,13 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=8.3.0", "pytest-asyncio>=0.24.0"]
+harbor = [
+    "harbor==0.18.0",
+    "dressage-blackbox-server==1.1.0",
+]
+
+[project.entry-points."harbor.plugins"]
+dressage = "dressage.integrations.harbor.plugin:DressageHarborPlugin"
 
 [project.scripts]
 dressage-proxy = "dressage.proxy.server:main"
@@ -30,6 +37,10 @@ dressage-blackbox-stop = "dressage.sandbox.scripts.stop_blackbox_cluster:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-m 'not harbor_e2e'"
+markers = [
+    "harbor_e2e: paid or environment-dependent Harbor/GPU/E2B end-to-end tests",
+]
 
 [build-system]
 requires = ["setuptools>=61.0"]

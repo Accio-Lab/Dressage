@@ -68,6 +68,23 @@ def _trajectory_key(sample: Any, metadata: dict[str, Any], position: int) -> str
     return str(value) if value not in (None, "") else f"sample:{position}"
 
 
+def _sample_reward_value(args: Any, sample: Any) -> float:
+    """Match slime's ``Sample.get_reward_value`` for dict rewards.
+
+    Harbor verifier rewards are intentionally kept as a mapping on the
+    sample so auxiliary verifier signals remain available to downstream
+    consumers.  The rollout logger, however, needs the configured scalar.
+    """
+
+    reward = getattr(sample, "reward", None)
+    if isinstance(reward, dict):
+        reward_key = getattr(args, "reward_key", None)
+        if reward_key is None:
+            return 0.0
+        reward = reward.get(reward_key)
+    return float(reward) if reward is not None else 0.0
+
+
 def log_rollout_data(
     rollout_id: int,
     args: Any,
@@ -108,8 +125,7 @@ def log_rollout_data(
             str(ptid) if ptid is not None else _trajectory_key(sample, meta, position)
         )
         segment_index = int(meta.get("segment_index", 0))
-        r = getattr(sample, "reward", None)
-        reward = float(r) if r is not None else 0.0
+        reward = _sample_reward_value(args, sample)
         if ptid is not None:
             parent_traj_ids.append(trajectory_key)
             segment_indices.append(segment_index)

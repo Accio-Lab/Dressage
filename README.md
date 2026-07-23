@@ -20,7 +20,7 @@ Dressage lets you train diverse types of LLM agents that use real tools — like
 - [License](#-license)
 
 ## 📢 News
-
+- **[2026/07/19]** **Integrated [Harbor](docs/harbor.md) for rollout and training:** Harbor orchestrates task execution and evaluation, while Dressage handles model routing and trajectory collection.
 - **[2026/07/09]** **Multi-Agent Training.** From Timeline to Lineage, **Lineage-aware TITO** builds correct multi-agent training trajectories by reconstructing context inheritance across main-agent and subagent calls. Read the [technical deep dive](https://zhuanlan.zhihu.com/p/2059302405888537724).
 - **[2026/07/04]** **Multi-Harness Training.** Supports [Claude Code](https://github.com/anthropics/claude-code) and [Codex](https://github.com/openai/codex), and you can train multiple harnesses in a single [script](https://github.com/huang3eng/Dressage/blob/main/examples/scripts/run_blackbox_qwen3.5_4b_async_local.sh).
 - **[2026/06/30]**  Released [whitebox agent training curves](dressage/recipes/README.md) and [true staleness control](docs/staleness.md).
@@ -201,6 +201,7 @@ For the end-to-end data preparation and launch commands for these recipes, see t
 - **[BlackboxServer](docs/blackbox-server.md)** — HTTP adapter protocol, backends, in-process LLM proxy, session states
 - **[Rollout](docs/rollout.md)** — Generate hooks, async modes, reward registry, slime wiring
 - **[Training](docs/training.md)** — Multi-segment, TITO, prompt-equal aggregation, partial rollout
+- **[Harbor Integration](docs/harbor.md)** — Harbor rollouts, trainable trajectory capture, and synchronous slime training
 - **[Recipes](docs/recipes.md)** — ALFWorld and HotpotQA example agents, build-your-own guide
 - **[Whitebox Agent Quick Start](docs/whitebox-agent-quickstart.md)** — Data preparation and launch commands for ALFWorld and HotpotQA whitebox agents
 - **[Quick Start](docs/quickstart.md)** — Step-by-step setup, configuration reference, troubleshooting

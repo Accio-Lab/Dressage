@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Mapping
 
 import httpx
 
@@ -14,14 +14,30 @@ class ProxyClient:
         self,
         proxy_url: str,
         *,
-        timeout: httpx.Timeout | None = None,
+        timeout: httpx.Timeout | float | None = None,
         client: httpx.AsyncClient | None = None,
+        default_headers: Mapping[str, str] | None = None,
+        verify: bool = True,
     ):
         self._proxy_url = proxy_url.rstrip("/")
+        self._default_headers = {
+            str(key): str(value) for key, value in (default_headers or {}).items()
+        }
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(
-            timeout=timeout or httpx.Timeout(None), trust_env=False
+            timeout=timeout or httpx.Timeout(300.0, connect=10.0),
+            trust_env=False,
+            verify=verify,
         )
+
+    def _headers(self, extra: Mapping[str, str] | None = None) -> dict[str, str]:
+        headers = dict(self._default_headers)
+        for key, value in (extra or {}).items():
+            for existing in list(headers):
+                if existing.lower() == key.lower():
+                    del headers[existing]
+            headers[str(key)] = str(value)
+        return headers
 
     async def chat_completions(
         self,
@@ -38,7 +54,9 @@ class ProxyClient:
             headers["X-Turn-Id"] = turn_id
 
         response = await self._client.post(
-            f"{self._proxy_url}/v1/chat/completions", json=body, headers=headers
+            f"{self._proxy_url}/v1/chat/completions",
+            json=body,
+            headers=self._headers(headers),
         )
         response.raise_for_status()
         return response.json()
@@ -56,7 +74,9 @@ class ProxyClient:
         if label is not None:
             payload["label"] = label
         response = await self._client.post(
-            f"{self._proxy_url}/session/finalize", json=payload
+            f"{self._proxy_url}/session/finalize",
+            json=payload,
+            headers=self._headers(),
         )
         response.raise_for_status()
         return response.json()
@@ -86,7 +106,9 @@ class ProxyClient:
             payload["segment_view"] = segment_view
 
         response = await self._client.post(
-            f"{self._proxy_url}/trajectory/read", json=payload
+            f"{self._proxy_url}/trajectory/read",
+            json=payload,
+            headers=self._headers(),
         )
         response.raise_for_status()
         return response.json()
@@ -101,7 +123,9 @@ class ProxyClient:
         if timeout_seconds is not None:
             payload["timeout_seconds"] = timeout_seconds
         response = await self._client.post(
-            f"{self._proxy_url}/v1/rollout/pause", json=payload
+            f"{self._proxy_url}/v1/rollout/pause",
+            json=payload,
+            headers=self._headers(),
         )
         response.raise_for_status()
         return response.json()
@@ -116,10 +140,23 @@ class ProxyClient:
         if version is not None:
             payload["version"] = version
         response = await self._client.post(
-            f"{self._proxy_url}/v1/rollout/resume", json=payload
+            f"{self._proxy_url}/v1/rollout/resume",
+            json=payload,
+            headers=self._headers(),
         )
         response.raise_for_status()
         return response.json()
+
+    async def capabilities(self) -> dict[str, Any]:
+        response = await self._client.get(
+            f"{self._proxy_url}/integration/capabilities",
+            headers=self._headers(),
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict):
+            raise TypeError("Proxy capabilities response must be a JSON object")
+        return data
 
     async def close(self) -> None:
         if self._owns_client:
