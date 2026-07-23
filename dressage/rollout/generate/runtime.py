@@ -13,6 +13,7 @@ from dressage.proxy.proxy_client import ProxyClient
 logger = logging.getLogger(__name__)
 
 _PADDOCK = None
+_PADDOCK_BY_MODE: dict[tuple[str, str], Any] = {}
 _PROXY_CLIENT: ProxyClient | None = None
 
 _PADDOCK_ENV_ARG_KEYS = (
@@ -36,13 +37,19 @@ def get_proxy_client() -> ProxyClient:
     return _PROXY_CLIENT
 
 
-def get_paddock_from_env(*, allow_whitebox_mode: bool) -> Any:
+def get_paddock_from_env(
+    *, allow_whitebox_mode: bool, mode: str | None = None
+) -> Any:
     global _PADDOCK
+    # _PADDOCK remains the explicit test/embedder override and the legacy
+    # cache for callers that do not request a mode.
     if _PADDOCK is not None:
         return _PADDOCK
 
     paddock_class_path = os.environ.get("DRESSAGE_PADDOCK_CLASS")
-    paddock_mode = (os.environ.get("DRESSAGE_PADDOCK_MODE") or "blackbox").strip().lower()
+    paddock_mode = (
+        mode or os.environ.get("DRESSAGE_PADDOCK_MODE") or "blackbox"
+    ).strip().lower()
     if not paddock_class_path and not allow_whitebox_mode and paddock_mode == "whitebox":
         raise ValueError(
             "blackbox_dispatch does not support whitebox mode; set "
@@ -52,12 +59,20 @@ def get_paddock_from_env(*, allow_whitebox_mode: bool) -> Any:
 
     from dressage.paddock import factory as paddock_factory
 
-    _PADDOCK = paddock_factory.create_paddock_from_env()
+    if mode is None:
+        _PADDOCK = paddock_factory.create_paddock_from_env()
+        paddock = _PADDOCK
+    else:
+        cache_key = (paddock_class_path or "", paddock_mode)
+        paddock = _PADDOCK_BY_MODE.get(cache_key)
+        if paddock is None:
+            paddock = paddock_factory.create_paddock_from_env(mode=paddock_mode)
+            _PADDOCK_BY_MODE[cache_key] = paddock
     if paddock_class_path:
         logger.info("initialized paddock class override: %s", paddock_class_path)
     else:
-        logger.info("initialized paddock from mode/provider env: %s", type(_PADDOCK).__name__)
-    return _PADDOCK
+        logger.info("initialized paddock from mode/provider env: %s", type(paddock).__name__)
+    return paddock
 
 
 def paddock_env_args_from_metadata(
