@@ -11,6 +11,26 @@ checkpoint is loaded once and copied into Slime's existing pinned-CPU
 that teacher's subset, and then restores the student before training. GPU model
 memory is reused; CPU memory grows with the number of teachers.
 
+## Experiment snapshot
+
+The figure below shows a 20-step MOPD run on ALFWorld and HotpotQA with seed
+1234. Dark lines are centered five-step rolling means, and light lines are raw
+step values.
+
+![MOPD open training dynamics](../assets/mopd_open_dynamics_8panel.png)
+
+The two domains show different distillation dynamics. HotpotQA's routed MOPD
+K1 falls from about 0.22 to 0.04, while ALFWorld starts much lower and stays
+between 0.003 and 0.005. Global routed K1 declines steadily, and both trainable
+trajectory reward curves finish above their early values. Gradient norm
+decreases without a sustained spike, while policy entropy and the
+train-rollout log-probability gap remain stable.
+
+This run is primarily a mechanism and stability check: it confirms that both
+teachers remain active and that distillation proceeds without destabilizing
+training. Because it covers one seed with changing training prompts and has no
+matched control, it should not be read as a held-out capability comparison.
+
 ## Native Slime boundaries
 
 The implementation uses:
