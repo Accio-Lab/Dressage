@@ -4,6 +4,20 @@ Harbor-managed agent rollouts and synchronous training through the Dressage Gate
 
 [Back to the main README](../README.md) · [Harbor examples](../examples/harbor)
 
+## Preliminary Terminal-Bench 2.1 result
+
+We evaluated Qwen3.6-35B-A3B with OpenCode 1.3.13 through the Dressage Harbor integration rollout on **E2B** sandbox. The experiment is conducted on a single node with 8× NVIDIA H200 GPUs (140 GB memory per GPU).
+
+| Item | Value |
+|---|---|
+| Dataset | Terminal-Bench 2.1, 89 tasks |
+| Total attempts | 5 per task, 445 trials total |
+| Raw positive verifier-reward rate | 124 / 445 = **27.87%** |
+
+For reference, the public Terminal-Bench 2.0 leaderboard reports [little-coder with Qwen3.6-35B-A3B at **24.6% ± 3.2**](https://www.tbench.ai/leaderboard/terminal-bench/2.0?models=Qwen3.6-35B-A3B). [Terminal-Bench 2.1](https://www.tbench.ai/news/terminal-bench-2-1) revises the same 89-task benchmark by fixing issues in 28 tasks, including external dependency drift, resource mismatches, and instruction/test misspecification. The release reports that most representative agent-model pairs improve on 2.1.
+
+Our raw positive verifier-reward rate of **27.87%** is therefore directionally plausible: it is 3.27 percentage points above 24.6% and still within the leaderboard's displayed 24.6% ± 3.2 range (21.4%–27.8%). The Job was configured to align with the official evaluation semantics where possible: `n_attempts=5`, `max_retries=3`, the original task timeouts, and no timeout multiplier.
+
 ## How it works
 
 Harbor owns Dataset resolution, Environments, Agents, Verifiers, trial retries, and rewards. Dressage routes every model request through its Gateway and Proxy, records trainable token-level data, and combines it with Harbor's verifier result. slime can consume the resulting trajectories to update the model.
