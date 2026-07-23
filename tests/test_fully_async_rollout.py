@@ -109,6 +109,33 @@ def test_fully_async_rollout_drains_completed_groups(monkeypatch):
     assert all(group[0].reward == 1.0 for group in result)
 
 
+def test_fully_async_rollout_stops_worker_after_final_rollout(monkeypatch):
+    async def fake_generate_and_rm_group(args, group, sampling_params, evaluation=False):
+        del args, sampling_params, evaluation
+        for sample in group:
+            sample.status = SampleLike.Status.COMPLETED
+            sample.reward = 1.0
+            sample.tokens = [1, 2]
+            sample.response_length = 1
+            sample.loss_mask = [1]
+            sample.rollout_log_probs = [-0.1]
+        return group
+
+    monkeypatch.setattr(
+        fully_async_rollout,
+        "generate_and_rm_group",
+        fake_generate_and_rm_group,
+    )
+    monkeypatch.setattr(fully_async_rollout, "GenerateState", None)
+
+    data = DataBuffer([[SampleLike(index=0)]])
+    args = SimpleNamespace(rollout_batch_size=1, num_rollout=1)
+
+    fully_async_rollout.generate_rollout_fully_async(args, 0, data)
+
+    assert fully_async_rollout._GLOBAL_WORKER is None
+
+
 def test_fully_async_rollout_retries_aborted_group(monkeypatch):
     attempts = {"count": 0}
 

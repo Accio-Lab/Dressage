@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 
@@ -21,6 +22,8 @@ from dressage.paddock.interface import BlackboxPaddock
 from dressage.sandbox import SandboxEndpoint, SandboxLease, SandboxServiceSpec, SandboxSpec
 from dressage.sandbox.factory import create_sandbox_provider_from_env
 from dressage.sandbox.provider import SandboxProvider
+
+logger = logging.getLogger(__name__)
 
 
 class BlackboxAgentPaddock(BlackboxPaddock):
@@ -78,31 +81,49 @@ class BlackboxAgentPaddock(BlackboxPaddock):
             metadata={"paddock_mode": "blackbox"},
         )
         lease = await self._provider.create(spec)
-        endpoint = lease.endpoints.get("blackbox")
-        if endpoint is None:
-            endpoint = await self._provider.get_public_url(
-                lease,
-                port=spec.services[0].port,
-                service_name="blackbox",
-            )
-            lease.endpoints["blackbox"] = endpoint
-        endpoint = endpoint.normalized()
-        if self._wait_health:
-            await self._client.health(endpoint)
-        self._leases[traj_id] = lease
-        state = SandboxState(
-            trajectory_id=traj_id,
-            sandbox_url=endpoint.url,
-            sandbox_id=lease.sandbox_id,
-            raw_register_response={
-                "provider": lease.provider,
-                "sandbox_id": lease.sandbox_id,
-                "metadata": lease.metadata,
-                "endpoints": {
-                    name: endpoint.url for name, endpoint in lease.endpoints.items()
+        try:
+            endpoint = lease.endpoints.get("blackbox")
+            if endpoint is None:
+                endpoint = await self._provider.get_public_url(
+                    lease,
+                    port=spec.services[0].port,
+                    service_name="blackbox",
+                )
+                lease.endpoints["blackbox"] = endpoint
+            endpoint = endpoint.normalized()
+            if self._wait_health:
+                await self._client.health(endpoint)
+            state = SandboxState(
+                trajectory_id=traj_id,
+                sandbox_url=endpoint.url,
+                sandbox_id=lease.sandbox_id,
+                raw_register_response={
+                    "provider": lease.provider,
+                    "sandbox_id": lease.sandbox_id,
+                    "metadata": lease.metadata,
+                    "endpoints": {
+                        name: endpoint.url
+                        for name, endpoint in lease.endpoints.items()
+                    },
                 },
-            },
-        )
+            )
+        except BaseException:
+            # provider.create() succeeded but a subsequent step failed.
+            # Terminate the already-created remote sandbox to prevent leaks.
+            try:
+                await self._provider.terminate(lease)
+            except Exception as term_exc:
+                logger.warning(
+                    "failed to terminate sandbox after init failure "
+                    "traj_id=%s: %s",
+                    traj_id,
+                    term_exc,
+                )
+            self._leases.pop(traj_id, None)
+            self._states.pop(traj_id, None)
+            raise
+
+        self._leases[traj_id] = lease
         self._states[traj_id] = state
         return state
 
