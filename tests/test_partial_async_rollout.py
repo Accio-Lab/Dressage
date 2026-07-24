@@ -321,7 +321,9 @@ def test_partial_async_rollout_drains_worker_after_final_rollout(monkeypatch):
     assert [group[0].index for group in result] == [0]
     assert partial_async_rollout._GLOBAL_PARTIAL_WORKER is None
     assert output.metrics["dressage/partial_rollout_final_worker_drain"] == 1
-    assert output.metrics["dressage/partial_rollout_drained_completed_groups"] >= 1
+    # With the cancel-on-shutdown semantics, in-flight groups are cancelled
+    # rather than awaited, so drained_completed_groups is 0.
+    assert output.metrics["dressage/partial_rollout_drained_completed_groups"] == 0
 
 
 def test_partial_async_rollout_drops_stale_group_by_trajectory(monkeypatch):

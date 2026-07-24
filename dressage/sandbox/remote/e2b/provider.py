@@ -85,30 +85,30 @@ class E2BSandboxProvider:
             },
             raw=sandbox,
         )
-        if sandbox_cmds:
-            try:
+        try:
+            if sandbox_cmds:
                 sandbox_cmd_results = await self._run_sandbox_cmds(
                     lease,
                     sandbox_cmds,
                     timeout=timeout,
                 )
-            except Exception:
-                await _best_effort_kill(sandbox)
-                raise
-            lease.metadata["sandbox_cmd_results"] = sandbox_cmd_results
-            lease.metadata["sandbox_cmd_result"] = sandbox_cmd_results[-1]
-        for service in spec.services:
-            try:
-                lease.endpoints[service.name] = await self.get_public_url(
-                    lease,
-                    port=service.port,
-                    service_name=service.name,
-                )
-            except Exception:
-                # Keep create usable for pure whitebox templates even when no
-                # port exposure is available in a mock or older SDK.
-                if service.name == "blackbox":
-                    raise
+                lease.metadata["sandbox_cmd_results"] = sandbox_cmd_results
+                lease.metadata["sandbox_cmd_result"] = sandbox_cmd_results[-1]
+            for service in spec.services:
+                try:
+                    lease.endpoints[service.name] = await self.get_public_url(
+                        lease,
+                        port=service.port,
+                        service_name=service.name,
+                    )
+                except Exception:
+                    # Keep create usable for pure whitebox templates even when no
+                    # port exposure is available in a mock or older SDK.
+                    if service.name == "blackbox":
+                        raise
+        except BaseException:
+            await _best_effort_kill(sandbox)
+            raise
         self._sandboxes[spec.trajectory_id] = sandbox
         return lease
 

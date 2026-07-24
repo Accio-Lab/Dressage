@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable
+import logging
 import os
+from collections.abc import Awaitable
 from typing import Any
 
 from dressage.config import local_bwrap_manager_name, local_bwrap_namespace
@@ -15,6 +16,8 @@ from dressage.sandbox.local.bwrap.supervisor import (
     normalize_pool_mode,
 )
 from dressage.sandbox.types import CommandResult, SandboxEndpoint, SandboxLease, SandboxSpec
+
+logger = logging.getLogger(__name__)
 
 
 class LocalBwrapSandboxProvider:
@@ -66,40 +69,63 @@ class LocalBwrapSandboxProvider:
             env_type=spec.env_type,
             env_args=spec.env_args,
         )
-        lease = SandboxLease(
-            trajectory_id=spec.trajectory_id,
-            provider=self.name,
-            sandbox_id=payload.get("lease_id"),
-            capabilities=(
-                {"command", "file", "public_url"}
-                if paddock_mode == "blackbox"
-                else {"command", "file"}
-            ),
-            metadata={
-                "pool_mode": pool_mode,
-                "paddock_mode": paddock_mode,
-                "node_id": payload.get("node_id"),
-                "node_ip": payload.get("node_ip"),
-                "slot_id": payload.get("slot_id"),
-                "port": payload.get("port"),
-                "generation": payload.get("generation"),
-            },
-            raw=payload,
-        )
-        if paddock_mode == "blackbox":
-            sandbox_url = payload.get("sandbox_url")
-            if not sandbox_url:
-                raise RuntimeError("blackbox local_bwrap lease did not return sandbox_url")
-            sandbox_endpoint = SandboxEndpoint(url=str(sandbox_url).rstrip("/"), headers={})
-            lease.endpoints["blackbox"] = sandbox_endpoint
-            for service in spec.services:
-                if service.name == "blackbox":
-                    lease.endpoints[service.name] = sandbox_endpoint
-                elif payload.get("node_ip") and service.port:
-                    lease.endpoints[service.name] = SandboxEndpoint(
-                        url=f"http://{payload['node_ip']}:{service.port}",
-                        headers={},
+        try:
+            lease = SandboxLease(
+                trajectory_id=spec.trajectory_id,
+                provider=self.name,
+                sandbox_id=payload.get("lease_id"),
+                capabilities=(
+                    {"command", "file", "public_url"}
+                    if paddock_mode == "blackbox"
+                    else {"command", "file"}
+                ),
+                metadata={
+                    "pool_mode": pool_mode,
+                    "paddock_mode": paddock_mode,
+                    "node_id": payload.get("node_id"),
+                    "node_ip": payload.get("node_ip"),
+                    "slot_id": payload.get("slot_id"),
+                    "port": payload.get("port"),
+                    "generation": payload.get("generation"),
+                },
+                raw=payload,
+            )
+            if paddock_mode == "blackbox":
+                sandbox_url = payload.get("sandbox_url")
+                if not sandbox_url:
+                    raise RuntimeError(
+                        "blackbox local_bwrap lease did not return sandbox_url"
                     )
+                sandbox_endpoint = SandboxEndpoint(
+                    url=str(sandbox_url).rstrip("/"),
+                    headers={},
+                )
+                lease.endpoints["blackbox"] = sandbox_endpoint
+                for service in spec.services:
+                    if service.name == "blackbox":
+                        lease.endpoints[service.name] = sandbox_endpoint
+                    elif payload.get("node_ip") and service.port:
+                        lease.endpoints[service.name] = SandboxEndpoint(
+                            url=f"http://{payload['node_ip']}:{service.port}",
+                            headers={},
+                        )
+        except BaseException:
+            try:
+                await _remote_call(
+                    self._manager,
+                    "release",
+                    trajectory_id=spec.trajectory_id,
+                    lease_id=payload.get("lease_id"),
+                    reason="paddock_create_failed",
+                )
+            except Exception as release_exc:
+                logger.warning(
+                    "failed to release local_bwrap slot after create failure "
+                    "trajectory_id=%s: %s",
+                    spec.trajectory_id,
+                    release_exc,
+                )
+            raise
         self._leases[spec.trajectory_id] = lease
         return lease
 

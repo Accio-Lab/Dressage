@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-import uuid
+import time
 from typing import Any
 
 from dressage.config import proxy_url
@@ -36,6 +36,10 @@ from dressage.rollout.artifacts.samples import (
     set_status as _set_status,
 )
 from dressage.rollout.artifacts.writer import DEFAULT_WRITER as _ARTIFACT_WRITER
+from dressage.rollout.prewarm import (
+    claim_prewarm,
+    ensure_blackbox_session_id,
+)
 from dressage.rollout.generate.runtime import (
     get_paddock_from_env,
     get_proxy_client,
@@ -50,19 +54,6 @@ def _chat_messages_from_prompt(prompt: Any) -> list[dict[str, Any]]:
     if isinstance(prompt, list):
         return [dict(message) for message in prompt]
     return [{"role": "user", "content": str(prompt)}]
-
-
-def _ensure_blackbox_session_id(sample: Any) -> str:
-    session_id = getattr(sample, "session_id", None)
-    if session_id is None:
-        session_id = str(uuid.uuid4())
-    session_id = str(session_id)
-
-    if not session_id.startswith("bbs-"):
-        session_id = f"bbs-{session_id}"
-        sample.session_id = session_id
-
-    return session_id
 
 
 def _backend_options_for_register(
@@ -96,7 +87,7 @@ async def generate(
     metadata.pop("blackbox_agent_early_stop", None)
     metadata.pop("blackbox_agent_early_stop_kind", None)
     metadata["execute_cmds"] = []
-    session_id = _ensure_blackbox_session_id(sample)
+    session_id = ensure_blackbox_session_id(sample)
     instance_id = _instance_id(sample)
     metadata["session_id"] = session_id
     metadata["instance_id"] = instance_id
@@ -124,16 +115,32 @@ async def generate(
             metadata=metadata,
             blackbox_type=blackbox_type,
         )
-        paddock = get_paddock_from_env(allow_whitebox_mode=False)
         proxy_client = get_proxy_client()
-        state = await maybe_await(
-            paddock.init(
+        prewarm_t0 = time.monotonic()
+        handle = await claim_prewarm(session_id)
+        prewarm_wait = time.monotonic() - prewarm_t0
+        if handle is not None:
+            paddock = handle.paddock
+            state = handle.state
+            env_args = handle.env_args
+            initialized = True
+            logger.debug(
+                "claimed prewarmed sandbox for session_id=%s group_id=%d: "
+                "wait=%.2fs",
                 session_id,
-                metadata.get("env_type"),
-                env_args,
+                handle.group_id,
+                prewarm_wait,
             )
-        )
-        initialized = True
+        else:
+            paddock = get_paddock_from_env(allow_whitebox_mode=False)
+            state = await maybe_await(
+                paddock.init(
+                    session_id,
+                    metadata.get("env_type"),
+                    env_args,
+                )
+            )
+            initialized = True
         if not hasattr(paddock, "register_agent"):
             raise TypeError(f"{type(paddock).__name__} does not implement register_agent")
         await maybe_await(

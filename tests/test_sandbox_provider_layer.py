@@ -440,6 +440,36 @@ async def _run_e2b_provider_sandbox_cmd_timeout_aborts_and_kills():
     ]
 
 
+def test_e2b_provider_public_url_failure_kills_created_sandbox():
+    asyncio.run(_run_e2b_provider_public_url_failure_kills_created_sandbox())
+
+
+async def _run_e2b_provider_public_url_failure_kills_created_sandbox():
+    events: list[tuple[Any, ...]] = []
+
+    class PublicUrlFailureSandbox(FakeE2BSandbox):
+        async def get_host(self, port):
+            self.events.append(("get_host", port))
+            raise RuntimeError("public URL unavailable")
+
+    async def sandbox_factory(**kwargs):
+        return PublicUrlFailureSandbox(events)
+
+    provider = E2BSandboxProvider(
+        template="blackbox-template",
+        sandbox_factory=sandbox_factory,
+    )
+    with pytest.raises(RuntimeError, match="public URL unavailable"):
+        await provider.create(
+            SandboxSpec(
+                trajectory_id="traj-public-url-failure",
+                services=(SandboxServiceSpec(name="blackbox", port=31000),),
+            )
+        )
+
+    assert events == [("get_host", 31000), ("kill",)]
+
+
 def test_e2b_provider_rejects_invalid_sandbox_cmd_before_create():
     asyncio.run(_run_e2b_provider_rejects_invalid_sandbox_cmd_before_create())
 
@@ -492,6 +522,36 @@ async def _run_local_bwrap_provider_wraps_ray_pool_manager():
     assert written["bytes"] == 5
     released = await provider.terminate(lease)
     assert released["released"] is True
+
+
+def test_local_bwrap_provider_releases_slot_when_lease_is_invalid():
+    asyncio.run(_run_local_bwrap_provider_releases_slot_when_lease_is_invalid())
+
+
+async def _run_local_bwrap_provider_releases_slot_when_lease_is_invalid():
+    class MissingUrlManager(FakeLocalManager):
+        async def acquire(self, trajectory_id, env_type=None, env_args=None):
+            payload = await super().acquire(trajectory_id, env_type, env_args)
+            payload.pop("sandbox_url", None)
+            return payload
+
+    manager = MissingUrlManager()
+    provider = LocalBwrapSandboxProvider(manager=manager)
+
+    with pytest.raises(RuntimeError, match="did not return sandbox_url"):
+        await provider.create(
+            SandboxSpec(
+                trajectory_id="traj-invalid",
+                metadata={"paddock_mode": "blackbox"},
+            )
+        )
+
+    assert manager.calls[-1] == (
+        "release",
+        "traj-invalid",
+        "lease-traj-invalid",
+        "paddock_create_failed",
+    )
 
 
 def test_local_bwrap_provider_command_only_lease_has_no_blackbox_endpoint():

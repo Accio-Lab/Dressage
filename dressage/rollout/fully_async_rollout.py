@@ -36,6 +36,7 @@ except ImportError:
 
     Sample = None  # type: ignore[assignment]
 
+from dressage.paddock.lifecycle import drain_terminate_tasks
 from dressage.rollout.multi_segment import (
     compute_multi_segment_metrics,
     mark_aborted_no_grad,
@@ -46,6 +47,7 @@ from dressage.rollout.staleness import (
     StalenessTracker,
     config_from_args,
 )
+from dressage.rollout.prewarm.scheduler import PrewarmScheduler
 
 
 @dataclass
@@ -82,6 +84,20 @@ def _state_for(args: Any):
     if GenerateState is None:
         return _FallbackGenerateState(args)
     return GenerateState(args)
+
+
+def _should_drain_worker_on_rollout(args: Any, rollout_id: int) -> bool:
+    value = os.environ.get(
+        "DRESSAGE_DRAIN_FULLY_ASYNC_WORKER_ON_FINAL_ROLLOUT",
+        "1",
+    )
+    if value.lower() in {"0", "false", "no", "off"}:
+        return False
+    try:
+        num_rollout = int(getattr(args, "num_rollout"))
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return int(rollout_id) + 1 >= num_rollout
 
 
 def _sample_status_name(sample: Any) -> str:
@@ -277,13 +293,17 @@ class AsyncRolloutWorker:
                 str(getattr(args, "rollout_batch_size", 1)),
             )
         )
+        self.samples_per_group = max(
+            1,
+            int(getattr(args, "n_samples_per_prompt", 1)),
+        )
         output_size = int(os.environ.get("DRESSAGE_ASYNC_OUTPUT_QUEUE_SIZE", "1000"))
         self.output_queue: queue.Queue[CompletedGroup] = queue.Queue(maxsize=output_size)
         self.high_watermark = max(1, int(output_size * 0.8))
         self.running = True
         self.worker_thread: threading.Thread | None = None
-        self._next_group_id = 0
         self.staleness = StalenessTracker(config_from_args(args))
+        self._scheduler = PrewarmScheduler()
 
     def start(self) -> None:
         if self.worker_thread is not None and self.worker_thread.is_alive():
@@ -294,45 +314,83 @@ class AsyncRolloutWorker:
         )
         self.worker_thread.start()
 
-    def stop(self) -> None:
+    def stop(self, *, timeout: float | None = None) -> None:
         self.running = False
         if self.worker_thread is not None and self.worker_thread.is_alive():
-            self.worker_thread.join(timeout=5)
+            if timeout is None:
+                timeout = float(
+                    os.environ.get("DRESSAGE_ASYNC_WORKER_STOP_TIMEOUT_SEC", "300")
+                )
+            self.worker_thread.join(timeout=timeout)
+            if self.worker_thread.is_alive():
+                logger.warning(
+                    "Dressage fully async rollout worker did not stop after %.1fs; "
+                    "active blackbox sessions may continue in the background",
+                    timeout,
+                )
 
     async def continuous_worker_loop(self) -> None:
-        logger.info("Dressage fully async rollout worker started")
+        sandbox_provider = os.environ.get("DRESSAGE_SANDBOX_PROVIDER", "").lower()
+        logger.info(
+            "Dressage fully async rollout worker started "
+            "(prewarm=%s provider=%s ahead_groups=%d "
+            "max_active_groups=%d samples_per_group=%d max_active_sessions=%d)",
+            self._scheduler.enabled,
+            sandbox_provider or "(unset)",
+            self._scheduler.ahead,
+            self.max_active_groups,
+            self.samples_per_group,
+            self.max_active_groups * self.samples_per_group,
+        )
         state = _state_for(self.args)
         active: dict[asyncio.Task, tuple[int, list[Any]]] = {}
 
-        while self.running:
-            done_tasks = [task for task in active if task.done()]
-            for task in done_tasks:
-                group_id, group = active.pop(task)
-                self._put_completed(_completed_from_task(group_id, group, task))
+        try:
+            while self.running:
+                done_tasks = [task for task in active if task.done()]
+                for task in done_tasks:
+                    group_id, group = active.pop(task)
+                    self._put_completed(_completed_from_task(group_id, group, task))
+                    # Release this group's unconsumed pre-warm entries (if any)
+                    # immediately after completion, without waiting for shutdown.
+                    await self._scheduler.cleanup_group(group_id)
 
-            while (
-                self.running
-                and len(active) < self.max_active_groups
-                and self.output_queue.qsize() < self.high_watermark
-            ):
-                groups = self.data_buffer.get_samples(1)
-                if not groups:
-                    break
-                group = groups[0]
-                group_id = self._next_group_id
-                self._next_group_id += 1
-                task = asyncio.create_task(
-                    self._run_group(group, state.sampling_params.copy())
-                )
-                active[task] = (group_id, group)
+                # --- Prefetch phase: pre-warm sandboxes for upcoming groups ---
+                self._scheduler.do_prefetch(self.data_buffer)
 
-            await asyncio.sleep(0.01)
+                # --- Dispatch phase ---
+                while (
+                    self.running
+                    and len(active) < self.max_active_groups
+                    and self.output_queue.qsize() < self.high_watermark
+                ):
+                    result = self._scheduler.pop_next_group(self.data_buffer)
+                    if result is None:
+                        break
+                    group_id, group = result
+                    task = asyncio.create_task(
+                        self._run_group(group, state.sampling_params.copy())
+                    )
+                    active[task] = (group_id, group)
 
-        if active:
-            await asyncio.wait(active.keys())
-            for task, (group_id, group) in active.items():
-                self._put_completed(_completed_from_task(group_id, group, task))
-        logger.info("Dressage fully async rollout worker stopped")
+                await asyncio.sleep(0.01)
+        finally:
+            # Cancel active tasks instead of waiting for full completion.
+            # Their results are no longer needed; waiting wastes compute on
+            # agent rollouts that nobody will consume.  Each task's finally
+            # block in blackbox_dispatch calls schedule_terminate_paddock to
+            # release claimed sandboxes; drain_terminate_tasks below waits
+            # for those background terminate tasks to finish.
+            if active:
+                for task in active:
+                    task.cancel()
+                await asyncio.gather(*active.keys(), return_exceptions=True)
+                for task, (group_id, group) in active.items():
+                    await self._scheduler.cleanup_group(group_id)
+
+            await self._scheduler.cleanup()
+            await drain_terminate_tasks()
+            logger.info("Dressage fully async rollout worker stopped")
 
     async def _run_group(self, group: list[Any], sampling_params: dict[str, Any]) -> list[Any]:
         if generate_and_rm_group is None:
@@ -538,7 +596,18 @@ def generate_rollout_fully_async(
 ):
     if evaluation:
         raise ValueError("Dressage fully async rollout does not support evaluation mode")
-    data, staleness_metrics = run(generate_rollout_async(args, rollout_id, data_buffer))
+    drain_final_worker = _should_drain_worker_on_rollout(args, rollout_id)
+    try:
+        data, staleness_metrics = run(
+            generate_rollout_async(args, rollout_id, data_buffer)
+        )
+    finally:
+        if drain_final_worker:
+            logger.info(
+                "final rollout %s ending; stopping fully async worker",
+                rollout_id,
+            )
+            stop_global_worker()
     metrics: dict[str, Any] = compute_multi_segment_metrics(
         [sample for group in data for sample in group]
     )

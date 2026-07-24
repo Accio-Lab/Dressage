@@ -203,10 +203,28 @@ DRESSAGE_PARTIAL_ROLLOUT_TARGET_GROUPS=<int>
 DRESSAGE_PARTIAL_ROLLOUT_TARGET_SAMPLES=<int>
 DRESSAGE_ROLLOUT_MAX_RETRIES=2
 DRESSAGE_ALLOW_EMPTY_TRAIN_BATCH=0
+
+# Blackbox sandbox prewarming for fully/partial async rollout.
+# Defaults to 1 for e2b and 0 for local_bwrap.
+DRESSAGE_SANDBOX_PREWARM=1
+DRESSAGE_SANDBOX_PREWARM_AHEAD=8
 ```
 
 > [!TIP]
 > Combine async modes with partial rollout via `train_async_with_rollout_pause` for proxy pause/resume around weight updates. This gives you the best of both worlds: continuous rollout without wasting computation on stale weights.
+
+Sandbox prewarming defaults to enabled for `e2b`, where it overlaps cloud
+sandbox provisioning, endpoint resolution, and health checks with current
+rollout work. It starts `paddock.init()` for upcoming prompt groups, then
+transfers the live lease to blackbox dispatch instead of creating a second
+sandbox. Unclaimed or cancelled prewarms are terminated during group or worker
+cleanup.
+`DRESSAGE_SANDBOX_PREWARM_AHEAD` counts prompt groups, so the maximum number of
+prefetched leases is approximately `ahead × n_samples_per_prompt`, which may
+increase concurrent E2B sandbox cost. `local_bwrap` defaults to disabled because
+its Ray manager already allocates from a pre-created slot pool; it can still be
+enabled explicitly for deployments where slot acquisition includes meaningful
+setup latency.
 
 </details>
 

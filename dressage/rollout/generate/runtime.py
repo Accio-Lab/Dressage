@@ -5,16 +5,24 @@ from __future__ import annotations
 import inspect
 import logging
 import os
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from dressage.config import proxy_url
-from dressage.proxy.proxy_client import ProxyClient
+
+if TYPE_CHECKING:
+    from dressage.proxy.proxy_client import ProxyClient as ProxyClientType
+else:
+    ProxyClientType = Any
+
+# Kept as an injection point for tests and embedders.  The real class is
+# imported lazily so scheduler-only processes do not load proxy/model deps.
+ProxyClient: Any = None
 
 logger = logging.getLogger(__name__)
 
 _PADDOCK = None
 _PADDOCK_BY_MODE: dict[tuple[str, str], Any] = {}
-_PROXY_CLIENT: ProxyClient | None = None
+_PROXY_CLIENT: ProxyClientType | None = None
 
 _PADDOCK_ENV_ARG_KEYS = (
     "sandbox_timeout_sec",
@@ -30,9 +38,14 @@ async def maybe_await(value: Any) -> Any:
     return value
 
 
-def get_proxy_client() -> ProxyClient:
-    global _PROXY_CLIENT
+def get_proxy_client() -> ProxyClientType:
+    global _PROXY_CLIENT, ProxyClient
     if _PROXY_CLIENT is None:
+        if ProxyClient is None:
+            from dressage.proxy.proxy_client import ProxyClient as ProxyClientClass
+
+            ProxyClient = ProxyClientClass
+
         _PROXY_CLIENT = ProxyClient(proxy_url())
     return _PROXY_CLIENT
 

@@ -112,6 +112,32 @@ def test_blackbox_async_scripts_record_token_versions_for_staleness():
         assert "--record-token-versions" in source
 
 
+def test_blackbox_async_scripts_propagate_provider_prewarm_config():
+    defaults_source = Path("examples/scripts/default/dressage_env_defaults.sh").read_text()
+    assert 'if [[ "${DRESSAGE_SANDBOX_PROVIDER}" == "e2b" ]]; then' in defaults_source
+    assert "DRESSAGE_SANDBOX_PREWARM=1" in defaults_source
+    assert "DRESSAGE_SANDBOX_PREWARM=0" in defaults_source
+    assert (
+        'DRESSAGE_SANDBOX_PREWARM_AHEAD="${DRESSAGE_SANDBOX_PREWARM_AHEAD:-8}"'
+        in defaults_source
+    )
+
+    script_paths = [
+        Path("examples/scripts/run_blackbox_qwen3.5_4b_async_local.sh"),
+        Path("examples/scripts/run_blackbox_qwen3.5_4b_async_remote.sh"),
+        Path("examples/scripts/run_blackbox_qwen3.5_4b_partial_rollout_async_local.sh"),
+        Path("examples/scripts/run_blackbox_qwen3.5_4b_partial_rollout_async_remote.sh"),
+    ]
+
+    for path in script_paths:
+        source = path.read_text()
+        assert '"DRESSAGE_SANDBOX_PREWARM": "${DRESSAGE_SANDBOX_PREWARM}"' in source
+        assert (
+            '"DRESSAGE_SANDBOX_PREWARM_AHEAD": '
+            '"${DRESSAGE_SANDBOX_PREWARM_AHEAD}"'
+        ) in source
+
+
 def test_train_async_entrypoint_uses_slime_common_parser():
     source = Path("dressage/training/train_async_with_rollout_pause.py").read_text()
 
