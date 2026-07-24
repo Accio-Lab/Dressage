@@ -141,6 +141,7 @@ class BlackboxAgentPaddock(BlackboxPaddock):
         session_id: str,
         messages: list[dict[str, Any]],
         metadata: dict[str, Any] | None = None,
+        turn_id: str | None = None,
     ) -> dict[str, Any]:
         state = self._resolve_state(state)
         return await self._client.call_agent(
@@ -149,6 +150,7 @@ class BlackboxAgentPaddock(BlackboxPaddock):
             session_id=session_id,
             messages=messages,
             metadata=metadata,
+            turn_id=turn_id,
         )
 
     async def execute_cmd(

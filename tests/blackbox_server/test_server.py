@@ -126,6 +126,16 @@ class MaxStepsExceededAdapter(FakeAdapter):
         )
 
 
+class UnexpectedErrorAdapter(FakeAdapter):
+    async def send_message(
+        self,
+        session_context: SessionContext,
+        turn_context: TurnContext,
+        new_messages: list[Message],
+    ) -> AdapterResponse:
+        raise RuntimeError("boom: unexpected backend failure")
+
+
 class SlowAdapter(FakeAdapter):
     async def send_message(
         self,
@@ -705,6 +715,55 @@ def test_max_steps_exceeded_returns_429_without_marking_server_error(
     assert turn["error"]["error"] == "max_steps_exceeded"
     assert execute_response.status_code == 200
     assert execute_response.json()["stdout"] == "harvested"
+
+
+def test_unexpected_error_returns_500_and_desyncs_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    prompt_file: Path,
+):
+    """An unexpected exception must settle the turn instead of leaving it INFLIGHT."""
+
+    client = make_client(tmp_path, monkeypatch, UnexpectedErrorAdapter())
+
+    with client:
+        register_response = client.post("/v1/rollout/register", json=register_payload(prompt_file))
+        assert register_response.status_code == 200
+
+        response = client.post(
+            "/v1/sessions/sess-001/messages",
+            json={
+                "turn_id": "turn-boom",
+                "messages": [{"role": "user", "content": "trigger"}],
+            },
+        )
+        status_response = client.get("/v1/status")
+        session_response = client.get(
+            "/v1/sessions/sess-001",
+            params={"include_turns": "true"},
+        )
+        next_message_response = client.post(
+            "/v1/sessions/sess-001/messages",
+            json={
+                "turn_id": "turn-after-boom",
+                "messages": [{"role": "user", "content": "continue"}],
+            },
+        )
+
+    # The synchronous facade must return promptly with a 500 rather than hang.
+    assert response.status_code == 500
+    body = response.json()
+    assert body["error"] == "internal_error"
+    assert "Unexpected backend failure" in body["message"]
+    # Adapter health still passes, so the server itself is not marked as errored.
+    assert status_response.json()["status"] == "ready"
+    # The turn is settled as UNKNOWN and the session is desynced (not stuck INFLIGHT).
+    assert session_response.json()["state"] == "desynced"
+    turn = session_response.json()["turn_ledger"]["turn-boom"]
+    assert turn["status"] == "unknown"
+    assert turn["error"]["error"] == "internal_error"
+    assert next_message_response.status_code == 409
+    assert "desynced" in next_message_response.json()["message"]
 
 
 def test_execute_cmd_success_and_default_timeout(

@@ -33,9 +33,12 @@ class SessionState(str, Enum):
 
 
 class TurnStatus(str, Enum):
-    INFLIGHT = "inflight"
-    COMMITTED = "committed"
-    UNKNOWN = "unknown"
+    QUEUED = "queued"        # accepted, not started yet
+    INFLIGHT = "inflight"    # backend call in flight
+    COMMITTED = "committed"  # succeeded
+    FAILED = "failed"        # deterministic failure (session not necessarily desynced)
+    CANCELLED = "cancelled"  # cancellation completed
+    UNKNOWN = "unknown"      # result unknown (timeout/process error); session -> DESYNCED
 
 
 class FunctionCall(BaseModel):
@@ -219,6 +222,7 @@ class MessageRequest(BaseModel):
     turn_id: str | None = None
     messages: list[Message]
     metadata: dict[str, Any] = Field(default_factory=dict)
+    mode: Literal["sync", "async"] = "sync"
 
 
 class MessageResponse(BaseModel):
@@ -231,6 +235,45 @@ class MessageResponse(BaseModel):
     outputs: list[Message]
     backend: BackendRef
     usage: TurnUsage
+
+
+class TurnSubmitResponse(BaseModel):
+    """202 Accepted response returned when a turn is submitted in async mode."""
+
+    request_id: str = ""
+    session_id: str
+    instance_id: str | None = None
+    turn_id: str
+    status: TurnStatus
+    idempotent_replay: bool = False
+
+
+class TurnStatusResponse(BaseModel):
+    """Snapshot returned by the long-poll turn status endpoint."""
+
+    request_id: str = ""
+    session_id: str
+    instance_id: str | None = None
+    turn_id: str
+    status: TurnStatus
+    state: SessionState
+    outputs: list[Message] | None = None
+    usage: TurnUsage | None = None
+    backend: BackendRef | None = None
+    error: dict[str, Any] | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class TurnCancelResponse(BaseModel):
+    """Response returned by the turn cancel endpoint."""
+
+    request_id: str = ""
+    session_id: str
+    instance_id: str | None = None
+    turn_id: str
+    status: str
+    state: SessionState
 
 
 class ExecuteCmdRequest(BaseModel):

@@ -94,7 +94,7 @@ BlackboxAgentPaddock
  | `init(traj_id)` | Builds a `SandboxSpec` containing a `blackbox` `SandboxServiceSpec`, calls provider `create()`, resolves the `blackbox` endpoint from `lease.endpoints` or `get_public_url()`, then initializes per-trajectory `SandboxState`. Unless `DRESSAGE_BLACKBOX_SKIP_HEALTHCHECK` is set, the endpoint is health-checked before use. |
  | `register_agent(...)` | Sends `POST /v1/rollout/register` to the BlackboxServer inside the sandbox. The server spawns the backend agent process, starts the in-process LLM proxy, and configures session routing. Idempotent — re-registration with same params is a no-op. |
  | `execute_cmd(...)` | Runs optional shell commands inside the sandbox. Used for per-sample setup: cloning repositories, installing dependencies, creating workspace directories. Commands are specified via `metadata["blackbox_execute_cmds"]`; parsed `before_agent` / `after_agent` results are accumulated in `metadata["execute_cmds"]`. |
- | `call_agent(...)` | Sends the task prompt to the agent via `POST /v1/sessions/{id}/messages`. Blocks until the agent completes or times out. The agent makes LLM calls through BlackboxServer's proxy, which routes through the Dressage proxy for recording. |
+ | `call_agent(...)` | Sends the task prompt to the agent via `POST /v1/sessions/{id}/messages`, reusing one stable `turn_id` across all submit retries (so retries are idempotent). Defaults to `mode="async"` (submit + long-poll `GET /v1/sessions/{id}/turns/{turn_id}?wait=…` until the turn settles); set `DRESSAGE_BLACKBOX_AGENT_CALL_MODE=sync` for the legacy request-bound call. Either way returns a payload matching the legacy synchronous body. The agent makes LLM calls through BlackboxServer's proxy, which routes through the Dressage proxy for recording. |
  | `pause / resume` | Coordinates with the proxy's `GenerationController` for weight updates. `pause` signals all active generation to abort at token boundaries; `resume` re-enables generation after the weight update completes. |
  | `terminate(traj_id)` | Cleanly shuts down the trajectory lease through provider `terminate()`. Guaranteed to run even on errors via try/finally. |
 
@@ -132,6 +132,9 @@ The singleton is created by `create_paddock_from_env()` on first call and cached
  | `DRESSAGE_BLACKBOX_TYPE` / `metadata["blackbox_type"]` | Select the backend agent type: `opencode` (default, code-editing), `openclaw` (OpenClaw gateway). Per-sample metadata can override the environment default. |
  | `DRESSAGE_BLACKBOX_MAX_STEPS` | Positive int forwarded to `backend_options.proxy.max_steps`; `0` disables the backend proxy step limit. |
  | `DRESSAGE_BLACKBOX_COMPACT_THRESHOLD` | Positive int no greater than the context window; controls backend compaction reserve sizing. |
+ | `DRESSAGE_BLACKBOX_AGENT_CALL_MODE` | `async` (default) or `sync`. `async` submits the turn (`202`) and long-polls `GET /turns/{turn_id}` until it settles; `sync` issues a request-bound `/messages` call and returns the result directly. Invalid values fall back to `async`. Both modes reuse one stable `turn_id` across submit retries. |
+ | `DRESSAGE_BLACKBOX_AGENT_POLL_WAIT_SEC` | Per-poll long-poll `wait` seconds for async mode (default `30`, server-clamped to `60`). |
+ | `DRESSAGE_BLACKBOX_AGENT_POLL_TOTAL_TIMEOUT_SEC` | Total client-side polling budget in seconds for async mode (default `0` = unbounded; the server `backend_timeout` remains the backstop). |
 
 > [!WARNING]
 > `blackbox_dispatch` rejects `DRESSAGE_PADDOCK_MODE=whitebox` at startup — use `whitebox_agent` generate function instead. This prevents accidental mode mismatches that would silently produce incorrect trajectories.
