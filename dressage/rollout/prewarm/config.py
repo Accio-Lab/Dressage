@@ -6,8 +6,6 @@ import os
 
 
 DEFAULT_PREWARM_AHEAD = 8
-_TRUE_VALUES = {"1", "true", "yes", "on"}
-_FALSE_VALUES = {"0", "false", "no", "off"}
 
 
 def prewarm_enabled() -> bool:
@@ -16,14 +14,13 @@ def prewarm_enabled() -> bool:
     if value is None or not value.strip():
         provider = os.environ.get("DRESSAGE_SANDBOX_PROVIDER", "").strip().lower()
         return provider == "e2b"
-    normalized = value.strip().lower()
-    if normalized in _TRUE_VALUES:
+    normalized = value.strip()
+    if normalized == "1":
         return True
-    if normalized in _FALSE_VALUES:
+    if normalized == "0":
         return False
     raise ValueError(
-        "DRESSAGE_SANDBOX_PREWARM must be one of "
-        f"{sorted(_TRUE_VALUES | _FALSE_VALUES)}, got {value!r}"
+        f"DRESSAGE_SANDBOX_PREWARM must be 0 or 1, got {value!r}"
     )
 
 

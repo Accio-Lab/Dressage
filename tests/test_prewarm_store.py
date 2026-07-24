@@ -224,13 +224,17 @@ def test_prewarm_config_defaults_to_e2b_only(monkeypatch) -> None:
 
     monkeypatch.setenv("DRESSAGE_SANDBOX_PROVIDER", "local_bwrap")
     assert prewarm_enabled() is False
-    monkeypatch.setenv("DRESSAGE_SANDBOX_PREWARM", "yes")
+    monkeypatch.setenv("DRESSAGE_SANDBOX_PREWARM", "1")
     assert prewarm_enabled() is True
-    monkeypatch.setenv("DRESSAGE_SANDBOX_PREWARM", "off")
+    monkeypatch.setenv("DRESSAGE_SANDBOX_PREWARM", "0")
     assert prewarm_enabled() is False
-    monkeypatch.setenv("DRESSAGE_SANDBOX_PREWARM", "sometimes")
-    with pytest.raises(ValueError, match="DRESSAGE_SANDBOX_PREWARM"):
-        prewarm_enabled()
+    for invalid in ("true", "false", "yes", "no", "on", "off", "sometimes", "2"):
+        monkeypatch.setenv("DRESSAGE_SANDBOX_PREWARM", invalid)
+        with pytest.raises(
+            ValueError,
+            match="DRESSAGE_SANDBOX_PREWARM must be 0 or 1",
+        ):
+            prewarm_enabled()
 
 
 @pytest.mark.asyncio
