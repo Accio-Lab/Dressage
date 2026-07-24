@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 from types import SimpleNamespace
 
 import httpx
@@ -107,6 +109,7 @@ async def _run_rollout_artifact_writer_writes_session_samples_and_error(
     )
     assert session_path == tmp_path / "payload" / "inst" / "bbs-sess" / "session.json"
     assert session_path.exists()
+    assert not (session_path.parent / "harbor" / "trajectory.json").exists()
 
     segment = {
         "uid": "seg-0",
@@ -140,6 +143,191 @@ async def _run_rollout_artifact_writer_writes_session_samples_and_error(
     )
     assert error_path == tmp_path / "errors" / "inst" / "bbs-sess" / "error.json"
     assert error_path.exists()
+
+
+def _trajectory_payload() -> dict:
+    return {
+        "success": True,
+        "mode": "trajectory",
+        "data": [
+            {
+                "uid": "segment-0",
+                "session_id": "bbs-sess",
+                "trajectory_id": "bbs-sess",
+                "instance_id": "inst",
+                "segment_index": 0,
+                "segment_count": 1,
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "done"},
+                ],
+                "tools": [],
+                "tokens": [1, 2],
+                "full_loss_mask": [0, 1],
+                "full_logprobs": [0.0, -0.1],
+                "extra_info": {"segment_reason": "initial"},
+            }
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_rollout_artifact_writer_exports_harbor_when_enabled(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("DRESSAGE_LOG_WRITE_MODE", "await")
+    monkeypatch.setenv("DRESSAGE_TRAJECTORY_PAYLOAD_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("DRESSAGE_HARBOR_ATIF_EXPORT", "true")
+    writer = RolloutArtifactWriter()
+
+    session_path = await writer.write_session_payload(
+        _trajectory_payload(),
+        session_id="bbs-sess",
+        instance_id="inst",
+    )
+
+    harbor_path = session_path.parent / "harbor" / "trajectory.json"
+    assert harbor_path.exists()
+    payload = json.loads(harbor_path.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == "ATIF-v1.7"
+    assert payload["session_id"] == "bbs-sess"
+
+
+@pytest.mark.asyncio
+async def test_rollout_artifact_writer_background_drain_waits_for_both_files(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("DRESSAGE_LOG_WRITE_MODE", "background")
+    monkeypatch.setenv("DRESSAGE_TRAJECTORY_PAYLOAD_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("DRESSAGE_HARBOR_ATIF_EXPORT", "1")
+    writer = RolloutArtifactWriter()
+
+    session_path = await writer.write_session_payload(
+        _trajectory_payload(),
+        session_id="bbs-sess",
+        instance_id="inst",
+    )
+    await writer.drain()
+
+    assert session_path.exists()
+    assert (session_path.parent / "harbor" / "trajectory.json").exists()
+    assert not writer._write_tasks
+
+
+@pytest.mark.asyncio
+async def test_rollout_artifact_writer_background_harbor_failure_logs_context(
+    monkeypatch,
+    tmp_path,
+    caplog,
+) -> None:
+    from dressage.rollout.artifacts import writer as writer_module
+
+    monkeypatch.setenv("DRESSAGE_LOG_WRITE_MODE", "background")
+    monkeypatch.setenv("DRESSAGE_TRAJECTORY_PAYLOAD_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("DRESSAGE_HARBOR_ATIF_EXPORT", "1")
+    write_json_file_atomic = writer_module._write_json_file_atomic
+
+    def fail_harbor_write(output_path, payload):
+        if output_path.name == "trajectory.json":
+            raise OSError("simulated Harbor disk failure")
+        return write_json_file_atomic(output_path, payload)
+
+    monkeypatch.setattr(writer_module, "_write_json_file_atomic", fail_harbor_write)
+    writer = RolloutArtifactWriter()
+
+    with caplog.at_level(logging.WARNING):
+        session_path = await writer.write_session_payload(
+            _trajectory_payload(),
+            session_id="bbs-background-failure",
+            instance_id="inst-background-failure",
+        )
+        await writer.drain()
+
+    assert session_path.exists()
+    assert not (session_path.parent / "harbor" / "trajectory.json").exists()
+    assert "simulated Harbor disk failure" in caplog.text
+    assert "bbs-background-failure" in caplog.text
+    assert "inst-background-failure" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_rollout_artifact_writer_skips_empty_harbor_payload(
+    monkeypatch,
+    tmp_path,
+    caplog,
+) -> None:
+    monkeypatch.setenv("DRESSAGE_LOG_WRITE_MODE", "await")
+    monkeypatch.setenv("DRESSAGE_TRAJECTORY_PAYLOAD_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("DRESSAGE_HARBOR_ATIF_EXPORT", "yes")
+    writer = RolloutArtifactWriter()
+
+    with caplog.at_level(logging.WARNING):
+        session_path = await writer.write_session_payload(
+            {"success": True, "data": []},
+            session_id="bbs-empty",
+            instance_id="inst",
+        )
+
+    assert session_path.exists()
+    assert not (session_path.parent / "harbor" / "trajectory.json").exists()
+    assert "contains no segments" in caplog.text
+    assert "bbs-empty" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_rollout_artifact_writer_keeps_session_when_harbor_conversion_fails(
+    monkeypatch,
+    tmp_path,
+    caplog,
+) -> None:
+    from dressage.rollout.artifacts import writer as writer_module
+
+    monkeypatch.setenv("DRESSAGE_LOG_WRITE_MODE", "await")
+    monkeypatch.setenv("DRESSAGE_TRAJECTORY_PAYLOAD_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("DRESSAGE_HARBOR_ATIF_EXPORT", "on")
+    monkeypatch.setattr(
+        writer_module,
+        "trajectory_payload_to_harbor",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("bad ATIF")),
+    )
+    writer = RolloutArtifactWriter()
+
+    with caplog.at_level(logging.WARNING):
+        session_path = await writer.write_session_payload(
+            _trajectory_payload(),
+            session_id="bbs-sess",
+            instance_id="inst",
+        )
+
+    assert session_path.exists()
+    assert not (session_path.parent / "harbor" / "trajectory.json").exists()
+    assert "bad ATIF" in caplog.text
+    assert "bbs-sess" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_invalid_harbor_export_flag_is_disabled(
+    monkeypatch,
+    tmp_path,
+    caplog,
+) -> None:
+    monkeypatch.setenv("DRESSAGE_LOG_WRITE_MODE", "await")
+    monkeypatch.setenv("DRESSAGE_TRAJECTORY_PAYLOAD_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("DRESSAGE_HARBOR_ATIF_EXPORT", "sometimes")
+    writer = RolloutArtifactWriter()
+
+    with caplog.at_level(logging.WARNING):
+        session_path = await writer.write_session_payload(
+            _trajectory_payload(),
+            session_id="bbs-sess",
+            instance_id="inst",
+        )
+
+    assert session_path.exists()
+    assert not (session_path.parent / "harbor" / "trajectory.json").exists()
+    assert "DRESSAGE_HARBOR_ATIF_EXPORT" in caplog.text
 
 
 def test_lifecycle_terminate_timeout_can_be_drained(monkeypatch):

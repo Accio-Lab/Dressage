@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import asdict, is_dataclass
 from enum import Enum
+from functools import partial
 import json
 import logging
 import os
@@ -17,6 +18,7 @@ import uuid
 import httpx
 
 from dressage.config import trajectory_error_log_dir, trajectory_payload_log_dir
+from dressage.rollout.artifacts.harbor_convert import trajectory_payload_to_harbor
 from dressage.rollout.artifacts.samples import (
     copy_sample_with_metadata,
     sample_artifact_payload,
@@ -32,7 +34,13 @@ class RolloutArtifactWriter:
     def __init__(self) -> None:
         self._write_tasks: set[asyncio.Future] = set()
 
-    async def write_json(self, output_path: Path, payload: Any) -> Path:
+    async def write_json(
+        self,
+        output_path: Path,
+        payload: Any,
+        *,
+        failure_context: str | None = None,
+    ) -> Path:
         payload = json_safe(payload)
         if _log_write_mode() == "await":
             return await asyncio.to_thread(_write_json_file_atomic, output_path, payload)
@@ -52,7 +60,13 @@ class RolloutArtifactWriter:
             return output_path
 
         self._write_tasks.add(task)
-        task.add_done_callback(self._discard_write_task)
+        task.add_done_callback(
+            partial(
+                self._discard_write_task,
+                output_path=output_path,
+                failure_context=failure_context,
+            )
+        )
         return output_path
 
     async def drain(self) -> None:
@@ -70,7 +84,57 @@ class RolloutArtifactWriter:
         output_dir = _rollout_log_dir(session_id=session_id, instance_id=instance_id)
         if output_dir is None:
             return None
-        return await self.write_json(output_dir / "session.json", trajectory_payload)
+        session_path = await self.write_json(
+            output_dir / "session.json",
+            trajectory_payload,
+        )
+        if _harbor_atif_export_enabled():
+            try:
+                await self.write_harbor_trajectory(
+                    trajectory_payload,
+                    session_id=session_id,
+                    instance_id=instance_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "failed to export Harbor ATIF trajectory for "
+                    "session_id=%s instance_id=%s: %s",
+                    session_id,
+                    instance_id,
+                    exception_summary(exc),
+                    exc_info=True,
+                )
+        return session_path
+
+    async def write_harbor_trajectory(
+        self,
+        trajectory_payload: dict[str, Any],
+        *,
+        session_id: str,
+        instance_id: str,
+        agent: dict[str, Any] | None = None,
+    ) -> Path | None:
+        """Convert and persist one trajectory as Harbor ATIF-v1.7."""
+        output_dir = _rollout_log_dir(
+            session_id=session_id,
+            instance_id=instance_id,
+        )
+        if output_dir is None:
+            return None
+        harbor_payload = trajectory_payload_to_harbor(
+            trajectory_payload,
+            session_id=session_id,
+            instance_id=instance_id,
+            agent=agent,
+        )
+        return await self.write_json(
+            output_dir / "harbor" / "trajectory.json",
+            harbor_payload,
+            failure_context=(
+                "Harbor ATIF trajectory for "
+                f"session_id={session_id} instance_id={instance_id}"
+            ),
+        )
 
     async def write_error(
         self,
@@ -180,14 +244,26 @@ class RolloutArtifactWriter:
         )
         return await self.write_json(output_path, payload)
 
-    def _discard_write_task(self, task: asyncio.Future) -> None:
+    def _discard_write_task(
+        self,
+        task: asyncio.Future,
+        *,
+        output_path: Path,
+        failure_context: str | None,
+    ) -> None:
         self._write_tasks.discard(task)
         try:
             task.result()
         except asyncio.CancelledError:
             pass
         except Exception:
-            logger.warning("background log write failed", exc_info=True)
+            context = f" ({failure_context})" if failure_context else ""
+            logger.warning(
+                "background log write failed for path=%s%s",
+                output_path,
+                context,
+                exc_info=True,
+            )
 
 
 DEFAULT_WRITER = RolloutArtifactWriter()
@@ -354,6 +430,19 @@ def _log_write_mode() -> str:
         mode,
     )
     return "background"
+
+
+def _harbor_atif_export_enabled() -> bool:
+    value = os.environ.get("DRESSAGE_HARBOR_ATIF_EXPORT", "").strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"", "0", "false", "no", "off"}:
+        return False
+    logger.warning(
+        "invalid DRESSAGE_HARBOR_ATIF_EXPORT=%r; Harbor export is disabled",
+        value,
+    )
+    return False
 
 
 def _rollout_log_dir(
