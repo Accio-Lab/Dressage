@@ -1,0 +1,48 @@
+{
+  "base_model": "../../../models/Qwen3.5-4B",
+  "reward_modules": [
+    "dressage.recipes.alfworld.reward",
+    "dressage.recipes.hotpotqa.reward"
+  ],
+  "runtime_env_keys": [
+    "ALFWORLD_MAX_STEPS",
+    "ALFWORLD_MAX_EPISODE_STEPS",
+    "HOTPOTQA_CORPUS_DIR",
+    "HOTPOTQA_EMBEDDING_MODEL",
+    "HOTPOTQA_EMBEDDING_DEVICE",
+    "HOTPOTQA_TOPK",
+    "HOTPOTQA_MAX_STEPS",
+    "HOTPOTQA_MAX_PARALLEL_CALLS",
+    "HOTPOTQA_FORCE_FIRST_SEARCH",
+    "HOTPOTQA_PASSAGE_MAX_CHARS",
+    "HOTPOTQA_FEEDBACK_RING_SIZE"
+  ],
+  "teachers": {
+    "alfworld": {
+      "load": "../../../outputs/checkpoints/alfworld-teacher",
+      "ckpt_step": 10
+    },
+    "hotpotqa": {
+      "load": "../../../outputs/checkpoints/hotpotqa-teacher",
+      "ckpt_step": 120
+    }
+  },
+  "datasets": [
+    {
+      "name": "alfworld",
+      "path": "../../../data/alfworld/train.jsonl",
+      "teacher_id": "alfworld",
+      "weight": 1.0,
+      "agent_mode": "whitebox",
+      "generate_function_path": "dressage.recipes.alfworld.agent_whitebox.generate"
+    },
+    {
+      "name": "hotpotqa",
+      "path": "../../../data/hotpotqa/train.jsonl",
+      "teacher_id": "hotpotqa",
+      "weight": 1.0,
+      "agent_mode": "whitebox",
+      "generate_function_path": "dressage.recipes.hotpotqa.agent_whitebox.generate"
+    }
+  ]
+}

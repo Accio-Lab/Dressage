@@ -20,10 +20,11 @@ Dressage lets you train diverse types of LLM agents that use real tools — like
 - [License](#-license)
 
 ## 📢 News
+- **[2026/07/23] Support for Multi-Teacher OPD (MOPD):** Train a single student across any agent with multiple frozen teachers, routing each dataset to its assigned teacher while serially rotating teachers through shared GPU model buffers. Read the [technical guide](docs/mopd.md).
 - **[2026/07/19]** **Integrated [Harbor](docs/harbor.md) for rollout and training:** Harbor orchestrates task execution and evaluation, while Dressage handles model routing and trajectory collection.
 - **[2026/07/09]** **Multi-Agent Training.** From Timeline to Lineage, **Lineage-aware TITO** builds correct multi-agent training trajectories by reconstructing context inheritance across main-agent and subagent calls. Read the [technical deep dive](https://zhuanlan.zhihu.com/p/2059302405888537724).
 - **[2026/07/04]** **Multi-Harness Training.** Supports [Claude Code](https://github.com/anthropics/claude-code) and [Codex](https://github.com/openai/codex), and you can train multiple harnesses in a single [script](https://github.com/huang3eng/Dressage/blob/main/examples/scripts/run_blackbox_qwen3.5_4b_async_local.sh).
-- **[2026/06/30]**  Released [whitebox agent training curves](dressage/recipes/README.md) and [true staleness control](docs/staleness.md).
+- **[2026/06/30]**  **Released**  [Whitebox agent training curves](dressage/recipes/README.md) and [True Staleness Control](docs/staleness.md).
 - **[2026/06/20]**  **Dressage is now open source!**
 
 

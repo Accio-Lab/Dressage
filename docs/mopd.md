@@ -1,0 +1,126 @@
+# Metadata-routed multi-teacher OPD
+
+Dressage MOPD trains one Megatron student from multiple frozen Megatron
+teachers on the same actor GPUs. Every teacher and the student must have the
+same architecture, tokenizer, vocabulary, and token IDs.
+
+Teachers are not separate services. During actor initialization, each teacher
+checkpoint is loaded once and copied into Slime's existing pinned-CPU
+`TensorBackuper`. For every local training batch the actor groups samples by
+`teacher_id`, restores one teacher onto the shared GPU model buffers, scores
+that teacher's subset, and then restores the student before training. GPU model
+memory is reused; CPU memory grows with the number of teachers.
+
+## Experiment snapshot
+
+The figure below shows a 20-step MOPD run on ALFWorld and HotpotQA with seed
+1234. Dark lines are centered five-step rolling means, and light lines are raw
+step values.
+
+![MOPD open training dynamics](../assets/mopd_open_dynamics_8panel.png)
+
+The two domains show different distillation dynamics. HotpotQA's routed MOPD
+K1 falls from about 0.22 to 0.04, while ALFWorld starts much lower and stays
+between 0.003 and 0.005. Global routed K1 declines steadily, and both trainable
+trajectory reward curves finish above their early values. Gradient norm
+decreases without a sustained spike, while policy entropy and the
+train-rollout log-probability gap remain stable.
+
+This run is primarily a mechanism and stability check: it confirms that both
+teachers remain active and that distillation proceeds without destabilizing
+training. Because it covers one seed with changing training prompts and has no
+matched control, it should not be read as a held-out capability comparison.
+
+## Native Slime boundaries
+
+The implementation uses:
+
+- `Sample.generate_function_path` for per-dataset rollout dispatch;
+- Dressage's existing custom train-data converter to place `teacher_id` in
+  Slime's native train-side `prompt` passthrough field;
+- upstream `create_training_models(..., actor_cls=...)` to install the
+  Dressage-owned rotating actor without monkey-patching a Slime module;
+- Slime's `TensorBackuper`, checkpoint loader, `compute_log_prob`, DP
+  partitioning, and OPD loss.
+
+The small `dressage.training.mopd_train` driver mirrors upstream `train.py`
+because upstream exposes `actor_cls` at the model factory but not yet on the
+stock CLI. Compatibility tests detect drift in this factory contract.
+
+There is no MOPD code under `dressage/rollout/generate` and no Slime source
+patch.
+
+## Configuration
+
+Start from
+`examples/data/mopd/mopd_alfworld_hotpotqa.example.json`. Important fields:
+
+- `teachers.<id>.load`: frozen Megatron checkpoint root;
+- `teachers.<id>.ckpt_step`: optional checkpoint iteration;
+- `datasets[].teacher_id`: authoritative teacher for that dataset;
+- `datasets[].weight`: smooth weighted-round-robin sampling weight;
+- `datasets[].agent_mode`: `blackbox` or `whitebox`;
+- `datasets[].generate_function_path`: required for whitebox data and optional
+  for a specialized blackbox implementation;
+- `reward_modules`: task reward registration modules;
+- `runtime_env_keys`: task-specific environment variables copied to Ray.
+
+There is no domain router or default teacher. The data source writes direct
+`metadata["teacher_id"]` and the native `Sample.generate_function_path`.
+Conversion validates the route and fails before training if multi-segment
+siblings disagree.
+
+## Per-step execution
+
+For every DP-local batch:
+
+1. Decode one teacher ID per sample from the native train-data passthrough.
+2. Build compact dynamic microbatches for the first distinct teacher.
+3. Restore that teacher from pinned CPU memory to the shared model buffers.
+4. Compute response-token log-probabilities only for its routed samples.
+5. Repeat for other distinct teachers and scatter results to original order.
+6. Restore the student/old actor.
+7. Let stock Slime compute student log-probs, OPD advantages, backward, and the
+   optimizer step.
+
+The launcher intentionally uses:
+
+```text
+--use-opd --opd-type megatron --opd-teacher-load <first-teacher>
+```
+
+The first teacher path satisfies Slime's stock argument validation and tells
+the actor factory that an OPD teacher is needed. `MOPDMegatronTrainRayActor`
+suppresses the stock single-teacher load and loads all configured named
+teachers instead.
+
+## Launch
+
+```bash
+export DRESSAGE_MOPD_TEACHER_CONFIG=/path/to/mopd.json
+
+TP_SIZE=4 \
+CP_SIZE=1 \
+ROLLOUT_BATCH_SIZE=16 \
+N_SAMPLES_PER_PROMPT=8 \
+GLOBAL_BATCH_SIZE=128 \
+bash examples/scripts/run_mopd_qwen3.5_sync.sh
+```
+
+Enable W&B without placing credentials in the trainer command line:
+
+```bash
+USE_WANDB=1 \
+WANDB_PROJECT=slime-dev \
+WANDB_GROUP=mopd-alfworld-hotpotqa \
+bash examples/scripts/run_mopd_qwen3.5_sync.sh
+```
+
+In addition to Slime's global training metrics, Dressage logs per-teacher
+trainable-trajectory reward and sampled-token reverse-KL curves under
+`rollout/mopd/raw_reward_trainable_trajectory_mean/<teacher_id>` and
+`rollout/mopd/opd_reverse_kl_train_aggregation_mean/<teacher_id>`.
+`SEED` and `ROLLOUT_SEED` are forwarded explicitly by the launcher.
+
+No teacher process is started separately. Checkpoint paths are validated by
+the launcher, and all teacher loading happens inside the student actor group.

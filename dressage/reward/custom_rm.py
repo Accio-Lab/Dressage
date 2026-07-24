@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Any
 
 from dressage.reward import call_reward_fn, load_reward_modules
@@ -21,6 +22,13 @@ async def _score_one(args: Any, sample: Any, **kwargs: Any) -> float:
     global _MODULES_LOADED
     if not _MODULES_LOADED:
         load_reward_modules()
+        config_path = getattr(args, "mopd_teacher_config", None) or os.environ.get(
+            "DRESSAGE_MOPD_TEACHER_CONFIG"
+        )
+        if config_path:
+            from dressage.rollout.mopd import load_mopd_config
+
+            load_reward_modules(load_mopd_config(str(config_path)).reward_modules)
         _MODULES_LOADED = True
     return await call_reward_fn(_reward_name(sample), sample, args=args, **kwargs)
 
