@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import Any
 
@@ -18,6 +19,11 @@ from dressage.paddock.blackbox.common.utils import (
     _validate_public_proxy_url,
 )
 from dressage.paddock.interface import BlackboxPaddock
+from dressage.paddock.lifecycle import (
+    schedule_lifecycle_task,
+    terminate_provider_lease_best_effort,
+    terminate_when_provider_create_finishes,
+)
 from dressage.sandbox import SandboxEndpoint, SandboxLease, SandboxServiceSpec, SandboxSpec
 from dressage.sandbox.factory import create_sandbox_provider_from_env
 from dressage.sandbox.provider import SandboxProvider
@@ -77,32 +83,70 @@ class BlackboxAgentPaddock(BlackboxPaddock):
             timeout_sec=env_args.get("sandbox_timeout_sec"),
             metadata={"paddock_mode": "blackbox"},
         )
-        lease = await self._provider.create(spec)
-        endpoint = lease.endpoints.get("blackbox")
-        if endpoint is None:
-            endpoint = await self._provider.get_public_url(
-                lease,
-                port=spec.services[0].port,
-                service_name="blackbox",
-            )
-            lease.endpoints["blackbox"] = endpoint
-        endpoint = endpoint.normalized()
-        if self._wait_health:
-            await self._client.health(endpoint)
-        self._leases[traj_id] = lease
-        state = SandboxState(
-            trajectory_id=traj_id,
-            sandbox_url=endpoint.url,
-            sandbox_id=lease.sandbox_id,
-            raw_register_response={
-                "provider": lease.provider,
-                "sandbox_id": lease.sandbox_id,
-                "metadata": lease.metadata,
-                "endpoints": {
-                    name: endpoint.url for name, endpoint in lease.endpoints.items()
-                },
-            },
+        create_task = asyncio.create_task(
+            self._provider.create(spec),
+            name=f"sandbox-create:{traj_id}",
         )
+        try:
+            lease = await asyncio.shield(create_task)
+        except asyncio.CancelledError:
+            # The provider request may still create a remote sandbox after the
+            # caller is cancelled.  Transfer ownership to an independently
+            # tracked lifecycle task before propagating cancellation.
+            schedule_lifecycle_task(
+                terminate_when_provider_create_finishes(
+                    self._provider,
+                    create_task,
+                    trajectory_id=traj_id,
+                ),
+                name=f"sandbox-create-cleanup:{traj_id}",
+            )
+            raise
+        try:
+            endpoint = lease.endpoints.get("blackbox")
+            if endpoint is None:
+                endpoint = await self._provider.get_public_url(
+                    lease,
+                    port=spec.services[0].port,
+                    service_name="blackbox",
+                )
+                lease.endpoints["blackbox"] = endpoint
+            endpoint = endpoint.normalized()
+            if self._wait_health:
+                await self._client.health(endpoint)
+            state = SandboxState(
+                trajectory_id=traj_id,
+                sandbox_url=endpoint.url,
+                sandbox_id=lease.sandbox_id,
+                raw_register_response={
+                    "provider": lease.provider,
+                    "sandbox_id": lease.sandbox_id,
+                    "metadata": lease.metadata,
+                    "endpoints": {
+                        name: endpoint.url
+                        for name, endpoint in lease.endpoints.items()
+                    },
+                },
+            )
+        except BaseException as exc:
+            # provider.create() succeeded but a subsequent step failed.
+            # Track termination independently so repeated caller cancellation
+            # cannot interrupt cleanup and orphan the lease.
+            cleanup_task = schedule_lifecycle_task(
+                terminate_provider_lease_best_effort(
+                    self._provider,
+                    lease,
+                    trajectory_id=traj_id,
+                ),
+                name=f"sandbox-init-cleanup:{traj_id}",
+            )
+            self._leases.pop(traj_id, None)
+            self._states.pop(traj_id, None)
+            if not isinstance(exc, asyncio.CancelledError):
+                await asyncio.shield(cleanup_task)
+            raise
+
+        self._leases[traj_id] = lease
         self._states[traj_id] = state
         return state
 

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
+import logging
 import os
 from typing import Any, Callable
 
@@ -14,6 +16,8 @@ from dressage.sandbox.types import (
 )
 
 _SANDBOX_CMD_STDIO_METADATA_LIMIT = 4096
+
+logger = logging.getLogger(__name__)
 
 
 class E2BSandboxProvider:
@@ -59,16 +63,39 @@ class E2BSandboxProvider:
             **{str(k): str(v) for k, v in _dict_extra_param(extra_params, "e2b_metadata").items()},
         }
         timeout = int(spec.timeout_sec or self.timeout_sec)
-        sandbox = await _maybe_await(
-            _call_create(
-                factory,
-                template=template,
-                timeout=timeout,
-                metadata=metadata,
-                envs=envs,
-                api_key=self.api_key,
-            )
+        create_task = asyncio.create_task(
+            _maybe_await(
+                _call_create(
+                    factory,
+                    template=template,
+                    timeout=timeout,
+                    metadata=metadata,
+                    envs=envs,
+                    api_key=self.api_key,
+                )
+            ),
+            name=f"e2b-create:{spec.trajectory_id}",
         )
+        try:
+            sandbox = await asyncio.shield(create_task)
+        except asyncio.CancelledError:
+            # Match the provider-owned cleanup contract used by the original
+            # Harness implementation.  The E2B request may still finish after
+            # its caller is cancelled, so wait for the SDK object and kill it
+            # before propagating cancellation.
+            try:
+                sandbox = await _await_task_ignoring_external_cancellation(
+                    create_task
+                )
+            except BaseException:
+                pass
+            else:
+                kill_task = asyncio.create_task(
+                    _best_effort_kill(sandbox),
+                    name=f"e2b-cancel-kill:{spec.trajectory_id}",
+                )
+                await _await_task_ignoring_external_cancellation(kill_task)
+            raise
         sandbox_id = _sandbox_id(sandbox)
         lease = SandboxLease(
             trajectory_id=spec.trajectory_id,
@@ -85,40 +112,40 @@ class E2BSandboxProvider:
             },
             raw=sandbox,
         )
-        if sandbox_cmds:
-            try:
+        try:
+            if sandbox_cmds:
                 sandbox_cmd_results = await self._run_sandbox_cmds(
                     lease,
                     sandbox_cmds,
                     timeout=timeout,
                 )
-            except Exception:
-                await _best_effort_kill(sandbox)
-                raise
-            lease.metadata["sandbox_cmd_results"] = sandbox_cmd_results
-            lease.metadata["sandbox_cmd_result"] = sandbox_cmd_results[-1]
-        for service in spec.services:
-            try:
-                lease.endpoints[service.name] = await self.get_public_url(
-                    lease,
-                    port=service.port,
-                    service_name=service.name,
-                )
-            except Exception:
-                # Keep create usable for pure whitebox templates even when no
-                # port exposure is available in a mock or older SDK.
-                if service.name == "blackbox":
-                    raise
+                lease.metadata["sandbox_cmd_results"] = sandbox_cmd_results
+                lease.metadata["sandbox_cmd_result"] = sandbox_cmd_results[-1]
+            for service in spec.services:
+                try:
+                    lease.endpoints[service.name] = await self.get_public_url(
+                        lease,
+                        port=service.port,
+                        service_name=service.name,
+                    )
+                except Exception:
+                    # Keep create usable for pure whitebox templates even when no
+                    # port exposure is available in a mock or older SDK.
+                    if service.name == "blackbox":
+                        raise
+        except BaseException:
+            await _best_effort_kill(sandbox)
+            raise
         self._sandboxes[spec.trajectory_id] = sandbox
         return lease
 
     async def terminate(self, lease: SandboxLease | str) -> dict[str, Any]:
         trajectory_id = lease if isinstance(lease, str) else lease.trajectory_id
-        sandbox = None if isinstance(lease, str) else lease.raw
-        sandbox = sandbox or self._sandboxes.pop(trajectory_id, None)
+        # Pop ownership before awaiting kill so concurrent/repeated terminate
+        # calls cannot invoke the paid sandbox teardown more than once.
+        sandbox = self._sandboxes.pop(trajectory_id, None)
         if sandbox is None:
             return {"terminated": False, "trajectory_id": trajectory_id, "missing": True}
-        self._sandboxes.pop(trajectory_id, None)
         kill = getattr(sandbox, "kill", None)
         if kill is None:
             return {"terminated": False, "trajectory_id": trajectory_id, "missing_kill": True}
@@ -374,8 +401,24 @@ async def _best_effort_kill(sandbox: Any) -> None:
         return
     try:
         await _maybe_await(kill())
-    except Exception:
-        return
+    except Exception as exc:
+        logger.warning(
+            "failed to kill E2B sandbox sandbox_id=%s: %s",
+            _sandbox_id(sandbox),
+            exc,
+        )
+
+
+async def _await_task_ignoring_external_cancellation(
+    task: asyncio.Task[Any],
+) -> Any:
+    """Wait for an owned task even if the current task is cancelled again."""
+    while True:
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.cancelled():
+                raise
 
 
 def _sandbox_cmd_result_summary(result: CommandResult) -> dict[str, Any]:

@@ -4,6 +4,7 @@ import asyncio
 from typing import Any
 
 import httpx
+import pytest
 
 from dressage.paddock.blackbox.paddock import BlackboxAgentPaddock
 from dressage.paddock.whitebox.paddock import WhiteboxToolPaddock
@@ -127,3 +128,82 @@ async def _run_whitebox_tool_paddock_maps_tools_to_provider():
     text, meta = await paddock.tool_call("traj-1", "file.read", {"path": "/workspace/a.txt"})
     assert text == "abc"
     assert meta["chars"] == 3
+
+
+# ---------------------------------------------------------------------------
+# paddock.init() exception safety: provider.terminate called on health failure
+# ---------------------------------------------------------------------------
+
+def test_blackbox_agent_paddock_init_terminates_on_health_failure():
+    asyncio.run(_run_init_terminates_on_health_failure())
+
+
+async def _run_init_terminates_on_health_failure():
+    """When health check fails after provider.create(), the lease is terminated."""
+    provider = FakeProvider()
+    paddock = BlackboxAgentPaddock(
+        provider=provider,
+        proxy_public_url="http://proxy.test",
+        wait_health=True,
+    )
+
+    # Make health check raise
+    async def failing_health(endpoint):
+        raise ConnectionError("sandbox not reachable")
+
+    from dressage.paddock.blackbox.client import BlackboxServerClient
+
+    paddock._client = BlackboxServerClient()
+    paddock._client.health = failing_health
+
+    with pytest.raises(ConnectionError, match="sandbox not reachable"):
+        await paddock.init("traj-health-fail")
+
+    # provider.terminate was called with the lease from create
+    assert len(provider.terminated) == 1
+    assert provider.terminated[0].trajectory_id == "traj-health-fail"
+
+    # lease and state are NOT registered
+    assert "traj-health-fail" not in paddock._leases
+    assert "traj-health-fail" not in paddock._states
+
+
+# ---------------------------------------------------------------------------
+# paddock.init() exception safety: terminate failure does not swallow original
+# ---------------------------------------------------------------------------
+
+def test_blackbox_agent_paddock_init_raises_original_when_terminate_fails():
+    asyncio.run(_run_init_raises_original_when_terminate_fails())
+
+
+async def _run_init_raises_original_when_terminate_fails():
+    """If terminate itself fails during cleanup, the original error is still raised."""
+    provider = FakeProvider()
+
+    # Make terminate fail
+    async def broken_terminate(lease):
+        raise RuntimeError("terminate broken")
+
+    provider.terminate = broken_terminate
+
+    paddock = BlackboxAgentPaddock(
+        provider=provider,
+        proxy_public_url="http://proxy.test",
+        wait_health=True,
+    )
+
+    async def failing_health(endpoint):
+        raise ConnectionError("health check failed")
+
+    from dressage.paddock.blackbox.client import BlackboxServerClient
+
+    paddock._client = BlackboxServerClient()
+    paddock._client.health = failing_health
+
+    # Original ConnectionError is raised, not the RuntimeError from terminate
+    with pytest.raises(ConnectionError, match="health check failed"):
+        await paddock.init("traj-term-fail")
+
+    # State is still cleaned up despite terminate failure
+    assert "traj-term-fail" not in paddock._leases
+    assert "traj-term-fail" not in paddock._states

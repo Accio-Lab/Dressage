@@ -238,6 +238,61 @@ def test_generate_runtime_get_paddock_from_env_mode_rules(monkeypatch):
     assert isinstance(paddock, RuntimeDummyPaddock)
 
 
+def test_generate_runtime_caches_paddocks_by_explicit_mode(monkeypatch):
+    import dressage.paddock.factory as paddock_factory
+
+    previous = generate_runtime._PADDOCK
+    previous_by_mode = generate_runtime._PADDOCK_BY_MODE
+    created = []
+
+    def create_paddock_from_env(*, mode=None):
+        paddock = RuntimeDummyPaddock()
+        created.append((mode, paddock))
+        return paddock
+
+    monkeypatch.delenv("DRESSAGE_PADDOCK_CLASS", raising=False)
+    monkeypatch.setattr(
+        paddock_factory,
+        "create_paddock_from_env",
+        create_paddock_from_env,
+    )
+    generate_runtime._PADDOCK = None
+    generate_runtime._PADDOCK_BY_MODE = {}
+    try:
+        blackbox = generate_runtime.get_paddock_from_env(
+            allow_whitebox_mode=False,
+            mode="blackbox",
+        )
+        assert (
+            generate_runtime.get_paddock_from_env(
+                allow_whitebox_mode=False,
+                mode="blackbox",
+            )
+            is blackbox
+        )
+
+        whitebox = generate_runtime.get_paddock_from_env(
+            allow_whitebox_mode=True,
+            mode="whitebox",
+        )
+        assert (
+            generate_runtime.get_paddock_from_env(
+                allow_whitebox_mode=True,
+                mode="whitebox",
+            )
+            is whitebox
+        )
+    finally:
+        generate_runtime._PADDOCK = previous
+        generate_runtime._PADDOCK_BY_MODE = previous_by_mode
+
+    assert blackbox is not whitebox
+    assert [(mode, type(paddock)) for mode, paddock in created] == [
+        ("blackbox", RuntimeDummyPaddock),
+        ("whitebox", RuntimeDummyPaddock),
+    ]
+
+
 def test_generate_runtime_get_paddock_from_env_class_override(monkeypatch):
     previous = generate_runtime._PADDOCK
     monkeypatch.setenv(
