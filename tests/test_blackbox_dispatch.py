@@ -3,12 +3,21 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
+import types
 
 import httpx
 import pytest
 from dataclasses import dataclass, field
 from enum import Enum
 from types import SimpleNamespace
+
+try:
+    import transformers  # noqa: F401
+except ModuleNotFoundError:
+    transformers = types.ModuleType("transformers")
+    transformers.AutoTokenizer = type("AutoTokenizer", (), {})
+    sys.modules["transformers"] = transformers
 
 from dressage.paddock import lifecycle as paddock_lifecycle
 from dressage.paddock.blackbox.common.defaults import (
@@ -17,6 +26,8 @@ from dressage.paddock.blackbox.common.defaults import (
 )
 from dressage.rollout.generate import blackbox_dispatch
 from dressage.rollout.generate import runtime as generate_runtime
+from dressage.rollout.prewarm import store as prewarm_store
+from dressage.rollout.prewarm.store import PrewarmHandle
 from dressage.paddock.blackbox.execute_hooks import (
     parse_blackbox_execute_cmds,
 )
@@ -447,16 +458,16 @@ def _blackbox_execute_cmds(
 
 def test_ensure_blackbox_session_id_reuses_prefixes_and_writes_generated(monkeypatch):
     prefixed = SampleLike(session_id="bbs-existing")
-    assert blackbox_dispatch._ensure_blackbox_session_id(prefixed) == "bbs-existing"
+    assert blackbox_dispatch.ensure_blackbox_session_id(prefixed) == "bbs-existing"
     assert prefixed.session_id == "bbs-existing"
 
     unprefixed = SampleLike(session_id="existing")
-    assert blackbox_dispatch._ensure_blackbox_session_id(unprefixed) == "bbs-existing"
+    assert blackbox_dispatch.ensure_blackbox_session_id(unprefixed) == "bbs-existing"
     assert unprefixed.session_id == "bbs-existing"
 
-    monkeypatch.setattr(blackbox_dispatch.uuid, "uuid4", lambda: "generated")
+    monkeypatch.setattr(prewarm_store.uuid, "uuid4", lambda: "generated")
     missing = SampleLike(session_id=None)
-    assert blackbox_dispatch._ensure_blackbox_session_id(missing) == "bbs-generated"
+    assert blackbox_dispatch.ensure_blackbox_session_id(missing) == "bbs-generated"
     assert missing.session_id == "bbs-generated"
 
 
@@ -717,6 +728,45 @@ async def _run_blackbox_dispatch_writes_last_segment_to_sample(monkeypatch):
     assert paddock.calls[-1][0] == "terminate"
 
 
+def test_blackbox_dispatch_claims_prewarm_handle(monkeypatch):
+    asyncio.run(_run_blackbox_dispatch_claims_prewarm_handle(monkeypatch))
+
+
+async def _run_blackbox_dispatch_claims_prewarm_handle(monkeypatch):
+    default_paddock = FakePaddock()
+    prewarmed_paddock = FakePaddock()
+    proxy = FakeProxy()
+    state = {"sandbox_url": "http://prewarmed.test"}
+    handle = PrewarmHandle(
+        session_id="bbs-sess-7",
+        group_id=21,
+        paddock=prewarmed_paddock,
+        state=state,
+        env_args={"from": "prewarm"},
+    )
+
+    async def claim(session_id):
+        assert session_id == "bbs-sess-7"
+        return handle
+
+    monkeypatch.setattr(generate_runtime, "_PADDOCK", default_paddock)
+    monkeypatch.setattr(generate_runtime, "_PROXY_CLIENT", proxy)
+    monkeypatch.setattr(blackbox_dispatch, "claim_prewarm", claim)
+
+    result = await blackbox_dispatch.generate(_rollout_args(), SampleLike(), {})
+    await paddock_lifecycle.drain_terminate_tasks()
+
+    assert _last_segment_sample(result).status == SampleLike.Status.COMPLETED
+    assert default_paddock.calls == []
+    assert not [item for item in prewarmed_paddock.calls if item[0] == "init"]
+    assert prewarmed_paddock.calls[0][0:2] == ("register_agent", state)
+    assert prewarmed_paddock.calls[-1] == (
+        "terminate",
+        "bbs-sess-7",
+        {"from": "prewarm"},
+    )
+
+
 def test_blackbox_dispatch_prefixes_generated_session_id(monkeypatch):
     asyncio.run(_run_blackbox_dispatch_prefixes_generated_session_id(monkeypatch))
 
@@ -728,7 +778,7 @@ async def _run_blackbox_dispatch_prefixes_generated_session_id(monkeypatch):
     proxy = FakeProxy()
     monkeypatch.setattr(generate_runtime, "_PADDOCK", paddock)
     monkeypatch.setattr(generate_runtime, "_PROXY_CLIENT", proxy)
-    monkeypatch.setattr(blackbox_dispatch.uuid, "uuid4", lambda: fixed_uuid)
+    monkeypatch.setattr(prewarm_store.uuid, "uuid4", lambda: fixed_uuid)
     monkeypatch.setenv("DRESSAGE_PROXY_URL", "http://127.0.0.1:8800")
 
     sample = SampleLike(session_id=None)
@@ -1238,7 +1288,7 @@ async def _run_blackbox_dispatch_retry_uses_new_session_id_after_abort(monkeypat
     proxy = FakeProxy()
     monkeypatch.setattr(generate_runtime, "_PADDOCK", paddock)
     monkeypatch.setattr(generate_runtime, "_PROXY_CLIENT", proxy)
-    monkeypatch.setattr(blackbox_dispatch.uuid, "uuid4", lambda: retry_uuid)
+    monkeypatch.setattr(prewarm_store.uuid, "uuid4", lambda: retry_uuid)
 
     sample = SampleLike()
     first = await blackbox_dispatch.generate(_rollout_args(), sample, {})

@@ -440,6 +440,36 @@ async def _run_e2b_provider_sandbox_cmd_timeout_aborts_and_kills():
     ]
 
 
+def test_e2b_provider_public_url_failure_kills_created_sandbox():
+    asyncio.run(_run_e2b_provider_public_url_failure_kills_created_sandbox())
+
+
+async def _run_e2b_provider_public_url_failure_kills_created_sandbox():
+    events: list[tuple[Any, ...]] = []
+
+    class PublicUrlFailureSandbox(FakeE2BSandbox):
+        async def get_host(self, port):
+            self.events.append(("get_host", port))
+            raise RuntimeError("public URL unavailable")
+
+    async def sandbox_factory(**kwargs):
+        return PublicUrlFailureSandbox(events)
+
+    provider = E2BSandboxProvider(
+        template="blackbox-template",
+        sandbox_factory=sandbox_factory,
+    )
+    with pytest.raises(RuntimeError, match="public URL unavailable"):
+        await provider.create(
+            SandboxSpec(
+                trajectory_id="traj-public-url-failure",
+                services=(SandboxServiceSpec(name="blackbox", port=31000),),
+            )
+        )
+
+    assert events == [("get_host", 31000), ("kill",)]
+
+
 def test_e2b_provider_rejects_invalid_sandbox_cmd_before_create():
     asyncio.run(_run_e2b_provider_rejects_invalid_sandbox_cmd_before_create())
 
