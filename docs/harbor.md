@@ -4,19 +4,21 @@ Harbor-managed agent rollouts and synchronous training through the Dressage Gate
 
 [Back to the main README](../README.md) · [Harbor examples](../examples/harbor)
 
-## Preliminary Terminal-Bench 2.1 result
+## Terminal-Bench 2.0 results
 
-We evaluated Qwen3.6-35B-A3B with OpenCode 1.3.13 through the Dressage Harbor integration rollout on **E2B** sandbox. The experiment is conducted on a single node with 8× NVIDIA H200 GPUs (140 GB memory per GPU).
+We evaluate Qwen3.6-35B-A3B with Harbor Terminus-2 agent through our Dressage–Harbor integration, using E2B sandboxes. The evaluation is configured to preserve the dataset’s original per-task Agent timeouts of 600–12,000 seconds with no timeout multiplier, while providing a 256K context window, up to 80K output tokens, and no Agent step limit. Each task runs five times, with Harbor configured for up to three retries (`n_attempts=5` and `max_retries=3`).
+
+Model inference runs on a single node with 8× NVIDIA H200 GPUs (140 GB each), while each task sandbox is limited to **1 CPU and 2 GiB RAM**. We report accuracy using the official Terminal-Bench **error-aware** definition: a Trial succeeds only when it completes without an exception and receives a positive verifier reward; every other scored Trial counts as a failure with reward 0.
 
 | Item | Value |
 |---|---|
-| Dataset | Terminal-Bench 2.1, 89 tasks |
-| Total attempts | 5 per task, 445 trials total |
-| Raw positive verifier-reward rate | 124 / 445 = **27.87%** |
+| Dataset | Terminal-Bench 2.0, 89 tasks |
+| Full run | 5 attempts per task, 445 Trials |
+| Error-aware accuracy | **169 / 445 = 37.98%** |
+| Task-aware standard error | **±1.92%** |
+| pass@2 / pass@3 | **44.72% / 56.76%** |
 
-For reference, the public Terminal-Bench 2.0 leaderboard reports [little-coder with Qwen3.6-35B-A3B at **24.6% ± 3.2**](https://www.tbench.ai/leaderboard/terminal-bench/2.0?models=Qwen3.6-35B-A3B). [Terminal-Bench 2.1](https://www.tbench.ai/news/terminal-bench-2-1) revises the same 89-task benchmark by fixing issues in 28 tasks, including external dependency drift, resource mismatches, and instruction/test misspecification. The release reports that most representative agent-model pairs improve on 2.1.
-
-Our raw positive verifier-reward rate of **27.87%** is therefore directionally plausible: it is 3.27 percentage points above 24.6% and still within the leaderboard's displayed 24.6% ± 3.2 range (21.4%–27.8%). The Job was configured to align with the official evaluation semantics where possible: `n_attempts=5`, `max_retries=3`, the original task timeouts, and no timeout multiplier.
+For context, the public Terminal-Bench 2.0 leaderboard reports a verified little-coder run with Qwen3.6-35B-A3B at [24.6% ± 3.2%](https://www.tbench.ai/leaderboard/terminal-bench/2.0?models=Qwen3.6-35B-A3B). The figures are not directly comparable because the Agent, inference configuration, sandbox backend and resources differ.
 
 ## How it works
 
