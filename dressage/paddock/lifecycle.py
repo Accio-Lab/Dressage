@@ -191,9 +191,21 @@ def schedule_terminate_paddock(
 async def drain_lifecycle_tasks() -> None:
     """Wait for all tracked cleanup, including tasks spawned while draining."""
     loop = asyncio.get_running_loop()
-    while tracked := _LIFECYCLE_TASKS.get(loop):
+    while True:
+        tracked = _LIFECYCLE_TASKS.get(loop)
+        if not tracked:
+            break
         tasks = tuple(tracked)
         await asyncio.gather(*tasks, return_exceptions=True)
+        # Finished tasks are normally removed by their done-callbacks, but those
+        # run on a later loop iteration. Awaiting an all-completed gather may
+        # return without yielding (Python 3.12), so proactively drop finished
+        # tasks here; otherwise this loop spins and starves the event loop.
+        for task in tasks:
+            if task.done():
+                tracked.discard(task)
+        if not tracked:
+            _LIFECYCLE_TASKS.pop(loop, None)
 
 
 async def drain_terminate_tasks() -> None:

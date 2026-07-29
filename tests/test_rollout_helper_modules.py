@@ -162,6 +162,58 @@ async def _run_lifecycle_terminate_timeout_can_be_drained(monkeypatch):
     ]
 
 
+def test_drain_lifecycle_tasks_does_not_spin_on_completed_tasks():
+    asyncio.run(_run_drain_lifecycle_tasks_does_not_spin_on_completed_tasks())
+
+
+async def _run_drain_lifecycle_tasks_does_not_spin_on_completed_tasks():
+    """Regression: draining all-completed tasks must not busy-spin the loop.
+
+    Historically ``drain_lifecycle_tasks`` relied on each task's done-callback
+    to remove it from ``_LIFECYCLE_TASKS``. Those callbacks only run on a later
+    loop iteration, and awaiting an all-completed ``gather`` can return without
+    yielding (Python 3.12). The result was an infinite tight loop that starved
+    the event loop. Here we seed the registry with already-finished tasks that
+    are NOT auto-removed, so draining must proactively discard them and return
+    promptly instead of hanging.
+    """
+    loop = asyncio.get_running_loop()
+
+    async def _noop() -> None:
+        return None
+
+    finished = [asyncio.ensure_future(_noop()) for _ in range(3)]
+    await asyncio.gather(*finished)
+    assert all(task.done() for task in finished)
+
+    # Seed the registry directly (bypassing add_done_callback) so nothing else
+    # removes the completed tasks: only a correct drain loop can clear them.
+    lifecycle._LIFECYCLE_TASKS[loop] = set(finished)
+    try:
+        drain = asyncio.ensure_future(lifecycle.drain_lifecycle_tasks())
+        # Watchdog proves the loop keeps iterating: if drain busy-spins and
+        # starves the loop, neither this sleep nor drain resolves and the test
+        # hangs (caught by the outer timeout guard). When drain yields properly
+        # it finishes first, well before the watchdog.
+        watchdog = asyncio.ensure_future(asyncio.sleep(5))
+        done, _pending = await asyncio.wait(
+            {drain, watchdog},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        assert drain in done, "drain_lifecycle_tasks starved the event loop"
+        watchdog.cancel()
+        try:
+            await watchdog
+        except asyncio.CancelledError:
+            pass
+        await drain  # surface any exception raised inside drain
+    finally:
+        lifecycle._LIFECYCLE_TASKS.pop(loop, None)
+
+    assert loop not in lifecycle._LIFECYCLE_TASKS
+    assert lifecycle.pending_lifecycle_task_count() == 0
+
+
 def test_generate_runtime_paddock_env_args_only_uses_supported_keys():
     env_args = generate_runtime.paddock_env_args_from_metadata(
         {
