@@ -35,6 +35,11 @@ from dressage.rollout.artifacts import samples as trajectory_sample
 from dressage.rollout.artifacts.writer import DEFAULT_WRITER, RolloutArtifactWriter
 
 
+@pytest.fixture(autouse=True)
+def _stable_fallback_session_id(monkeypatch):
+    monkeypatch.setattr(prewarm_store.uuid, "uuid4", lambda: "sess-7")
+
+
 @dataclass
 class SampleLike:
     prompt: str = "hello"
@@ -112,6 +117,19 @@ class FakePaddock:
     async def terminate(self, session_id, env_args=None):
         self.calls.append(("terminate", session_id, env_args))
         return {"deleted": True}
+
+
+class FailFirstInitPaddock(FakePaddock):
+    def __init__(self):
+        super().__init__()
+        self.init_attempts = 0
+
+    async def init(self, session_id, env_type=None, env_args=None):
+        self.calls.append(("init", session_id, env_type, env_args))
+        self.init_attempts += 1
+        if self.init_attempts == 1:
+            raise RuntimeError("prewarm register failed")
+        return {"sandbox_url": "http://sandbox.test"}
 
 
 class NoSlotPaddock(FakePaddock):
@@ -767,6 +785,94 @@ async def _run_blackbox_dispatch_claims_prewarm_handle(monkeypatch):
     )
 
 
+def test_blackbox_dispatch_prewarm_miss_uses_new_session_id(monkeypatch):
+    asyncio.run(_run_blackbox_dispatch_prewarm_miss_uses_new_session_id(monkeypatch))
+
+
+async def _run_blackbox_dispatch_prewarm_miss_uses_new_session_id(monkeypatch):
+    new_uuid = "11111111-1111-1111-1111-111111111111"
+    new_session_id = f"bbs-{new_uuid}"
+    paddock = FakePaddock()
+    proxy = FakeProxy()
+
+    async def claim(session_id):
+        assert session_id == "bbs-original"
+        return None
+
+    monkeypatch.setattr(generate_runtime, "_PADDOCK", paddock)
+    monkeypatch.setattr(generate_runtime, "_PROXY_CLIENT", proxy)
+    monkeypatch.setattr(blackbox_dispatch, "claim_prewarm", claim)
+    monkeypatch.setattr(prewarm_store.uuid, "uuid4", lambda: new_uuid)
+
+    sample = SampleLike(session_id="original")
+    result = await blackbox_dispatch.generate(_rollout_args(), sample, {})
+    await paddock_lifecycle.drain_terminate_tasks()
+
+    assert _last_segment_sample(result).status == SampleLike.Status.COMPLETED
+    assert sample.session_id == new_session_id
+    assert sample.metadata["session_id"] == new_session_id
+    assert paddock.calls[0] == ("init", new_session_id, None, {})
+    assert paddock.calls[1][2]["session_id"] == new_session_id
+    assert paddock.calls[2][2]["session_id"] == new_session_id
+    assert paddock.calls[-1] == ("terminate", new_session_id, {})
+    assert proxy.calls == [
+        ("finalize", new_session_id, "7", None),
+        (
+            "read",
+            {"trajectory_id": new_session_id, "instance_id": "7", "drain": True},
+        ),
+    ]
+
+
+def test_blackbox_dispatch_failed_prewarm_uses_new_session_id(monkeypatch):
+    asyncio.run(_run_blackbox_dispatch_failed_prewarm_uses_new_session_id(monkeypatch))
+
+
+async def _run_blackbox_dispatch_failed_prewarm_uses_new_session_id(monkeypatch):
+    old_session_id = "bbs-sess-7"
+    new_uuid = "22222222-2222-2222-2222-222222222222"
+    new_session_id = f"bbs-{new_uuid}"
+    paddock = FailFirstInitPaddock()
+    proxy = FakeProxy()
+    store = prewarm_store.PrewarmStore()
+    sample = SampleLike()
+    assert (
+        store.start(
+            sample,
+            group_id=21,
+            paddock=paddock,
+            env_args={},
+        )
+        == old_session_id
+    )
+
+    monkeypatch.setattr(generate_runtime, "_PADDOCK", paddock)
+    monkeypatch.setattr(generate_runtime, "_PROXY_CLIENT", proxy)
+    monkeypatch.setattr(blackbox_dispatch, "claim_prewarm", store.claim)
+    monkeypatch.setattr(prewarm_store.uuid, "uuid4", lambda: new_uuid)
+
+    result = await blackbox_dispatch.generate(_rollout_args(), sample, {})
+    await paddock_lifecycle.drain_terminate_tasks()
+
+    assert _last_segment_sample(result).status == SampleLike.Status.COMPLETED
+    assert sample.session_id == new_session_id
+    assert sample.metadata["session_id"] == new_session_id
+    assert paddock.calls[0] == ("init", old_session_id, None, {})
+    assert paddock.calls[1] == ("init", new_session_id, None, {})
+    assert paddock.calls[2][0] == "register_agent"
+    assert paddock.calls[2][2]["session_id"] == new_session_id
+    assert paddock.calls[3][0] == "call_agent"
+    assert paddock.calls[3][2]["session_id"] == new_session_id
+    assert paddock.calls[-1] == ("terminate", new_session_id, {})
+    assert proxy.calls == [
+        ("finalize", new_session_id, "7", None),
+        (
+            "read",
+            {"trajectory_id": new_session_id, "instance_id": "7", "drain": True},
+        ),
+    ]
+
+
 def test_blackbox_dispatch_prefixes_generated_session_id(monkeypatch):
     asyncio.run(_run_blackbox_dispatch_prefixes_generated_session_id(monkeypatch))
 
@@ -1282,13 +1388,32 @@ def test_blackbox_dispatch_retry_uses_new_session_id_after_abort(monkeypatch):
 
 
 async def _run_blackbox_dispatch_retry_uses_new_session_id_after_abort(monkeypatch):
+    first_uuid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    first_session_id = f"bbs-{first_uuid}"
+    retry_claim_uuid = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
     retry_uuid = "12345678-1234-5678-1234-567812345678"
     retry_session_id = f"bbs-{retry_uuid}"
+    generated_uuids = iter((first_uuid, retry_claim_uuid, retry_uuid))
+
+    def ensure_session_id(sample):
+        session_id = sample.session_id
+        if session_id is None:
+            session_id = next(generated_uuids)
+        session_id = str(session_id)
+        if not session_id.startswith("bbs-"):
+            session_id = f"bbs-{session_id}"
+        sample.session_id = session_id
+        return session_id
+
     paddock = FailingOnceRegisterPaddock()
     proxy = FakeProxy()
     monkeypatch.setattr(generate_runtime, "_PADDOCK", paddock)
     monkeypatch.setattr(generate_runtime, "_PROXY_CLIENT", proxy)
-    monkeypatch.setattr(prewarm_store.uuid, "uuid4", lambda: retry_uuid)
+    monkeypatch.setattr(
+        blackbox_dispatch,
+        "ensure_blackbox_session_id",
+        ensure_session_id,
+    )
 
     sample = SampleLike()
     first = await blackbox_dispatch.generate(_rollout_args(), sample, {})
@@ -1296,7 +1421,7 @@ async def _run_blackbox_dispatch_retry_uses_new_session_id_after_abort(monkeypat
 
     assert first.status == SampleLike.Status.ABORTED
     assert sample.session_id is None
-    assert sample.metadata["last_failed_session_id"] == "bbs-sess-7"
+    assert sample.metadata["last_failed_session_id"] == first_session_id
 
     second = await blackbox_dispatch.generate(_rollout_args(), sample, {})
     await paddock_lifecycle.drain_terminate_tasks()
@@ -1306,14 +1431,14 @@ async def _run_blackbox_dispatch_retry_uses_new_session_id_after_abort(monkeypat
     assert sample.session_id == retry_session_id
     assert segment_sample.metadata["session_id"] == retry_session_id
     assert "blackbox_error" not in segment_sample.metadata
-    assert segment_sample.metadata["last_failed_session_id"] == "bbs-sess-7"
+    assert segment_sample.metadata["last_failed_session_id"] == first_session_id
     assert (
         segment_sample.metadata["blackbox_failure_history"][0]["session_id"]
-        == "bbs-sess-7"
+        == first_session_id
     )
     assert [
         call[1] for call in paddock.calls if call[0] == "init"
-    ] == ["bbs-sess-7", retry_session_id]
+    ] == [first_session_id, retry_session_id]
     register_calls = [call for call in paddock.calls if call[0] == "register_agent"]
     assert register_calls[1][2]["session_id"] == retry_session_id
     assert any(

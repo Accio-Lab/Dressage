@@ -132,6 +132,16 @@ async def generate(
                 prewarm_wait,
             )
         else:
+            previous_session_id = session_id
+            sample.session_id = None
+            session_id = ensure_blackbox_session_id(sample)
+            metadata["session_id"] = session_id
+            logger.debug(
+                "initializing sandbox with a new session_id after prewarm miss: "
+                "previous_session_id=%s new_session_id=%s",
+                previous_session_id,
+                session_id,
+            )
             paddock = get_paddock_from_env(allow_whitebox_mode=False)
             state = await maybe_await(
                 paddock.init(
