@@ -247,3 +247,56 @@ def compute_multi_segment_metrics(samples: list[Any]) -> dict[str, float]:
         })
 
     return metrics
+
+
+def compute_prewarm_metrics(samples: list[Any]) -> dict[str, float]:
+    """Sandbox-prewarm hit-rate stats keyed under ``prewarm/`` for wandb.
+
+    Only trajectories that actually requested a prewarm (stamped by the
+    scheduler via ``metadata['prewarm_requested']``) are counted, so
+    rollout modes that never prewarm (e.g. sync) emit no prewarm metrics at
+    all instead of a misleading 0% hit rate.
+
+    Buckets samples by trajectory (``metadata['parent_traj_id']``, falling
+    back to ``_metric_trajectory_id``) so a multi-segment trajectory counts
+    once. ``remove_sample=True`` (aborted/no-grad) samples are intentionally
+    NOT excluded here: a prewarm *hit* reflects sandbox reuse and is
+    independent of whether the rollout later succeeded.
+
+    Called from the slime-facing rollout entrypoints (sync + fully_async +
+    partial_async) so the metrics ride through ``RolloutFnTrainOutput.metrics``.
+    """
+    hits_by_traj: dict[str, bool] = {}
+    waits: list[float] = []
+    for s in samples:
+        meta = getattr(s, "metadata", None) or {}
+        if not meta.get("prewarm_requested"):
+            continue
+        traj_id = meta.get("parent_traj_id") or _metric_trajectory_id(s)
+        if traj_id is None or traj_id in hits_by_traj:
+            continue
+        hit = int(meta.get("prewarm_hit", 0)) == 1
+        hits_by_traj[traj_id] = hit
+        if hit:
+            wait = meta.get("prewarm_wait_seconds")
+            if wait is not None:
+                waits.append(float(wait))
+
+    if not hits_by_traj:
+        return {}
+
+    num_requested = len(hits_by_traj)
+    num_hits = sum(1 for hit in hits_by_traj.values() if hit)
+    metrics: dict[str, float] = {
+        "prewarm/num_requested": float(num_requested),
+        "prewarm/num_hits": float(num_hits),
+        "prewarm/num_misses": float(num_requested - num_hits),
+        "prewarm/hit_rate": num_hits / num_requested,
+    }
+    if waits:
+        metrics.update({
+            "prewarm/wait_seconds_mean": sum(waits) / len(waits),
+            "prewarm/wait_seconds_max": float(max(waits)),
+            "prewarm/wait_seconds_min": float(min(waits)),
+        })
+    return metrics

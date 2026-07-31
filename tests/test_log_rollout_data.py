@@ -89,13 +89,16 @@ def test_rollout_hook_defines_staleness_wandb_step_metric(monkeypatch):
             calls.append((name, kwargs))
 
     monkeypatch.setitem(sys.modules, "wandb", FakeWandb)
-    monkeypatch.setattr(log_rollout_module, "_STALENESS_WANDB_METRICS_DEFINED", False)
+    monkeypatch.setattr(log_rollout_module, "_ROLLOUT_WANDB_METRICS_DEFINED", False)
 
     args = SimpleNamespace(use_wandb=True)
     assert log_rollout_data(0, args, [], {}, 0.0) is False
     assert log_rollout_data(1, args, [], {}, 0.0) is False
 
-    assert calls == [("staleness/*", {"step_metric": "rollout/step"})]
+    assert calls == [
+        ("staleness/*", {"step_metric": "rollout/step"}),
+        ("prewarm/*", {"step_metric": "rollout/step"}),
+    ]
 
 
 def test_single_segment_trajectories():

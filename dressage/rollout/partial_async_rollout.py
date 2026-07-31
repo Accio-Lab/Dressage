@@ -585,11 +585,14 @@ async def generate_rollout_partial_async_impl(
             "Set DRESSAGE_ALLOW_EMPTY_TRAIN_BATCH=1 to keep the previous behavior."
         )
 
-    from dressage.rollout.multi_segment import compute_multi_segment_metrics
-
-    metrics: dict[str, Any] = compute_multi_segment_metrics(
-        [sample for group in data_groups for sample in group]
+    from dressage.rollout.multi_segment import (
+        compute_multi_segment_metrics,
+        compute_prewarm_metrics,
     )
+
+    flat = [sample for group in data_groups for sample in group]
+    metrics: dict[str, Any] = compute_multi_segment_metrics(flat)
+    metrics.update(compute_prewarm_metrics(flat))
     metrics.update(staleness_filter.metrics_for_groups(data_groups))
     metrics.update({
         "dressage/partial_rollout_target_groups": target_groups,

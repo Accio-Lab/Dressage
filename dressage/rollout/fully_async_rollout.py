@@ -39,6 +39,7 @@ except ImportError:
 from dressage.paddock.lifecycle import drain_lifecycle_tasks
 from dressage.rollout.multi_segment import (
     compute_multi_segment_metrics,
+    compute_prewarm_metrics,
     mark_aborted_no_grad,
 )
 from dressage.rollout.staleness import (
@@ -608,9 +609,9 @@ def generate_rollout_fully_async(
                 rollout_id,
             )
             stop_global_worker()
-    metrics: dict[str, Any] = compute_multi_segment_metrics(
-        [sample for group in data for sample in group]
-    )
+    flat = [sample for group in data for sample in group]
+    metrics: dict[str, Any] = compute_multi_segment_metrics(flat)
+    metrics.update(compute_prewarm_metrics(flat))
     metrics.update(staleness_metrics)
     if RolloutFnTrainOutput is None:
         return data

@@ -114,6 +114,31 @@ def test_prefetch_passes_explicit_group_ownership_and_queues_groups() -> None:
     assert not hasattr(subject, "_group_sids")
 
 
+def test_prefetch_marks_requested_only_for_started_prewarms() -> None:
+    """Samples whose prewarm actually started get a ``prewarm_requested``
+    marker so dispatch can attribute hit/miss; skipped ones stay unmarked."""
+    started_sample = sample()
+    skipped_sample = sample()
+    group = [started_sample, skipped_sample]
+    buffer = FakeDataBuffer([group])
+
+    with patch(
+        "dressage.rollout.prewarm.scheduler.get_paddock_from_env",
+        return_value=object(),
+    ), patch(
+        "dressage.rollout.prewarm.scheduler.paddock_env_args_from_metadata",
+        return_value={},
+    ), patch(
+        "dressage.rollout.prewarm.scheduler.start_prewarm",
+        side_effect=["bbs-started", None],
+    ):
+        subject = scheduler(enabled=True, ahead=1)
+        subject.do_prefetch(buffer)
+
+    assert started_sample.metadata.get("prewarm_requested") is True
+    assert "prewarm_requested" not in skipped_sample.metadata
+
+
 def test_prefetch_keeps_group_when_paddock_or_start_is_unavailable() -> None:
     paddock_failure_group = [sample()]
     start_skip_group = [sample()]
