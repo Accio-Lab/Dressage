@@ -18,7 +18,7 @@ from typing import Any
 
 from dressage.training.log_helpers import compute_trajectory_mean_raw_reward
 
-_STALENESS_WANDB_METRICS_DEFINED = False
+_ROLLOUT_WANDB_METRICS_DEFINED = False
 
 
 def _metric_component(value: str) -> str:
@@ -27,8 +27,8 @@ def _metric_component(value: str) -> str:
 
 
 def _define_staleness_wandb_metrics(args: Any) -> None:
-    global _STALENESS_WANDB_METRICS_DEFINED
-    if _STALENESS_WANDB_METRICS_DEFINED or not getattr(args, "use_wandb", False):
+    global _ROLLOUT_WANDB_METRICS_DEFINED
+    if _ROLLOUT_WANDB_METRICS_DEFINED or not getattr(args, "use_wandb", False):
         return
 
     import wandb
@@ -36,7 +36,10 @@ def _define_staleness_wandb_metrics(args: Any) -> None:
     if wandb.run is None:
         return
     wandb.define_metric("staleness/*", step_metric="rollout/step")
-    _STALENESS_WANDB_METRICS_DEFINED = True
+    # Sandbox-prewarm observability (hit rate / wait time), see
+    # dressage.rollout.multi_segment.compute_prewarm_metrics.
+    wandb.define_metric("prewarm/*", step_metric="rollout/step")
+    _ROLLOUT_WANDB_METRICS_DEFINED = True
 
 
 def _sample_has_trainable_loss(sample: Any) -> bool:

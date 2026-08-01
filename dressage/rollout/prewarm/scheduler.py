@@ -124,6 +124,11 @@ class PrewarmScheduler:
                 paddock=paddock,
                 env_args=env_args,
             ) is not None:
+                # Mark the sample so dispatch can attribute a prewarm hit/miss
+                # only to trajectories that actually requested a prewarm. This
+                # keeps prewarm hit-rate metrics clean of non-prewarmed rollout
+                # modes (e.g. sync) where no prewarm is ever started.
+                metadata["prewarm_requested"] = True
                 started += 1
         return started
 

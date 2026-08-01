@@ -39,7 +39,10 @@ except ImportError:
     def run(coro):  # type: ignore[no-redef]
         return asyncio.run(coro)
 
-from dressage.rollout.multi_segment import compute_multi_segment_metrics
+from dressage.rollout.multi_segment import (
+    compute_multi_segment_metrics,
+    compute_prewarm_metrics,
+)
 
 
 def _max_retries() -> int:
@@ -158,9 +161,9 @@ def generate_rollout_sync(
     if evaluation:
         raise ValueError("Dressage sync rollout does not support evaluation mode")
     data = run(_run_sync_rollout(args, rollout_id, data_buffer))
-    metrics: dict[str, Any] = compute_multi_segment_metrics(
-        [sample for group in data for sample in group]
-    )
+    flat = [sample for group in data for sample in group]
+    metrics: dict[str, Any] = compute_multi_segment_metrics(flat)
+    metrics.update(compute_prewarm_metrics(flat))
     if RolloutFnTrainOutput is None:
         return data
     return RolloutFnTrainOutput(samples=data, metrics=metrics)

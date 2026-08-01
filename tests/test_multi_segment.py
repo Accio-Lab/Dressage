@@ -18,6 +18,7 @@ import pytest
 
 from dressage.rollout.multi_segment import (
     compute_multi_segment_metrics,
+    compute_prewarm_metrics,
     expand_segments_to_samples,
     mark_aborted_no_grad,
 )
@@ -382,6 +383,94 @@ def test_compute_multi_segment_metrics_empty():
         _make_metric_sample(parent_traj_id=None),
     ]
     assert compute_multi_segment_metrics(samples) == {}
+
+
+# ---------------------------------------------------------------------------
+# compute_prewarm_metrics
+# ---------------------------------------------------------------------------
+
+
+def _prewarm_sample(
+    *,
+    parent_traj_id=None,
+    prewarm_requested=False,
+    prewarm_hit=None,
+    prewarm_wait_seconds=None,
+    remove_sample=False,
+):
+    meta: dict[str, Any] = {}
+    if parent_traj_id is not None:
+        meta["parent_traj_id"] = parent_traj_id
+    if prewarm_requested:
+        meta["prewarm_requested"] = True
+    if prewarm_hit is not None:
+        meta["prewarm_hit"] = prewarm_hit
+    if prewarm_wait_seconds is not None:
+        meta["prewarm_wait_seconds"] = prewarm_wait_seconds
+    return SimpleNamespace(metadata=meta, remove_sample=remove_sample)
+
+
+def test_compute_prewarm_metrics_hit_rate_and_wait():
+    samples = [
+        # trajectory t1: prewarm hit, 3 segments share the same metadata
+        _prewarm_sample(parent_traj_id="t1", prewarm_requested=True, prewarm_hit=1,
+                        prewarm_wait_seconds=0.5),
+        _prewarm_sample(parent_traj_id="t1", prewarm_requested=True, prewarm_hit=1,
+                        prewarm_wait_seconds=0.5),
+        _prewarm_sample(parent_traj_id="t1", prewarm_requested=True, prewarm_hit=1,
+                        prewarm_wait_seconds=0.5),
+        # trajectory t2: prewarm hit with a longer wait
+        _prewarm_sample(parent_traj_id="t2", prewarm_requested=True, prewarm_hit=1,
+                        prewarm_wait_seconds=1.5),
+        # trajectory t3: prewarm miss (fell back to inline init)
+        _prewarm_sample(parent_traj_id="t3", prewarm_requested=True, prewarm_hit=0),
+    ]
+    metrics = compute_prewarm_metrics(samples)
+    assert metrics["prewarm/num_requested"] == 3
+    assert metrics["prewarm/num_hits"] == 2
+    assert metrics["prewarm/num_misses"] == 1
+    assert metrics["prewarm/hit_rate"] == pytest.approx(2 / 3)
+    assert metrics["prewarm/wait_seconds_mean"] == pytest.approx(1.0)
+    assert metrics["prewarm/wait_seconds_max"] == pytest.approx(1.5)
+    assert metrics["prewarm/wait_seconds_min"] == pytest.approx(0.5)
+
+
+def test_compute_prewarm_metrics_ignores_non_requested_trajectories():
+    """Rollout modes that never prewarm (e.g. sync) leave no prewarm_requested
+    marker, so no prewarm metrics are emitted at all."""
+    samples = [
+        _prewarm_sample(parent_traj_id="t1"),
+        _prewarm_sample(parent_traj_id="t2"),
+    ]
+    assert compute_prewarm_metrics(samples) == {}
+    assert compute_prewarm_metrics([]) == {}
+
+
+def test_compute_prewarm_metrics_counts_aborted_trajectories():
+    """A prewarm hit reflects sandbox reuse and must count even when the
+    rollout later aborted (remove_sample=True)."""
+    samples = [
+        _prewarm_sample(parent_traj_id="t1", prewarm_requested=True, prewarm_hit=1,
+                        prewarm_wait_seconds=0.2, remove_sample=True),
+        _prewarm_sample(parent_traj_id="t2", prewarm_requested=True, prewarm_hit=0),
+    ]
+    metrics = compute_prewarm_metrics(samples)
+    assert metrics["prewarm/num_requested"] == 2
+    assert metrics["prewarm/num_hits"] == 1
+    assert metrics["prewarm/hit_rate"] == pytest.approx(0.5)
+
+
+def test_compute_prewarm_metrics_all_miss_reports_zero_hit_rate():
+    samples = [
+        _prewarm_sample(parent_traj_id="t1", prewarm_requested=True, prewarm_hit=0),
+        _prewarm_sample(parent_traj_id="t2", prewarm_requested=True, prewarm_hit=0),
+    ]
+    metrics = compute_prewarm_metrics(samples)
+    assert metrics["prewarm/num_requested"] == 2
+    assert metrics["prewarm/num_hits"] == 0
+    assert metrics["prewarm/hit_rate"] == pytest.approx(0.0)
+    # No hits → no wait-time distribution.
+    assert "prewarm/wait_seconds_mean" not in metrics
 
 
 # ---------------------------------------------------------------------------

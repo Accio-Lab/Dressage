@@ -116,6 +116,7 @@ async def generate(
             blackbox_type=blackbox_type,
         )
         proxy_client = get_proxy_client()
+        prewarm_requested = bool(metadata.get("prewarm_requested"))
         prewarm_t0 = time.monotonic()
         handle = await claim_prewarm(session_id)
         prewarm_wait = time.monotonic() - prewarm_t0
@@ -124,6 +125,11 @@ async def generate(
             state = handle.state
             env_args = handle.env_args
             initialized = True
+            # Only trajectories that requested a prewarm contribute to the
+            # prewarm hit-rate metrics (see compute_prewarm_metrics).
+            if prewarm_requested:
+                metadata["prewarm_hit"] = 1
+                metadata["prewarm_wait_seconds"] = prewarm_wait
             logger.debug(
                 "claimed prewarmed sandbox for session_id=%s group_id=%d: "
                 "wait=%.2fs",
@@ -132,6 +138,8 @@ async def generate(
                 prewarm_wait,
             )
         else:
+            if prewarm_requested:
+                metadata["prewarm_hit"] = 0
             previous_session_id = session_id
             sample.session_id = None
             session_id = ensure_blackbox_session_id(sample)
