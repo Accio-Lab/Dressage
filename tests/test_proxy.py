@@ -485,6 +485,75 @@ class BlockingSGLangClient(FakeSGLangClient):
         )
 
 
+class AsyncBlockingSGLangClient(FakeSGLangClient):
+    def __init__(self, responses: list[SGLangResponse]):
+        super().__init__(responses)
+        self.first_call_started = asyncio.Event()
+        self.release_first_call = asyncio.Event()
+        self.abort_calls: list[dict[str, Any]] = []
+
+    async def generate(
+        self,
+        input_ids,
+        sampling_params,
+        *,
+        routing_key=None,
+        request_id=None,
+        return_logprob=True,
+        logprob_start_len=0,
+    ):
+        self.calls.append(
+            {
+                "input_ids": list(input_ids),
+                "sampling_params": dict(sampling_params),
+                "routing_key": routing_key,
+                "request_id": request_id,
+                "return_logprob": return_logprob,
+                "logprob_start_len": logprob_start_len,
+            }
+        )
+        self.last_routing_key = routing_key
+        self.first_call_started.set()
+        await self.release_first_call.wait()
+        return self._hydrate_response(
+            self._responses.pop(0),
+            input_ids,
+            expect_input_logprobs=bool(return_logprob and logprob_start_len == 0),
+        )
+
+    async def abort_request(self, request_id, *, routing_key=None):
+        self.abort_calls.append(
+            {
+                "request_id": request_id,
+                "routing_key": routing_key,
+            }
+        )
+        self.release_first_call.set()
+        return {"request_id": request_id, "aborted": True}
+
+
+class SlowSGLangClient(FakeSGLangClient):
+    """Delays generate to keep requests in flight past the heartbeat grace."""
+
+    def __init__(
+        self,
+        responses: list[SGLangResponse],
+        *,
+        delay: float,
+        error: Exception | None = None,
+    ):
+        super().__init__(responses)
+        self.delay = delay
+        self.error = error
+
+    async def generate(self, input_ids, sampling_params, **kwargs):
+        await asyncio.sleep(self.delay)
+        if self.error is not None:
+            raise self.error
+        kwargs.pop("request_id", None)
+        return await super().generate(input_ids, sampling_params, **kwargs)
+
+
 class TemplateMismatchTokenizer(FakeTokenizer):
     def _maybe_adjust_rendered(
         self,
@@ -797,6 +866,7 @@ def make_client(
     use_rollout_routing_replay: bool = False,
     partial_rollout: bool = False,
     max_partial_rollout_preempts: int | None = None,
+    stream_heartbeat_interval_seconds: float = 15.0,
 ):
     session_manager = SessionManager()
     trajectory_store = TrajectoryStore(min_group_size=1, group_timeout=0.0)
@@ -825,6 +895,7 @@ def make_client(
         use_rollout_routing_replay=use_rollout_routing_replay,
         partial_rollout=partial_rollout,
         max_partial_rollout_preempts=max_partial_rollout_preempts,
+        stream_heartbeat_interval_seconds=stream_heartbeat_interval_seconds,
     )
     if tool_call_parser is not _UNSET:
         create_app_kwargs["tool_call_parser"] = tool_call_parser
@@ -876,6 +947,7 @@ def test_proxy_health_reports_sampling_limits():
         make_response("hello"),
         rollout_temperature=0.7,
         max_output_tokens=2048,
+        stream_heartbeat_interval_seconds=7.5,
     )
 
     result = client.get("/health")
@@ -884,6 +956,7 @@ def test_proxy_health_reports_sampling_limits():
     config = result.json()["config"]
     assert config["rollout_temperature"] == 0.7
     assert config["max_output_tokens"] == 2048
+    assert config["stream_heartbeat_interval_seconds"] == 7.5
 
 
 def test_integration_capabilities_require_auth_and_report_version():
@@ -1311,6 +1384,7 @@ def test_parse_args_defaults_to_sglang_api_parser_backends(monkeypatch):
     assert args.context_window is None
     assert args.max_output_tokens is None
     assert args.dynamic_max_tokens is True
+    assert args.stream_heartbeat_interval_seconds == 15.0
 
 
 def test_parse_args_rejects_non_positive_context_window(monkeypatch):
@@ -1358,6 +1432,36 @@ def test_parse_args_rejects_non_positive_max_output_tokens(monkeypatch, value):
 def test_create_app_rejects_non_positive_max_output_tokens(value):
     with pytest.raises(ValueError, match="max_output_tokens must be greater than 0"):
         create_app(max_output_tokens=value)
+
+
+@pytest.mark.parametrize("value", ["-1", "nan", "inf"])
+def test_parse_args_rejects_invalid_stream_heartbeat_interval_seconds(
+    monkeypatch, value
+):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "dressage.proxy.server",
+            "--tokenizer-path",
+            "fake-tokenizer",
+            "--stream-heartbeat-interval-seconds",
+            value,
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        parse_args()
+
+    assert exc_info.value.code == 2
+
+
+@pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf")])
+def test_create_app_rejects_invalid_stream_heartbeat_interval_seconds(value):
+    with pytest.raises(
+        ValueError,
+        match="stream_heartbeat_interval_seconds must be a finite number",
+    ):
+        create_app(stream_heartbeat_interval_seconds=value)
 
 
 def test_parse_args_can_disable_dynamic_max_tokens(monkeypatch):
@@ -3329,6 +3433,220 @@ def test_streaming_emits_usage_chunk_before_done():
     assert usage_event["model"] == "fake-model"
     assert usage["prompt_tokens"] == len(sglang_client.calls[0]["input_ids"])
     assert usage["completion_tokens"] == len(raw_text)
+
+
+def test_stream_heartbeat_emits_keepalive_before_chunks():
+    raw_text = "heartbeat hello"
+    slow_client = SlowSGLangClient([make_response(raw_text)], delay=0.3)
+    client, _, _, _ = make_client(
+        sglang_client=slow_client, stream_heartbeat_interval_seconds=0.05
+    )
+
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        headers={"X-Session-Id": "sess-hb", "X-Instance-Id": "inst-hb"},
+        json={
+            "model": "fake-model",
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    ) as response:
+        body = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-cache, no-transform"
+    assert response.headers["x-accel-buffering"] == "no"
+    assert body.count(": dressage-heartbeat") >= 2
+    assert body.index(": dressage-heartbeat") < body.index("data:")
+    assert f'"content": "{raw_text[:8]}"' in body or f'"content":"{raw_text[:8]}"' in body
+    assert_stream_usage_chunk(body)
+
+
+def test_stream_heartbeat_fast_completion_matches_legacy_stream():
+    raw_text = "quick reply"
+    client, _, _, _ = make_client(
+        make_response(raw_text), stream_heartbeat_interval_seconds=5.0
+    )
+
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        headers={"X-Session-Id": "sess-hb-fast", "X-Instance-Id": "inst-hb-fast"},
+        json={
+            "model": "fake-model",
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    ) as response:
+        body = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    assert ": dressage-heartbeat" not in body
+    assert_stream_usage_chunk(body)
+
+
+def test_stream_heartbeat_can_be_disabled():
+    raw_text = "heartbeat disabled"
+    slow_client = SlowSGLangClient([make_response(raw_text)], delay=0.05)
+    client, _, _, _ = make_client(
+        sglang_client=slow_client,
+        stream_heartbeat_interval_seconds=0,
+    )
+
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        headers={"X-Session-Id": "sess-hb-off", "X-Instance-Id": "inst-hb-off"},
+        json={
+            "model": "fake-model",
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    ) as response:
+        body = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    assert ": dressage-heartbeat" not in body
+    assert_stream_usage_chunk(body)
+
+
+def test_stream_heartbeat_preserves_status_code_for_fast_errors():
+    client, _, _, _ = make_client(
+        make_response("unused"),
+        context_window=4,
+        stream_heartbeat_interval_seconds=5.0,
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"X-Session-Id": "sess-hb-413", "X-Instance-Id": "inst-hb-413"},
+        json={
+            "model": "fake-model",
+            "stream": True,
+            "messages": [{"role": "user", "content": "way too long prompt"}],
+        },
+    )
+
+    assert response.status_code == 413
+    assert response.json()["error"] == "context_overflow"
+
+
+def test_stream_heartbeat_reports_late_error_in_stream():
+    slow_client = SlowSGLangClient(
+        [], delay=0.3, error=httpx.ConnectError("router down")
+    )
+    client, _, _, _ = make_client(
+        sglang_client=slow_client, stream_heartbeat_interval_seconds=0.05
+    )
+
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        headers={"X-Session-Id": "sess-hb-err", "X-Instance-Id": "inst-hb-err"},
+        json={
+            "model": "fake-model",
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    ) as response:
+        body = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    assert ": dressage-heartbeat" in body
+    assert sse_data_values(body)[-1] == "[DONE]"
+    events = sse_json_events(body)
+    error_events = [event for event in events if "error" in event]
+    assert len(error_events) == 1
+    error = error_events[0]["error"]
+    assert error["status_code"] == 503
+    assert "error" not in error
+    assert error["code"] == "sglang_upstream_unavailable"
+    assert error["type"] == "dressage_proxy_error"
+    assert error["message"] == "router down"
+
+
+def test_stream_heartbeat_reports_unknown_late_error_without_details():
+    slow_client = SlowSGLangClient(
+        [],
+        delay=0.05,
+        error=RuntimeError("sensitive internal detail"),
+    )
+    client, _, _, _ = make_client(
+        sglang_client=slow_client,
+        stream_heartbeat_interval_seconds=0.01,
+    )
+
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        headers={
+            "X-Session-Id": "sess-hb-internal",
+            "X-Instance-Id": "inst-hb-internal",
+        },
+        json={
+            "model": "fake-model",
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    ) as response:
+        body = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    assert ": dressage-heartbeat" in body
+    error = next(event["error"] for event in sse_json_events(body) if "error" in event)
+    assert error == {
+        "code": "internal_error",
+        "message": "Internal proxy error.",
+        "type": "dressage_proxy_error",
+        "status_code": 500,
+    }
+    assert "sensitive internal detail" not in body
+
+
+def test_stream_cancellation_aborts_generation():
+    async def run_test() -> None:
+        sglang_client = AsyncBlockingSGLangClient([make_response("unused")])
+        sync_client, session_manager, _, _ = make_client(
+            sglang_client=sglang_client,
+            stream_heartbeat_interval_seconds=0.01,
+        )
+        headers = {
+            "X-Session-Id": "sess-disconnect-abort",
+            "X-Instance-Id": "inst-abort",
+            "X-Turn-Id": "turn-1",
+        }
+        body = {
+            "model": "fake-model",
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=sync_client.app),
+            base_url="http://test",
+        ) as client:
+            request = asyncio.create_task(
+                client.post("/v1/chat/completions", json=body, headers=headers)
+            )
+            await asyncio.wait_for(
+                sglang_client.first_call_started.wait(),
+                timeout=1.0,
+            )
+            await asyncio.sleep(0.03)
+            request.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await request
+
+            pause_state = (await client.get("/v1/rollout/pause_state")).json()
+
+        assert len(sglang_client.abort_calls) == 1
+        assert pause_state["active_sglang_generations"] == 0
+        session = session_manager.get_session("sess-disconnect-abort")
+        assert session is not None
+        assert session.steps == []
+
+    asyncio.run(run_test())
 
 
 def test_streaming_include_usage_true_and_bad_options_default_to_usage():
@@ -5661,6 +5979,37 @@ def test_generation_controller_rejects_preempt_without_partial_resume():
     asyncio.run(run_test())
 
     assert len(sglang_client.calls) == 1
+
+
+def test_generation_controller_cancellation_aborts_active_request():
+    from dressage.proxy.generation_controller import GenerationController
+
+    async def run_test() -> None:
+        sglang_client = AsyncBlockingSGLangClient([make_response("late")])
+        controller = GenerationController(sglang_client)
+        generation = asyncio.create_task(
+            controller.generate_preemptible(
+                [1],
+                {"max_new_tokens": 1},
+                session_id="sess-cancelled-stream",
+                instance_id="inst-cancelled-stream",
+                turn_id="turn-cancelled-stream",
+            )
+        )
+        await asyncio.wait_for(
+            sglang_client.first_call_started.wait(),
+            timeout=1.0,
+        )
+
+        generation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await generation
+
+        assert len(sglang_client.abort_calls) == 1
+        assert sglang_client.abort_calls[0]["request_id"]
+        assert controller.state()["active_sglang_generations"] == 0
+
+    asyncio.run(run_test())
 
 
 def test_generation_controller_rejects_stale_epoch_before_sglang():

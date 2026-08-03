@@ -7,17 +7,17 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import time
 import uuid
 from contextlib import asynccontextmanager
-
-import httpx
 from typing import Any, Literal
 
+import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from transformers import AutoTokenizer
 
 from dressage.config import (
@@ -55,6 +55,52 @@ logger = logging.getLogger(__name__)
 _INPUT_TOKEN_VERSION = "-1"
 _DEFAULT_TOOL_CALL_PARSER = object()
 _NON_REAL_TOKEN_VERSIONS = {"", "-1", "unknown", "none"}
+_DEFAULT_STREAM_HEARTBEAT_INTERVAL_SECONDS = 15.0
+_SSE_HEARTBEAT = ": dressage-heartbeat\n\n"
+_SSE_RESPONSE_HEADERS = {
+    "Cache-Control": "no-cache, no-transform",
+    "X-Accel-Buffering": "no",
+}
+
+
+def _response_json_payload(response: Response) -> Any:
+    body = bytes(response.body)
+    try:
+        return json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return {"message": body.decode("utf-8", "replace")}
+
+
+def _stream_error_chunk(status_code: int, payload: Any) -> str:
+    """Render an in-stream SSE error event.
+
+    Once heartbeat streaming has sent the response headers, failures can no
+    longer change the HTTP status code, so the payload is normalized into a
+    terminal error event that retains its details and intended status code.
+    """
+
+    error = dict(payload) if isinstance(payload, dict) else {"message": str(payload)}
+    raw_code = error.get("code") or error.get("error")
+    code = raw_code if isinstance(raw_code, str) and raw_code else "http_error"
+    raw_message = error.get("message") or error.get("detail")
+    message = (
+        raw_message
+        if isinstance(raw_message, str) and raw_message
+        else f"Dressage proxy error: {code}"
+    )
+    error.pop("error", None)
+    error["type"] = "dressage_proxy_error"
+    error["code"] = code
+    error["message"] = message
+    error["status_code"] = status_code
+    return f"data: {json.dumps({'error': error})}\n\n"
+
+
+def _consume_task_exception(task: asyncio.Task[Any]) -> None:
+    """Retrieve a detached pipeline exception to avoid an asyncio warning."""
+
+    if not task.cancelled():
+        task.exception()
 TokenBuildMode = Literal["tito", "snapshot"]
 SegmentView = Literal["lineage", "timeline"]
 
@@ -80,6 +126,18 @@ def _non_negative_int(value: str) -> int:
         raise argparse.ArgumentTypeError("must be an integer") from exc
     if parsed < 0:
         raise argparse.ArgumentTypeError("must be greater than or equal to 0")
+    return parsed
+
+
+def _non_negative_finite_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError(
+            "must be a finite number greater than or equal to 0"
+        )
     return parsed
 
 
@@ -562,11 +620,22 @@ def create_app(
     use_rollout_routing_replay: bool = False,
     partial_rollout: bool = False,
     max_partial_rollout_preempts: int | None = None,
+    stream_heartbeat_interval_seconds: float = (
+        _DEFAULT_STREAM_HEARTBEAT_INTERVAL_SECONDS
+    ),
 ) -> FastAPI:
     """Create the Dressage proxy FastAPI app."""
 
     if context_window is not None and context_window <= 0:
         raise ValueError("context_window must be greater than 0 when provided")
+    if (
+        not math.isfinite(stream_heartbeat_interval_seconds)
+        or stream_heartbeat_interval_seconds < 0
+    ):
+        raise ValueError(
+            "stream_heartbeat_interval_seconds must be a finite number "
+            "greater than or equal to 0"
+        )
     if max_output_tokens is not None and max_output_tokens <= 0:
         raise ValueError("max_output_tokens must be greater than 0")
     if max_partial_rollout_preempts is not None and max_partial_rollout_preempts < 0:
@@ -1420,20 +1489,20 @@ def create_app(
                 }
             )
 
-    @app.post("/v1/chat/completions")
-    async def chat_completions(request: Request):
-        _check_auth(request)
-        body = await request.json()
+    async def _chat_completions_pipeline(
+        request: Request, body: dict[str, Any]
+    ) -> Response:
+        """Run one full generate-and-record step and build its HTTP response."""
         messages: list[dict] = body.get("messages", [])
         model = body.get("model", "proxy-model")
         stream = bool(body.get("stream", False))
-        tools = body.get("tools")
         stream_options = body.get("stream_options")
         if not isinstance(stream_options, dict):
             stream_options = {}
         # Dressage defaults usage on for opencode compatibility; set
         # stream_options.include_usage=false to opt out.
         include_usage = stream_options.get("include_usage", True) is not False
+        tools = body.get("tools")
 
         session_id, instance_id, turn_id = _runtime_ids_from_request(request, body)
         try:
@@ -1938,6 +2007,7 @@ def create_app(
                     include_usage,
                 ),
                 media_type="text/event-stream",
+                headers=_SSE_RESPONSE_HEADERS,
             )
 
         return JSONResponse(
@@ -1951,6 +2021,94 @@ def create_app(
                 completion_tokens=public_completion_tokens,
                 response_id=response_id,
             )
+        )
+
+    @app.post("/v1/chat/completions")
+    async def chat_completions(request: Request):
+        _check_auth(request)
+        body = await request.json()
+        stream = bool(body.get("stream", False))
+
+        if not stream or stream_heartbeat_interval_seconds <= 0:
+            return await _chat_completions_pipeline(request, body)
+
+        # Preserve the original HTTP status for operations that finish before
+        # the first configured heartbeat.
+        task = asyncio.create_task(_chat_completions_pipeline(request, body))
+        task.add_done_callback(_consume_task_exception)
+        try:
+            done, _ = await asyncio.wait(
+                {task},
+                timeout=stream_heartbeat_interval_seconds,
+            )
+        except asyncio.CancelledError:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
+        if done:
+            return task.result()
+
+        async def _heartbeat_stream():
+            try:
+                while True:
+                    if task.done():
+                        break
+                    yield _SSE_HEARTBEAT
+                    finished, _ = await asyncio.wait(
+                        {task},
+                        timeout=stream_heartbeat_interval_seconds,
+                    )
+                    if finished:
+                        break
+                try:
+                    result = task.result()
+                except HTTPException as exc:
+                    yield _stream_error_chunk(exc.status_code, exc.detail)
+                    yield "data: [DONE]\n\n"
+                    return
+                except Exception:
+                    logger.exception("chat completion failed during heartbeat streaming")
+                    yield _stream_error_chunk(
+                        500,
+                        {
+                            "code": "internal_error",
+                            "message": "Internal proxy error.",
+                        },
+                    )
+                    yield "data: [DONE]\n\n"
+                    return
+                if not 200 <= result.status_code < 300:
+                    yield _stream_error_chunk(
+                        result.status_code, _response_json_payload(result)
+                    )
+                    yield "data: [DONE]\n\n"
+                    return
+                if not isinstance(result, StreamingResponse):
+                    logger.error(
+                        "chat completion pipeline returned a non-streaming "
+                        "success response after heartbeat streaming started"
+                    )
+                    yield _stream_error_chunk(
+                        500,
+                        {
+                            "code": "internal_error",
+                            "message": "Internal proxy error.",
+                        },
+                    )
+                    yield "data: [DONE]\n\n"
+                    return
+                async for chunk in result.body_iterator:
+                    yield chunk
+            finally:
+                if not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                    logger.info("chat completion client disconnected; cancelled generation")
+
+        return StreamingResponse(
+            _heartbeat_stream(),
+            media_type="text/event-stream",
+            headers=_SSE_RESPONSE_HEADERS,
         )
 
     @app.post("/session/finalize")
@@ -2245,6 +2403,9 @@ def create_app(
                 "use_rollout_routing_replay": use_rollout_routing_replay,
                 "partial_rollout": partial_rollout,
                 "max_partial_rollout_preempts": max_partial_rollout_preempts,
+                "stream_heartbeat_interval_seconds": (
+                    stream_heartbeat_interval_seconds
+                ),
             },
         }
 
@@ -2352,6 +2513,16 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Maximum model weight version switches allowed for one partial-rollout session.",
     )
+    parser.add_argument(
+        "--stream-heartbeat-interval-seconds",
+        type=_non_negative_finite_float,
+        default=_DEFAULT_STREAM_HEARTBEAT_INTERVAL_SECONDS,
+        help=(
+            "Seconds between SSE comment heartbeats for stream=true requests "
+            "while generation is still running. 0 disables heartbeats and "
+            "keeps the legacy respond-after-completion behavior."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -2384,6 +2555,7 @@ def main() -> None:
         use_rollout_routing_replay=args.use_rollout_routing_replay,
         partial_rollout=args.dressage_partial_rollout,
         max_partial_rollout_preempts=args.max_partial_rollout_preempts,
+        stream_heartbeat_interval_seconds=args.stream_heartbeat_interval_seconds,
     )
     uvicorn.run(app, host=args.host, port=args.port)
 

@@ -247,6 +247,33 @@ class GenerationController:
                     logprob_start_len=chunk_logprob_start_len,
                 )
                 forced_preempted = active.abort_succeeded
+            except asyncio.CancelledError:
+                # A disconnected stream cancels its response producer. Abort
+                # the model request before removing it from the active set.
+                active.state = "preempting"
+                try:
+                    await asyncio.shield(
+                        self._abort_active_with_timeout(
+                            active,
+                            timeout_seconds=5.0,
+                        )
+                    )
+                except BaseException as abort_exc:
+                    active.abort_succeeded = False
+                    active.abort_error = repr(abort_exc)
+                    logger.warning(
+                        "failed to abort cancelled SGLang request rid=%s "
+                        "session_id=%s error=%s",
+                        active.request_id,
+                        active.session_id,
+                        abort_exc,
+                    )
+                finally:
+                    async with self._pause_lock:
+                        self._active.pop(active.request_id, None)
+                        active.state = "quiesced"
+                        active.quiesced_event.set()
+                raise
             except Exception as exc:
                 if self._shutting_down:
                     async with self._pause_lock:
