@@ -22,10 +22,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from blackbox_server.adapters.base import (
     BackendAdapter,
     BackendCapabilities,
+    BackendError,
     BackendProcessError,
     BackendProtocolError,
     BackendTransportError,
-    backend_context_overflow_from_proxy_payload,
 )
 from blackbox_server.core.models import (
     AdapterResponse,
@@ -472,7 +472,7 @@ class CodexAdapter(BackendAdapter):
                 backend_session_id=target_backend_session_id,
             )
 
-        success = False
+        proxy_failure_checked = False
         try:
             task = asyncio.create_task(
                 self._run_codex_turn(
@@ -481,16 +481,11 @@ class CodexAdapter(BackendAdapter):
                     session_state=session_state,
                 )
             )
-            try:
-                result = await self._await_backend_task_or_proxy_max_steps(
-                    task,
-                    session_context=session_context,
-                    proxy=self._proxy,
-                )
-            except BackendTransportError as exc:
-                await self._raise_if_proxy_context_overflow()
-                await self._raise_if_proxy_rollout_invalidated()
-                await self._raise_with_proxy_failed_upstream(exc)
+            result = await self._await_backend_task_or_proxy_max_steps(
+                task,
+                session_context=session_context,
+                proxy=self._proxy,
+            )
             if result.backend_session_id:
                 target_backend_session_id = result.backend_session_id
                 if self._proxy is not None:
@@ -498,31 +493,42 @@ class CodexAdapter(BackendAdapter):
                         target_backend_session_id
                     )
             if self._proxy is not None:
-                await self._proxy.drain_turn(
-                    timeout=self._remaining_timeout(
-                        deadline, operation="wait for rollout proxy drain"
-                    )
+                proxy_drain_timeout = self._remaining_timeout(
+                    deadline,
+                    operation="wait for rollout proxy drain",
                 )
-                await self._raise_if_proxy_context_overflow()
-                await self._raise_if_proxy_rollout_invalidated()
+                proxy_failure_checked = True
+                await self._drain_and_raise_proxy_failure(
+                    self._proxy,
+                    drain_timeout=proxy_drain_timeout,
+                )
             session_context.backend_session_id = target_backend_session_id
-            success = True
             return AdapterResponse(
                 outputs=result.outputs,
                 trace_events=result.trace_events,
                 usage=result.usage,
                 backend_session_id=target_backend_session_id,
             )
+        except (BackendError, asyncio.TimeoutError) as exc:
+            if proxy_failure_checked:
+                raise
+            proxy_failure_checked = True
+            await self._drain_and_raise_proxy_failure(
+                self._proxy,
+                original_error=exc,
+                drain_timeout=2.0,
+            )
         finally:
             if self._proxy is not None:
-                drain_timeout = None if success else 2.0
                 try:
-                    await self._proxy.drain_turn(timeout=drain_timeout)
-                except asyncio.TimeoutError:
-                    LOGGER.warning(
-                        "Timed out draining rollout proxy requests for turn %s",
-                        turn_context.turn_id,
-                    )
+                    if not proxy_failure_checked:
+                        try:
+                            await self._proxy.drain_turn(timeout=2.0)
+                        except asyncio.TimeoutError:
+                            LOGGER.warning(
+                                "Timed out draining rollout proxy requests for turn %s",
+                                turn_context.turn_id,
+                            )
                 finally:
                     await self._proxy.clear_turn()
 
@@ -803,53 +809,6 @@ class CodexAdapter(BackendAdapter):
         if remaining <= 0:
             raise asyncio.TimeoutError(f"Timed out before {operation}.")
         return remaining
-
-    async def _raise_if_proxy_context_overflow(self) -> None:
-        if self._proxy is None:
-            return
-        if not hasattr(self._proxy, "consume_context_overflow_error"):
-            return
-        payload = await self._proxy.consume_context_overflow_error()
-        typed_error = backend_context_overflow_from_proxy_payload(payload)
-        if typed_error is not None:
-            raise typed_error
-
-    async def _raise_if_proxy_rollout_invalidated(self) -> None:
-        if self._proxy is None:
-            return
-        if not hasattr(self._proxy, "consume_rollout_invalidated_error"):
-            return
-        payload = await self._proxy.consume_rollout_invalidated_error()
-        if payload is None:
-            return
-        error = payload.get("error") or "rollout_invalidated"
-        message = payload.get("message") or "Dressage rollout was invalidated."
-        raise BackendTransportError(f"Dressage proxy {error}: {message}")
-
-    async def _raise_with_proxy_failed_upstream(
-        self, exc: BackendTransportError
-    ) -> None:
-        if self._proxy is None:
-            raise exc
-        if not hasattr(self._proxy, "consume_failed_upstream_error"):
-            raise exc
-        payload = await self._proxy.consume_failed_upstream_error()
-        if payload is None:
-            raise exc
-        parts = [str(exc)]
-        message = payload.get("message")
-        if message:
-            parts.append(f"upstream error: {message}")
-        request_path = payload.get("request_path")
-        if request_path:
-            parts.append(f"failed upstream payload: {request_path}")
-        response_path = payload.get("response_path")
-        if response_path:
-            parts.append(f"failed upstream response: {response_path}")
-        dump_error = payload.get("dump_error")
-        if dump_error:
-            parts.append(f"failed upstream dump error: {dump_error}")
-        raise BackendTransportError("; ".join(parts)) from exc
 
     async def _terminate_active_process(self) -> bool:
         process = self._process

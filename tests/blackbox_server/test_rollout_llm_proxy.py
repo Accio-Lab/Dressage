@@ -24,6 +24,25 @@ class MockAsyncByteStream(httpx.AsyncByteStream):
         return None
 
 
+class BlockingAsyncByteStream(httpx.AsyncByteStream):
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.closed = asyncio.Event()
+
+    async def __aiter__(self):
+        self.started.set()
+        await asyncio.Event().wait()
+        yield b""
+
+    async def aclose(self) -> None:
+        self.closed.set()
+
+
+class RaisingCloseAsyncByteStream(MockAsyncByteStream):
+    async def aclose(self) -> None:
+        raise RuntimeError("upstream close failed")
+
+
 def _make_proxy(
     sticky_header_name: str = "X-SMG-Routing-Key",
     *,
@@ -396,6 +415,215 @@ def test_rollout_proxy_scopes_increment_steps_and_inject_turn_header():
         assert headers["X-Turn-Id"] == "turn-001"
 
     asyncio.run(run_test())
+
+
+def test_rollout_proxy_successful_later_attempt_clears_retryable_upstream_error():
+    proxy = _make_proxy(max_steps=2)
+    request_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        if request_count == 1:
+            return httpx.Response(
+                503,
+                json={
+                    "error": {
+                        "code": "sglang_upstream_unavailable",
+                        "message": "router unavailable",
+                    }
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp-1",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            },
+        )
+
+    body = {
+        "model": "agent-model",
+        "messages": [{"role": "user", "content": "same"}],
+        "stream": False,
+    }
+
+    async def run_test() -> tuple[httpx.Response, httpx.Response, dict[str, Any] | None]:
+        proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await proxy.open_turn("turn-001")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.app),
+            base_url="http://proxy",
+        ) as client:
+            failed = await client.post("/v1/chat/completions", json=body)
+            recovered = await client.post("/v1/chat/completions", json=body)
+        remaining_error = await proxy.consume_failed_upstream_error()
+        await proxy.clear_turn()
+        await proxy._client.aclose()
+        return failed, recovered, remaining_error
+
+    failed, recovered, remaining_error = asyncio.run(run_test())
+
+    assert failed.status_code == 503
+    assert recovered.status_code == 200
+    assert request_count == 2
+    assert remaining_error is None
+
+
+def test_rollout_proxy_later_step_success_ignores_delayed_retryable_error():
+    proxy = _make_proxy(max_steps=2)
+    first_request_started = asyncio.Event()
+    release_first_request = asyncio.Event()
+    request_count = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        if request_count == 1:
+            first_request_started.set()
+            await release_first_request.wait()
+            return httpx.Response(503, text="delayed temporary failure")
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp-2",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            },
+        )
+
+    async def run_test() -> dict[str, Any] | None:
+        proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await proxy.open_turn("turn-001")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.app),
+            base_url="http://proxy",
+        ) as client:
+            delayed_failure = asyncio.create_task(
+                client.post(
+                    "/v1/chat/completions",
+                    json={"model": "agent-model", "messages": []},
+                )
+            )
+            await first_request_started.wait()
+            recovered = await client.post(
+                "/v1/chat/completions",
+                json={"model": "agent-model", "messages": []},
+            )
+            release_first_request.set()
+            failed = await delayed_failure
+        remaining_error = await proxy.consume_failed_upstream_error()
+        await proxy.clear_turn()
+        await proxy._client.aclose()
+
+        assert recovered.status_code == 200
+        assert failed.status_code == 503
+        return remaining_error
+
+    assert asyncio.run(run_test()) is None
+
+
+def test_rollout_proxy_delayed_retryable_error_does_not_hide_terminal_error():
+    proxy = _make_proxy(max_steps=3)
+    first_request_started = asyncio.Event()
+    release_first_request = asyncio.Event()
+    request_count = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        if request_count == 1:
+            first_request_started.set()
+            await release_first_request.wait()
+            return httpx.Response(503, text="delayed temporary failure")
+        if request_count == 2:
+            return httpx.Response(400, text="terminal failure")
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp-3",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            },
+        )
+
+    async def run_test() -> dict[str, Any] | None:
+        proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await proxy.open_turn("turn-001")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.app),
+            base_url="http://proxy",
+        ) as client:
+            delayed_retryable = asyncio.create_task(
+                client.post(
+                    "/v1/chat/completions",
+                    json={"model": "agent-model", "messages": []},
+                )
+            )
+            await first_request_started.wait()
+            terminal = await client.post(
+                "/v1/chat/completions",
+                json={"model": "agent-model", "messages": []},
+            )
+            release_first_request.set()
+            retryable = await delayed_retryable
+            recovered = await client.post(
+                "/v1/chat/completions",
+                json={"model": "agent-model", "messages": []},
+            )
+        remaining_error = await proxy.consume_failed_upstream_error()
+        await proxy.clear_turn()
+        await proxy._client.aclose()
+
+        assert terminal.status_code == 400
+        assert retryable.status_code == 503
+        assert recovered.status_code == 200
+        return remaining_error
+
+    remaining_error = asyncio.run(run_test())
+    assert remaining_error is not None
+    assert remaining_error["status_code"] == 400
+    assert remaining_error["step"] == 1
+
+
+def test_rollout_proxy_terminal_retry_error_replaces_retryable_error():
+    proxy = _make_proxy(max_steps=2)
+    request_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        status_code = 503 if request_count == 1 else 500
+        return httpx.Response(
+            status_code,
+            json={"error": {"message": f"upstream {status_code}"}},
+        )
+
+    body = {
+        "model": "agent-model",
+        "messages": [{"role": "user", "content": "same"}],
+        "stream": False,
+    }
+
+    async def run_test() -> tuple[httpx.Response, httpx.Response, dict[str, Any] | None]:
+        proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await proxy.open_turn("turn-001")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.app),
+            base_url="http://proxy",
+        ) as client:
+            retryable = await client.post("/v1/chat/completions", json=body)
+            terminal = await client.post("/v1/chat/completions", json=body)
+        remaining_error = await proxy.consume_failed_upstream_error()
+        await proxy.clear_turn()
+        await proxy._client.aclose()
+        return retryable, terminal, remaining_error
+
+    retryable, terminal, remaining_error = asyncio.run(run_test())
+
+    assert retryable.status_code == 503
+    assert terminal.status_code == 500
+    assert request_count == 2
+    assert remaining_error is not None
+    assert remaining_error["status_code"] == 500
 
 
 def test_rollout_proxy_matches_any_chat_completion_prefix():
@@ -2578,3 +2806,553 @@ def test_rollout_proxy_recognizes_partial_staleness_invalidated_response():
     )
 
     assert recorded == payload["detail"]
+
+
+def _in_stream_error_event(error: dict[str, Any]) -> bytes:
+    return f"data: {json.dumps({'error': error})}\n\n".encode("utf-8")
+
+
+def test_rollout_proxy_sniffs_in_stream_context_overflow():
+    proxy = _make_proxy()
+    overflow_error = {
+        "type": "dressage_proxy_error",
+        "code": "context_overflow",
+        "message": "Dressage proxy context window overflow.",
+        "details": {"phase": "input_output", "context_window": 4096},
+        "status_code": 413,
+    }
+    error_event = _in_stream_error_event(overflow_error)
+    split_at = len(error_event) // 2
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=MockAsyncByteStream(
+                [
+                    b": dressage-heartbeat\n\n",
+                    b": dressage-heartbeat\n\n",
+                    error_event[:split_at],
+                    error_event[split_at:],
+                    b"data: [DONE]\n\n",
+                ]
+            ),
+        )
+
+    async def run_test() -> None:
+        proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await proxy.open_turn("turn-001")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.app),
+            base_url="http://proxy",
+        ) as client:
+            async with client.stream(
+                "POST",
+                "/v1/chat/completions",
+                json={"model": "proxy-model", "stream": True, "messages": []},
+            ) as response:
+                response_body = await response.aread()
+        await proxy.drain_turn(timeout=1.0)
+        overflow = await proxy.consume_context_overflow_error()
+        failed = await proxy.consume_failed_upstream_error()
+        await proxy.clear_turn()
+        await proxy._client.aclose()
+
+        assert response.status_code == 200
+        assert b": dressage-heartbeat" in response_body
+        assert b'"context_overflow"' in response_body
+        assert b"data: [DONE]" in response_body
+        assert overflow == overflow_error
+        assert failed is not None
+        assert failed["status_code"] == 413
+
+    asyncio.run(run_test())
+
+
+def test_rollout_proxy_sniffs_in_stream_rollout_invalidated():
+    proxy = _make_proxy()
+    invalidated_error = {
+        "type": "dressage_proxy_error",
+        "code": "generation_preempted",
+        "message": "stale",
+        "status_code": 502,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=MockAsyncByteStream(
+                [
+                    b": ping\n\n",
+                    _in_stream_error_event(invalidated_error),
+                    b"data: [DONE]\n\n",
+                ]
+            ),
+        )
+
+    async def run_test() -> None:
+        proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await proxy.open_turn("turn-001")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.app),
+            base_url="http://proxy",
+        ) as client:
+            async with client.stream(
+                "POST",
+                "/v1/chat/completions",
+                json={"model": "proxy-model", "stream": True, "messages": []},
+            ) as response:
+                response_body = await response.aread()
+        await proxy.drain_turn(timeout=1.0)
+        invalidated = await proxy.consume_rollout_invalidated_error()
+        failed = await proxy.consume_failed_upstream_error()
+        await proxy.clear_turn()
+        await proxy._client.aclose()
+
+        assert response.status_code == 200
+        assert b"generation_preempted" not in response_body
+        assert b"chatcmpl-rollout-invalidated" in response_body
+        assert b"data: [DONE]" in response_body
+        assert invalidated == invalidated_error
+        assert failed is None
+
+    asyncio.run(run_test())
+
+
+def test_rollout_proxy_anthropic_stream_sniffs_error_and_forwards_ping():
+    proxy = _make_proxy()
+    overflow_error = {
+        "type": "dressage_proxy_error",
+        "code": "context_overflow",
+        "message": "Dressage proxy context window overflow.",
+        "details": {"phase": "input_output"},
+        "status_code": 413,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=MockAsyncByteStream(
+                [
+                    b": dressage-heartbeat\n\n",
+                    _in_stream_error_event(overflow_error),
+                    b"data: [DONE]\n\n",
+                ]
+            ),
+        )
+
+    async def run_test() -> None:
+        proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await proxy.open_turn("turn-001", backend_session_id="claude-session-1")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.app),
+            base_url="http://proxy",
+        ) as client:
+            async with client.stream(
+                "POST",
+                "/v1/messages",
+                json={"model": "proxy-model", "max_tokens": 128, "stream": True, "messages": []},
+            ) as response:
+                response_body = await response.aread()
+        await proxy.drain_turn(timeout=1.0)
+        overflow = await proxy.consume_context_overflow_error()
+        await proxy.clear_turn()
+        await proxy._client.aclose()
+
+        assert response.status_code == 200
+        assert b"event: ping" in response_body
+        assert b"event: message_start" in response_body
+        assert b"event: message_stop" in response_body
+        assert b"context_overflow" not in response_body
+        assert overflow == overflow_error
+
+    asyncio.run(run_test())
+
+
+def test_rollout_proxy_anthropic_stream_emits_terminal_failed_upstream_error():
+    proxy = _make_proxy()
+    upstream_error = {
+        "code": "sglang_upstream_unavailable",
+        "message": "SGLang generation failed.",
+        "status_code": 503,
+    }
+    error_event = _in_stream_error_event(upstream_error).replace(b"\n", b"\r\n")
+    split_at = len(error_event) // 2
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=MockAsyncByteStream(
+                [
+                    b": ping\r\n\r\n",
+                    error_event[:split_at],
+                    error_event[split_at:],
+                    b"data: [DONE]\r\n\r\n",
+                ]
+            ),
+        )
+
+    async def run_test() -> None:
+        proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await proxy.open_turn("turn-001", backend_session_id="claude-session-1")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.app),
+            base_url="http://proxy",
+        ) as client:
+            async with client.stream(
+                "POST",
+                "/v1/messages",
+                json={"model": "proxy-model", "max_tokens": 128, "stream": True, "messages": []},
+            ) as response:
+                response_body = await response.aread()
+        await proxy.drain_turn(timeout=1.0)
+        failed = await proxy.consume_failed_upstream_error()
+        await proxy.clear_turn()
+        await proxy._client.aclose()
+
+        assert response.status_code == 200
+        assert b"event: ping" in response_body
+        assert b"event: error" in response_body
+        assert b'"type": "upstream_error"' in response_body
+        assert b"HTTP 503" in response_body
+        assert b"event: message_stop" not in response_body
+        assert failed is not None
+        assert failed["status_code"] == 503
+
+    asyncio.run(run_test())
+
+
+def test_rollout_proxy_anthropic_stream_keeps_invalidated_as_graceful_end():
+    proxy = _make_proxy()
+    invalidated_error = {
+        "code": "generation_preempted",
+        "message": "Generation was preempted.",
+        "status_code": 502,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=MockAsyncByteStream(
+                [_in_stream_error_event(invalidated_error), b"data: [DONE]\n\n"]
+            ),
+        )
+
+    async def run_test() -> None:
+        proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await proxy.open_turn("turn-001", backend_session_id="claude-session-1")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.app),
+            base_url="http://proxy",
+        ) as client:
+            async with client.stream(
+                "POST",
+                "/v1/messages",
+                json={"model": "proxy-model", "max_tokens": 128, "stream": True, "messages": []},
+            ) as response:
+                response_body = await response.aread()
+        await proxy.drain_turn(timeout=1.0)
+        invalidated = await proxy.consume_rollout_invalidated_error()
+        failed = await proxy.consume_failed_upstream_error()
+        await proxy.clear_turn()
+        await proxy._client.aclose()
+
+        assert response.status_code == 200
+        assert b"event: message_stop" in response_body
+        assert b"event: error" not in response_body
+        assert invalidated == invalidated_error
+        assert failed is None
+
+    asyncio.run(run_test())
+
+
+def test_rollout_proxy_sniffs_terminal_error_without_sse_delimiter():
+    proxy = _make_proxy()
+    upstream_error = {
+        "code": "sglang_upstream_unavailable",
+        "message": "SGLang generation failed.",
+        "status_code": 503,
+    }
+    terminal_event = _in_stream_error_event(upstream_error).removesuffix(b"\n\n")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=MockAsyncByteStream([terminal_event]),
+        )
+
+    async def run_test() -> None:
+        proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await proxy.open_turn("turn-001")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.app),
+            base_url="http://proxy",
+        ) as client:
+            async with client.stream(
+                "POST",
+                "/v1/chat/completions",
+                json={"model": "proxy-model", "stream": True, "messages": []},
+            ) as response:
+                response_body = await response.aread()
+        await proxy.drain_turn(timeout=1.0)
+        failed = await proxy.consume_failed_upstream_error()
+        await proxy.clear_turn()
+        await proxy._client.aclose()
+
+        assert response_body == terminal_event
+        assert failed is not None
+        assert failed["status_code"] == 503
+
+    asyncio.run(run_test())
+
+
+def test_rollout_proxy_rejects_invalid_embedded_http_statuses():
+    proxy = _make_proxy()
+
+    for status_code in (399, 600, "503", True):
+        assert (
+            proxy._in_stream_error_from_chunk(
+                {"error": {"code": "backend_error", "status_code": status_code}}
+            )
+            is None
+        )
+
+    assert (
+        proxy._in_stream_error_from_chunk(
+            {"error": {"code": "backend_error", "status_code": 599}}
+        )
+        is not None
+    )
+
+
+@pytest.mark.parametrize(
+    ("method_name", "extra_args"),
+    [
+        ("_stream_proxy", ()),
+        ("_stream_anthropic_messages_proxy", ()),
+        ("_stream_openai_responses_proxy", ({},)),
+    ],
+)
+def test_rollout_proxy_stream_error_body_cancellation_finishes_request(
+    method_name: str,
+    extra_args: tuple[Any, ...],
+    monkeypatch: pytest.MonkeyPatch,
+):
+    proxy = _make_proxy()
+
+    async def run_test() -> None:
+        proxy._client = httpx.AsyncClient()
+        await proxy.open_turn("turn-001")
+        snapshot = await proxy._enter_chat_request()
+        assert snapshot.scope is not None
+        stream = BlockingAsyncByteStream()
+
+        async def send_stream_request(*_args: Any) -> httpx.Response:
+            return httpx.Response(
+                503,
+                stream=stream,
+                request=httpx.Request("POST", "http://upstream/v1/chat/completions"),
+            )
+
+        monkeypatch.setattr(proxy, "_send_stream_request", send_stream_request)
+        method = getattr(proxy, method_name)
+        task = asyncio.create_task(
+            method("http://upstream/v1/chat/completions", b"{}", {}, snapshot, *extra_args)
+        )
+        await asyncio.wait_for(stream.started.wait(), timeout=1.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert stream.closed.is_set()
+        assert snapshot.scope.inflight_requests == 0
+        assert snapshot.scope.drained.is_set()
+        await proxy._client.aclose()
+
+    asyncio.run(run_test())
+
+
+def test_rollout_proxy_stream_close_error_still_finishes_request(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    proxy = _make_proxy()
+
+    async def run_test() -> None:
+        proxy._client = httpx.AsyncClient()
+        await proxy.open_turn("turn-001")
+        snapshot = await proxy._enter_chat_request()
+        assert snapshot.scope is not None
+        stream = RaisingCloseAsyncByteStream([b"data: [DONE]\n\n"])
+
+        async def send_stream_request(*_args: Any) -> httpx.Response:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=stream,
+                request=httpx.Request("POST", "http://upstream/v1/chat/completions"),
+            )
+
+        monkeypatch.setattr(proxy, "_send_stream_request", send_stream_request)
+        response = await proxy._stream_proxy(
+            "http://upstream/v1/chat/completions",
+            b"{}",
+            {},
+            snapshot,
+        )
+        with pytest.raises(RuntimeError, match="upstream close failed"):
+            async for _ in response.body_iterator:
+                pass
+
+        assert snapshot.scope.inflight_requests == 0
+        assert snapshot.scope.drained.is_set()
+        await proxy._client.aclose()
+
+    asyncio.run(run_test())
+
+
+def test_rollout_proxy_openai_responses_forwards_heartbeat_comment():
+    proxy = _make_proxy()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=MockAsyncByteStream(
+                [
+                    b": dressage-heartbeat\n\n",
+                    _sse_event(
+                        {
+                            "id": "chatcmpl-stream",
+                            "choices": [{"delta": {"content": "ok"}}],
+                        }
+                    ),
+                    b"data: [DONE]\n\n",
+                ]
+            ),
+        )
+
+    async def run_test() -> None:
+        proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await proxy.open_turn("turn-001", backend_session_id="codex-session-1")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.app),
+            base_url="http://proxy",
+        ) as client:
+            async with client.stream(
+                "POST",
+                "/v1/responses",
+                json={"model": "proxy-model", "input": "hi", "stream": True},
+            ) as response:
+                response_body = await response.aread()
+        await proxy.drain_turn(timeout=1.0)
+        failed = await proxy.consume_failed_upstream_error()
+        await proxy.clear_turn()
+        await proxy._client.aclose()
+
+        assert response.status_code == 200
+        assert b": dressage-heartbeat" in response_body
+        assert b"event: response.completed" in response_body
+        assert failed is None
+
+    asyncio.run(run_test())
+
+
+def test_rollout_proxy_openai_responses_emits_terminal_failed_upstream_error():
+    proxy = _make_proxy()
+    upstream_error = {
+        "code": "sglang_upstream_unavailable",
+        "message": "router unavailable",
+        "status_code": 503,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=MockAsyncByteStream(
+                [
+                    b": dressage-heartbeat\n\n",
+                    _in_stream_error_event(upstream_error),
+                    b"data: [DONE]\n\n",
+                ]
+            ),
+        )
+
+    async def run_test() -> None:
+        proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await proxy.open_turn("turn-001", backend_session_id="codex-session-1")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.app),
+            base_url="http://proxy",
+        ) as client:
+            async with client.stream(
+                "POST",
+                "/v1/responses",
+                json={"model": "proxy-model", "input": "hi", "stream": True},
+            ) as response:
+                response_body = await response.aread()
+        await proxy.drain_turn(timeout=1.0)
+        failed = await proxy.consume_failed_upstream_error()
+        await proxy.clear_turn()
+        await proxy._client.aclose()
+
+        events = _sse_events_from_body(response_body)
+        assert response.status_code == 200
+        assert b": dressage-heartbeat" in response_body
+        assert any(name == "error" for name, _ in events)
+        assert not any(name == "response.completed" for name, _ in events)
+        assert failed is not None
+        assert failed["status_code"] == 503
+
+    asyncio.run(run_test())
+
+
+def test_rollout_proxy_openai_responses_keeps_invalidated_as_graceful_completion():
+    proxy = _make_proxy()
+    invalidated_error = {
+        "code": "generation_preempted",
+        "message": "Generation was preempted.",
+        "status_code": 502,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=MockAsyncByteStream(
+                [_in_stream_error_event(invalidated_error), b"data: [DONE]\n\n"]
+            ),
+        )
+
+    async def run_test() -> None:
+        proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await proxy.open_turn("turn-001", backend_session_id="codex-session-1")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.app),
+            base_url="http://proxy",
+        ) as client:
+            async with client.stream(
+                "POST",
+                "/v1/responses",
+                json={"model": "proxy-model", "input": "hi", "stream": True},
+            ) as response:
+                response_body = await response.aread()
+        await proxy.drain_turn(timeout=1.0)
+        invalidated = await proxy.consume_rollout_invalidated_error()
+        failed = await proxy.consume_failed_upstream_error()
+        await proxy.clear_turn()
+        await proxy._client.aclose()
+
+        events = _sse_events_from_body(response_body)
+        assert response.status_code == 200
+        assert any(name == "response.completed" for name, _ in events)
+        assert not any(name == "error" for name, _ in events)
+        assert invalidated == invalidated_error
+        assert failed is None
+
+    asyncio.run(run_test())

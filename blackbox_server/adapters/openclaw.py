@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from blackbox_server.adapters.base import (
     BackendAdapter,
     BackendCapabilities,
+    BackendError,
     BackendMaxStepsExceededError,
     BackendProcessError,
     BackendProtocolError,
@@ -201,7 +202,7 @@ class OpenClawAdapter(BackendAdapter):
         if self._proxy is not None:
             await self._proxy.open_turn(turn_context.turn_id, backend_session_id=backend_session_id)
 
-        success = False
+        proxy_failure_checked = False
         try:
             chat_task = asyncio.create_task(
                 self._post_chat_completions(
@@ -217,11 +218,15 @@ class OpenClawAdapter(BackendAdapter):
                 proxy=self._proxy,
             )
             if self._proxy is not None:
-                await self._proxy.drain_turn(
-                    timeout=self._remaining_timeout(deadline, operation="wait for rollout proxy drain")
+                proxy_drain_timeout = self._remaining_timeout(
+                    deadline,
+                    operation="wait for rollout proxy drain",
                 )
-                await self._raise_if_proxy_context_overflow()
-                await self._raise_if_proxy_rollout_invalidated()
+                proxy_failure_checked = True
+                await self._drain_and_raise_proxy_failure(
+                    self._proxy,
+                    drain_timeout=proxy_drain_timeout,
+                )
 
             _raise_if_openclaw_max_steps_exceeded(raw, self._options)
 
@@ -229,20 +234,32 @@ class OpenClawAdapter(BackendAdapter):
                 turn_context.turn_id,
                 raw,
             )
-            success = True
             return AdapterResponse(
                 outputs=outputs,
                 trace_events=trace_events,
                 usage=usage,
                 backend_session_id=backend_session_id,
             )
+        except (BackendError, asyncio.TimeoutError) as exc:
+            if proxy_failure_checked:
+                raise
+            proxy_failure_checked = True
+            await self._drain_and_raise_proxy_failure(
+                self._proxy,
+                original_error=exc,
+                drain_timeout=2.0,
+            )
         finally:
             if self._proxy is not None:
-                drain_timeout = None if success else 2.0
                 try:
-                    await self._proxy.drain_turn(timeout=drain_timeout)
-                except asyncio.TimeoutError:
-                    LOGGER.warning("Timed out draining rollout proxy requests for turn %s", turn_context.turn_id)
+                    if not proxy_failure_checked:
+                        try:
+                            await self._proxy.drain_turn(timeout=2.0)
+                        except asyncio.TimeoutError:
+                            LOGGER.warning(
+                                "Timed out draining rollout proxy requests for turn %s",
+                                turn_context.turn_id,
+                            )
                 finally:
                     await self._proxy.clear_turn()
 
@@ -864,29 +881,6 @@ class OpenClawAdapter(BackendAdapter):
             sock.bind(("127.0.0.1", 0))
             sock.listen(1)
             return int(sock.getsockname()[1])
-
-    async def _raise_if_proxy_context_overflow(self) -> None:
-        if self._proxy is None:
-            return
-        if not hasattr(self._proxy, "consume_context_overflow_error"):
-            return
-        payload = await self._proxy.consume_context_overflow_error()
-        typed_error = backend_context_overflow_from_proxy_payload(payload)
-        if typed_error is not None:
-            raise typed_error
-
-    async def _raise_if_proxy_rollout_invalidated(self) -> None:
-        if self._proxy is None:
-            return
-        if not hasattr(self._proxy, "consume_rollout_invalidated_error"):
-            return
-        payload = await self._proxy.consume_rollout_invalidated_error()
-        if payload is None:
-            return
-        error = payload.get("error") or "rollout_invalidated"
-        message = payload.get("message") or "Dressage rollout was invalidated."
-        raise BackendTransportError(f"Dressage proxy {error}: {message}")
-
 
 def _maybe_int(value: Any) -> int | None:
     if value is None or isinstance(value, bool):

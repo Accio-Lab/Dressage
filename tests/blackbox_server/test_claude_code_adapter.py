@@ -4,11 +4,17 @@ import asyncio
 import json
 import sys
 from pathlib import Path
+from typing import Any
+from unittest.mock import patch
 
 import pytest
 
 import blackbox_server.adapters.claude_code as claude_code_module
-from blackbox_server.adapters.base import BackendProtocolError, BackendTransportError
+from blackbox_server.adapters.base import (
+    BackendContextOverflowError,
+    BackendProtocolError,
+    BackendTransportError,
+)
 from blackbox_server.adapters.claude_code import (
     ClaudeCodeAdapter,
     ClaudeCodeBackendOptions,
@@ -22,7 +28,16 @@ from blackbox_server.adapters.claude_code import (
     convert_claude_code_stream_events,
 )
 from blackbox_server.config import BlackboxServerConfig
-from blackbox_server.core.models import BindingContext, BindingInfo, TurnContext, utcnow
+from blackbox_server.core.models import (
+    BindingContext,
+    BindingInfo,
+    Message,
+    SessionContext,
+    SessionState,
+    TurnContext,
+    TurnUsage,
+    utcnow,
+)
 
 EXPECTED_CLAUDE_CODE_PERMISSION_ALLOW = [
     "Bash(*)",
@@ -464,8 +479,17 @@ def test_claude_code_stream_error_summary_extracts_nested_error_fields() -> None
     assert "transport closed" in summary
 
 
-def test_claude_code_adapter_appends_failed_upstream_payload_path() -> None:
+def test_adapter_proxy_failure_appends_failed_upstream_payload_paths() -> None:
     class FakeProxy:
+        async def drain_turn(self, timeout: float | None = None) -> None:
+            assert timeout == 2.0
+
+        async def consume_context_overflow_error(self) -> None:
+            return None
+
+        async def consume_rollout_invalidated_error(self) -> None:
+            return None
+
         async def consume_failed_upstream_error(self) -> dict[str, object]:
             return {
                 "message": "Upstream returned HTTP 500: Internal Server Error",
@@ -475,14 +499,229 @@ def test_claude_code_adapter_appends_failed_upstream_payload_path() -> None:
 
     async def run_test() -> None:
         adapter = ClaudeCodeAdapter()
-        adapter._proxy = FakeProxy()  # type: ignore[assignment]
+        original_error = BackendTransportError("claude_code exited with code 1")
         with pytest.raises(BackendTransportError) as exc_info:
-            await adapter._raise_with_proxy_failed_upstream(BackendTransportError("claude_code exited with code 1"))
+            await adapter._drain_and_raise_proxy_failure(
+                FakeProxy(),
+                original_error=original_error,
+                drain_timeout=2.0,
+            )
         message = str(exc_info.value)
         assert "claude_code exited with code 1" in message
         assert "Internal Server Error" in message
         assert "failed upstream payload: /tmp/runtime/logs/upstream_request.turn-001.0.json" in message
         assert "failed upstream response: /tmp/runtime/logs/upstream_response.turn-001.0.json" in message
+        assert exc_info.value.__cause__ is original_error
+
+    asyncio.run(run_test())
+
+
+def test_adapter_proxy_failure_prefers_context_overflow_marker() -> None:
+    calls: list[str] = []
+
+    class FakeProxy:
+        async def drain_turn(self, timeout: float | None = None) -> None:
+            calls.append("drain")
+
+        async def consume_context_overflow_error(self) -> dict[str, object]:
+            calls.append("context_overflow")
+            return {
+                "type": "dressage_proxy_error",
+                "code": "context_overflow",
+                "message": "Prompt plus completion exceeds the context window.",
+                "details": {
+                    "context_window": 4096,
+                    "input_tokens": 4000,
+                    "max_tokens": 512,
+                },
+            }
+
+        async def consume_rollout_invalidated_error(self) -> dict[str, object]:
+            calls.append("rollout_invalidated")
+            return {"code": "generation_preempted"}
+
+        async def consume_failed_upstream_error(self) -> dict[str, object]:
+            calls.append("failed_upstream")
+            return {"message": "Upstream returned HTTP 413"}
+
+    async def run_test() -> None:
+        adapter = ClaudeCodeAdapter()
+        original_error = BackendProtocolError("invalid backend response")
+        with pytest.raises(BackendContextOverflowError) as exc_info:
+            await adapter._drain_and_raise_proxy_failure(
+                FakeProxy(),
+                original_error=original_error,
+                drain_timeout=2.0,
+            )
+
+        assert exc_info.value.context_window == 4096
+        assert exc_info.value.__cause__ is original_error
+        assert calls == ["drain", "context_overflow"]
+
+    asyncio.run(run_test())
+
+
+def test_adapter_proxy_failure_prefers_invalidated_over_failed_upstream() -> None:
+    calls: list[str] = []
+
+    class FakeProxy:
+        async def drain_turn(self, timeout: float | None = None) -> None:
+            calls.append("drain")
+
+        async def consume_context_overflow_error(self) -> None:
+            calls.append("context_overflow")
+            return None
+
+        async def consume_rollout_invalidated_error(self) -> dict[str, object]:
+            calls.append("rollout_invalidated")
+            return {
+                "code": "generation_preempted",
+                "message": "Generation was preempted.",
+            }
+
+        async def consume_failed_upstream_error(self) -> dict[str, object]:
+            calls.append("failed_upstream")
+            return {"message": "Upstream returned HTTP 502"}
+
+    async def run_test() -> None:
+        adapter = ClaudeCodeAdapter()
+        original_error = BackendProtocolError("invalid backend response")
+        with pytest.raises(
+            BackendTransportError,
+            match="generation_preempted",
+        ) as exc_info:
+            await adapter._drain_and_raise_proxy_failure(
+                FakeProxy(),
+                original_error=original_error,
+                drain_timeout=2.0,
+            )
+
+        assert exc_info.value.__cause__ is original_error
+        assert calls == ["drain", "context_overflow", "rollout_invalidated"]
+
+    asyncio.run(run_test())
+
+
+def test_proxy_wait_cancellation_cancels_backend_task() -> None:
+    backend_started = asyncio.Event()
+    backend_cancelled = asyncio.Event()
+
+    class FakeProxy:
+        async def wait_for_max_steps_error(
+            self,
+            timeout: float | None = None,
+        ) -> None:
+            await asyncio.Event().wait()
+
+        async def consume_max_steps_error(self) -> None:
+            return None
+
+    async def backend() -> None:
+        backend_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            backend_cancelled.set()
+            raise
+
+    async def run_test() -> None:
+        adapter = ClaudeCodeAdapter()
+        backend_task = asyncio.create_task(backend())
+        waiter = asyncio.create_task(
+            adapter._await_backend_task_or_proxy_max_steps(
+                backend_task,
+                session_context=None,  # type: ignore[arg-type]
+                proxy=FakeProxy(),
+            )
+        )
+        await backend_started.wait()
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+
+        assert backend_task.cancelled()
+        assert backend_cancelled.is_set()
+
+    asyncio.run(run_test())
+
+
+def test_claude_code_success_path_surfaces_proxy_failed_upstream(
+    tmp_path: Path,
+) -> None:
+    class FakeProxy:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, Any]] = []
+
+        async def open_turn(
+            self,
+            turn_id: str,
+            backend_session_id: str | None = None,
+        ) -> None:
+            self.calls.append(("open", (turn_id, backend_session_id)))
+
+        async def drain_turn(self, timeout: float | None = None) -> None:
+            self.calls.append(("drain", timeout))
+
+        async def consume_context_overflow_error(self) -> None:
+            self.calls.append(("consume_context_overflow_error", None))
+            return None
+
+        async def consume_rollout_invalidated_error(self) -> None:
+            self.calls.append(("consume_rollout_invalidated_error", None))
+            return None
+
+        async def consume_failed_upstream_error(self) -> dict[str, object]:
+            self.calls.append(("consume_failed_upstream_error", None))
+            return {"message": "Upstream returned HTTP 503: unavailable"}
+
+        async def clear_turn(self) -> None:
+            self.calls.append(("clear", None))
+
+    async def run_test() -> None:
+        adapter = ClaudeCodeAdapter()
+        adapter._binding_context = _make_binding_context(tmp_path)
+        adapter._proxy = FakeProxy()  # type: ignore[assignment]
+        session = SessionContext(
+            session_id="test-session",
+            state=SessionState.ACTIVE,
+            blackbox_type="claude_code",
+            backend_session_id="claude-session-1",
+            router_base_url="http://127.0.0.1:30000/v1",
+            created_at=utcnow(),
+            updated_at=utcnow(),
+        )
+        turn = TurnContext(
+            turn_id="turn-1",
+            request_fingerprint="fp-turn-1",
+            deadline_seconds=30.0,
+        )
+
+        with (
+            patch.object(adapter, "health", return_value=True),
+            patch.object(
+                adapter,
+                "_run_claude_turn",
+                return_value=([], [], TurnUsage()),
+            ),
+        ):
+            with pytest.raises(BackendTransportError, match="Upstream returned HTTP 503"):
+                await adapter.send_message(
+                    session,
+                    turn,
+                    [Message(role="user", content="hello")],
+                )
+
+        assert adapter._proxy.calls[0] == (
+            "open",
+            ("turn-1", "claude-session-1"),
+        )
+        assert adapter._proxy.calls[1][0] == "drain"
+        assert adapter._proxy.calls[2:] == [
+            ("consume_context_overflow_error", None),
+            ("consume_rollout_invalidated_error", None),
+            ("consume_failed_upstream_error", None),
+            ("clear", None),
+        ]
 
     asyncio.run(run_test())
 

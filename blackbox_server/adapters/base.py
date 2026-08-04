@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from abc import ABC, abstractmethod
 from typing import Any, Protocol
 
@@ -13,6 +14,9 @@ from blackbox_server.core.models import (
     SessionContext,
     TurnContext,
 )
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class BackendError(Exception):
@@ -117,7 +121,10 @@ class BackendContextOverflowError(BackendError):
 def backend_context_overflow_from_proxy_payload(
     payload: object,
 ) -> BackendContextOverflowError | None:
-    if not isinstance(payload, dict) or payload.get("error") != "context_overflow":
+    if (
+        not isinstance(payload, dict)
+        or (payload.get("code") or payload.get("error")) != "context_overflow"
+    ):
         return None
     details = payload.get("details")
     if not isinstance(details, dict):
@@ -163,6 +170,30 @@ def _maybe_int(value: object) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _failed_upstream_backend_error(
+    payload: dict[str, Any],
+    original_error: BaseException | None,
+) -> BackendTransportError:
+    parts: list[str] = []
+    if original_error is not None:
+        parts.append(str(original_error))
+    message = payload.get("message")
+    if message:
+        parts.append(f"upstream error: {message}")
+    request_path = payload.get("request_path")
+    if request_path:
+        parts.append(f"failed upstream payload: {request_path}")
+    response_path = payload.get("response_path")
+    if response_path:
+        parts.append(f"failed upstream response: {response_path}")
+    dump_error = payload.get("dump_error")
+    if dump_error:
+        parts.append(f"failed upstream dump error: {dump_error}")
+    return BackendTransportError(
+        "; ".join(parts) or "Dressage proxy upstream request failed."
+    )
 
 
 class BackendAdapter(ABC):
@@ -257,6 +288,12 @@ class BackendAdapter(ABC):
             if typed_error is not None:
                 raise typed_error
             return result
+        except asyncio.CancelledError:
+            if not task.done():
+                task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+            raise
         finally:
             if not max_steps_task.done():
                 max_steps_task.cancel()
@@ -275,6 +312,63 @@ class BackendAdapter(ABC):
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await asyncio.wait_for(task, timeout=2.0)
+
+    async def _drain_and_raise_proxy_failure(
+        self,
+        proxy: Any,
+        *,
+        original_error: BaseException | None = None,
+        drain_timeout: float | None = None,
+    ) -> None:
+        """Drain the proxy before consuming any failure recorded by its stream."""
+        if proxy is None:
+            if original_error is not None:
+                raise original_error
+            return
+
+        drain_error: asyncio.TimeoutError | None = None
+        if hasattr(proxy, "drain_turn"):
+            try:
+                await proxy.drain_turn(timeout=drain_timeout)
+            except asyncio.TimeoutError as exc:
+                drain_error = exc
+                LOGGER.warning(
+                    "Timed out draining rollout proxy before consuming failure "
+                    "markers; attribution may be incomplete."
+                )
+
+        if hasattr(proxy, "consume_context_overflow_error"):
+            payload = await proxy.consume_context_overflow_error()
+            typed_error = backend_context_overflow_from_proxy_payload(payload)
+            if typed_error is not None:
+                raise typed_error from original_error
+
+        if hasattr(proxy, "consume_rollout_invalidated_error"):
+            payload = await proxy.consume_rollout_invalidated_error()
+            if payload is not None:
+                error = (
+                    payload.get("code")
+                    or payload.get("error")
+                    or "rollout_invalidated"
+                )
+                message = (
+                    payload.get("message") or "Dressage rollout was invalidated."
+                )
+                raise BackendTransportError(
+                    f"Dressage proxy {error}: {message}"
+                ) from original_error
+
+        if hasattr(proxy, "consume_failed_upstream_error"):
+            payload = await proxy.consume_failed_upstream_error()
+            if payload is not None:
+                raise _failed_upstream_backend_error(
+                    payload, original_error
+                ) from original_error
+
+        if original_error is not None:
+            raise original_error
+        if drain_error is not None:
+            raise drain_error
 
     @abstractmethod
     async def shutdown(self) -> None:

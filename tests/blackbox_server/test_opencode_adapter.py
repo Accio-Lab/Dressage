@@ -262,6 +262,23 @@ class FakeProxy:
         self.calls.append(("clear", None))
 
 
+class FailedUpstreamProxy(FakeProxy):
+    async def consume_context_overflow_error(self) -> None:
+        self.calls.append(("consume_context_overflow_error", None))
+        return None
+
+    async def consume_rollout_invalidated_error(self) -> None:
+        self.calls.append(("consume_rollout_invalidated_error", None))
+        return None
+
+    async def consume_failed_upstream_error(self) -> dict[str, Any]:
+        self.calls.append(("consume_failed_upstream_error", None))
+        return {
+            "message": "Upstream returned HTTP 503: unavailable",
+            "request_path": "/tmp/upstream-request.json",
+        }
+
+
 def _make_binding_context(
     *,
     system_prompt: RuntimeSystemPrompt | None = None,
@@ -352,8 +369,7 @@ def test_send_message_drains_and_clears_proxy_scope():
         assert adapter._proxy.calls[1] == ("update", "oc-session-1")
         assert adapter._proxy.calls[2][0] == "drain"
         assert isinstance(adapter._proxy.calls[2][1], float)
-        assert adapter._proxy.calls[3] == ("drain", None)
-        assert adapter._proxy.calls[4] == ("clear", None)
+        assert adapter._proxy.calls[3] == ("clear", None)
 
     asyncio.run(run_test())
 
@@ -382,6 +398,50 @@ def test_send_message_best_effort_drains_proxy_on_failure():
         ]
 
     asyncio.run(run_test())
+
+
+def test_send_message_preserves_proxy_failure_when_backend_raises():
+    adapter = OpencodeAdapter()
+    adapter._proxy = FailedUpstreamProxy()
+    session = _make_session_context(backend_session_id=None)
+
+    async def run_test() -> None:
+        with (
+            patch.object(adapter, "health", return_value=True),
+            patch.object(
+                adapter,
+                "_ensure_backend_session",
+                return_value="oc-session-1",
+            ),
+            patch.object(
+                adapter,
+                "_post_message_with_connect_retry",
+                side_effect=BackendProtocolError("invalid streamed response"),
+            ),
+        ):
+            with pytest.raises(BackendTransportError) as exc_info:
+                await adapter.send_message(
+                    session,
+                    _make_turn_context("turn-1"),
+                    [Message(role="user", content="hello")],
+                )
+
+        message = str(exc_info.value)
+        assert "invalid streamed response" in message
+        assert "Upstream returned HTTP 503" in message
+        assert "failed upstream payload: /tmp/upstream-request.json" in message
+
+    asyncio.run(run_test())
+
+    assert adapter._proxy.calls == [
+        ("open", ("turn-1", None)),
+        ("update", "oc-session-1"),
+        ("drain", 2.0),
+        ("consume_context_overflow_error", None),
+        ("consume_rollout_invalidated_error", None),
+        ("consume_failed_upstream_error", None),
+        ("clear", None),
+    ]
 
 
 def test_send_message_aborts_pending_opencode_post_on_proxy_max_steps():

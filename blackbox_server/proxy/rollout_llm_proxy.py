@@ -6,7 +6,7 @@ import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Awaitable, Callable, Literal, Mapping
 
 import httpx
 from fastapi import FastAPI, Request
@@ -21,6 +21,15 @@ DRESSAGE_ROLLOUT_INVALIDATED_ERRORS = {
     "partial_rollout_staleness_exceeded",
     "trajectory_version_changed",
 }
+_MAX_SSE_SNIFF_EVENT_BYTES = 1024 * 1024
+_SSE_BOUNDARY_SUFFIX_BYTES = 3
+_RETRYABLE_UPSTREAM_STATUSES = {429, 502, 503, 504, 522}
+_InStreamErrorKind = Literal[
+    "context_overflow",
+    "rollout_invalidated",
+    "failed_upstream",
+]
+_ModelRequestOutcome = Literal["succeeded", "retryable", "failed"]
 
 
 @dataclass
@@ -33,6 +42,7 @@ class _TurnScope:
     rollout_invalidated_error: dict[str, Any] | None = None
     max_steps_error: dict[str, Any] | None = None
     failed_upstream_error: dict[str, Any] | None = None
+    latest_successful_step: int | None = None
     drained: asyncio.Event = field(default_factory=asyncio.Event)
     max_steps_exceeded: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -721,6 +731,14 @@ class RolloutLLMProxy:
         return headers
 
     @staticmethod
+    def _request_outcome_for_status(status_code: int) -> _ModelRequestOutcome:
+        return (
+            "retryable"
+            if status_code in _RETRYABLE_UPSTREAM_STATUSES
+            else "failed"
+        )
+
+    @staticmethod
     def _set_header(headers: dict[str, str], name: str, value: str) -> None:
         for existing in list(headers):
             if existing.lower() == name.lower():
@@ -849,8 +867,31 @@ class RolloutLLMProxy:
             scope.inflight_requests += 1
             scope.drained.clear()
 
-    async def _mark_request_finished(self, scope: _TurnScope) -> None:
+    async def _mark_request_finished(
+        self,
+        snapshot: _TurnSnapshot,
+        *,
+        outcome: _ModelRequestOutcome,
+    ) -> None:
+        scope = snapshot.scope
+        if scope is None:
+            return
         async with self._scope_lock:
+            if outcome == "succeeded":
+                if (
+                    scope.latest_successful_step is None
+                    or snapshot.step > scope.latest_successful_step
+                ):
+                    scope.latest_successful_step = snapshot.step
+                failed_upstream = scope.failed_upstream_error
+                if (
+                    isinstance(failed_upstream, dict)
+                    and failed_upstream.get("status_code")
+                    in _RETRYABLE_UPSTREAM_STATUSES
+                    and isinstance(failed_upstream.get("step"), int)
+                    and failed_upstream["step"] <= scope.latest_successful_step
+                ):
+                    scope.failed_upstream_error = None
             if scope.inflight_requests > 0:
                 scope.inflight_requests -= 1
             if scope.inflight_requests == 0:
@@ -865,6 +906,7 @@ class RolloutLLMProxy:
         snapshot: _TurnSnapshot | None,
     ) -> Response:
         assert self._client is not None
+        outcome: _ModelRequestOutcome = "retryable"
         try:
             response = await self._send_plain_request(method, url, body, headers)
             if response.status_code >= 400:
@@ -886,6 +928,7 @@ class RolloutLLMProxy:
                         status_code=response.status_code,
                         response_body=response.content,
                     ):
+                        outcome = "failed"
                         return self._synthetic_anthropic_message_response()
                 await self._record_failed_upstream_error(
                     snapshot,
@@ -896,6 +939,7 @@ class RolloutLLMProxy:
                     response_headers=dict(response.headers),
                     response_body=response.content,
                 )
+                outcome = self._request_outcome_for_status(response.status_code)
                 if 500 <= response.status_code < 600:
                     return self._anthropic_non_retry_upstream_error_response(
                         upstream_status_code=response.status_code,
@@ -915,6 +959,7 @@ class RolloutLLMProxy:
             response_headers.pop("transfer-encoding", None)
             response_headers.pop("content-length", None)
             response_headers["content-type"] = "application/json"
+            outcome = "succeeded"
             return Response(
                 content=json.dumps(anthropic_payload, ensure_ascii=False).encode("utf-8"),
                 status_code=response.status_code,
@@ -923,7 +968,7 @@ class RolloutLLMProxy:
             )
         finally:
             if snapshot is not None and snapshot.scope is not None:
-                await self._mark_request_finished(snapshot.scope)
+                await self._mark_request_finished(snapshot, outcome=outcome)
 
     async def _plain_openai_responses_proxy(
         self,
@@ -935,6 +980,7 @@ class RolloutLLMProxy:
         original_request: dict[str, Any],
     ) -> Response:
         assert self._client is not None
+        outcome: _ModelRequestOutcome = "retryable"
         try:
             response = await self._send_plain_request(method, url, body, headers)
             if response.status_code >= 400:
@@ -956,6 +1002,7 @@ class RolloutLLMProxy:
                         status_code=response.status_code,
                         response_body=response.content,
                     ):
+                        outcome = "failed"
                         return self._synthetic_openai_response()
                 await self._record_failed_upstream_error(
                     snapshot,
@@ -966,6 +1013,7 @@ class RolloutLLMProxy:
                     response_headers=dict(response.headers),
                     response_body=response.content,
                 )
+                outcome = self._request_outcome_for_status(response.status_code)
             response_headers = dict(response.headers)
             response_headers.pop("content-encoding", None)
             response_headers.pop("transfer-encoding", None)
@@ -985,6 +1033,7 @@ class RolloutLLMProxy:
                 payload = {}
             responses_payload = self._chat_completion_to_openai_response(payload, original_request)
             response_headers["content-type"] = "application/json"
+            outcome = "succeeded"
             return Response(
                 content=json.dumps(responses_payload, ensure_ascii=False).encode("utf-8"),
                 status_code=response.status_code,
@@ -993,7 +1042,7 @@ class RolloutLLMProxy:
             )
         finally:
             if snapshot is not None and snapshot.scope is not None:
-                await self._mark_request_finished(snapshot.scope)
+                await self._mark_request_finished(snapshot, outcome=outcome)
 
     async def _plain_proxy(
         self,
@@ -1004,6 +1053,7 @@ class RolloutLLMProxy:
         snapshot: _TurnSnapshot | None,
     ) -> Response:
         assert self._client is not None
+        outcome: _ModelRequestOutcome = "retryable"
         try:
             response = await self._send_plain_request(method, url, body, headers)
             if response.status_code >= 400:
@@ -1025,6 +1075,7 @@ class RolloutLLMProxy:
                         status_code=response.status_code,
                         response_body=response.content,
                     ):
+                        outcome = "failed"
                         return self._synthetic_chat_completion_response()
                 await self._record_failed_upstream_error(
                     snapshot,
@@ -1035,6 +1086,9 @@ class RolloutLLMProxy:
                     response_headers=dict(response.headers),
                     response_body=response.content,
                 )
+                outcome = self._request_outcome_for_status(response.status_code)
+            else:
+                outcome = "succeeded"
             response_headers = dict(response.headers)
             response_headers.pop("content-encoding", None)
             response_headers.pop("transfer-encoding", None)
@@ -1046,7 +1100,7 @@ class RolloutLLMProxy:
             )
         finally:
             if snapshot is not None and snapshot.scope is not None:
-                await self._mark_request_finished(snapshot.scope)
+                await self._mark_request_finished(snapshot, outcome=outcome)
 
     async def _stream_proxy(
         self,
@@ -1058,64 +1112,145 @@ class RolloutLLMProxy:
         assert self._client is not None
         try:
             upstream_response = await self._send_stream_request(url, body, headers)
-        except Exception:
+        except BaseException:
             if snapshot is not None and snapshot.scope is not None:
-                await self._mark_request_finished(snapshot.scope)
+                await self._mark_request_finished(snapshot, outcome="retryable")
             raise
 
         if upstream_response.status_code >= 400:
-            error_body = await upstream_response.aread()
-            response_headers = dict(upstream_response.headers)
-            response_headers.pop("content-encoding", None)
-            response_headers.pop("transfer-encoding", None)
-            response_headers.pop("content-length", None)
-            self._log_upstream_error(
-                url=url,
-                status_code=upstream_response.status_code,
-                response_headers=dict(upstream_response.headers),
-                response_body=error_body,
-                retried=False,
-            )
-            if snapshot is not None and snapshot.scope is not None:
-                await self._record_context_overflow_error(
-                    snapshot.scope,
+            outcome: _ModelRequestOutcome = "retryable"
+            try:
+                error_body = await upstream_response.aread()
+                response_headers = dict(upstream_response.headers)
+                response_headers.pop("content-encoding", None)
+                response_headers.pop("transfer-encoding", None)
+                response_headers.pop("content-length", None)
+                self._log_upstream_error(
+                    url=url,
                     status_code=upstream_response.status_code,
+                    response_headers=dict(upstream_response.headers),
+                    response_body=error_body,
+                    retried=False,
+                )
+                if snapshot is not None and snapshot.scope is not None:
+                    await self._record_context_overflow_error(
+                        snapshot.scope,
+                        status_code=upstream_response.status_code,
+                        response_body=error_body,
+                    )
+                    if await self._record_rollout_invalidated_error(
+                        snapshot.scope,
+                        status_code=upstream_response.status_code,
+                        response_body=error_body,
+                    ):
+                        outcome = "failed"
+                        return self._synthetic_chat_completion_stream_response()
+                await self._record_failed_upstream_error(
+                    snapshot,
+                    url=url,
+                    status_code=upstream_response.status_code,
+                    request_headers=headers,
+                    request_body=body,
+                    response_headers=dict(upstream_response.headers),
                     response_body=error_body,
                 )
-                if await self._record_rollout_invalidated_error(
-                    snapshot.scope,
+                outcome = self._request_outcome_for_status(
+                    upstream_response.status_code
+                )
+                return Response(
+                    content=error_body,
                     status_code=upstream_response.status_code,
-                    response_body=error_body,
-                ):
+                    headers=response_headers,
+                )
+            finally:
+                try:
                     await upstream_response.aclose()
-                    await self._mark_request_finished(snapshot.scope)
-                    return self._synthetic_chat_completion_stream_response()
-            await self._record_failed_upstream_error(
-                snapshot,
-                url=url,
-                status_code=upstream_response.status_code,
-                request_headers=headers,
-                request_body=body,
-                response_headers=dict(upstream_response.headers),
-                response_body=error_body,
-            )
-            await upstream_response.aclose()
-            if snapshot is not None and snapshot.scope is not None:
-                await self._mark_request_finished(snapshot.scope)
-            return Response(
-                content=error_body,
-                status_code=upstream_response.status_code,
-                headers=response_headers,
-            )
+                finally:
+                    if snapshot is not None and snapshot.scope is not None:
+                        await self._mark_request_finished(snapshot, outcome=outcome)
 
         async def _forward():
+            buffer = b""
+            oversized_event = False
+            outcome: _ModelRequestOutcome = "retryable"
+            saw_retryable_error = False
+            saw_terminal_error = False
+
+            async def _rewrite_event(
+                raw_event: bytes,
+                event_bytes: bytes,
+                *,
+                terminal: bool = False,
+            ) -> bytes:
+                nonlocal saw_retryable_error, saw_terminal_error
+                sniffed = self._in_stream_error_from_sse_event(raw_event)
+                if sniffed is None:
+                    return event_bytes
+                error_status, error_body = sniffed
+                error_kind = await self._record_in_stream_error(
+                    snapshot,
+                    url=url,
+                    request_headers=headers,
+                    request_body=body,
+                    status_code=error_status,
+                    error_body=error_body,
+                )
+                if (
+                    error_kind == "failed_upstream"
+                    and self._request_outcome_for_status(error_status) == "retryable"
+                ):
+                    saw_retryable_error = True
+                else:
+                    saw_terminal_error = True
+                if error_kind != "rollout_invalidated":
+                    return event_bytes
+                rewritten = self._synthetic_chat_completion_chunk_bytes()
+                if terminal:
+                    rewritten += b"data: [DONE]\n\n"
+                return rewritten
+
             try:
                 async for chunk in upstream_response.aiter_bytes():
-                    yield chunk
+                    buffer += chunk
+                    while True:
+                        framed = _pop_sse_event_bytes(buffer)
+                        if framed is None:
+                            break
+                        raw_event, delimiter, buffer = framed
+                        event_bytes = raw_event + delimiter
+                        if oversized_event or len(raw_event) > _MAX_SSE_SNIFF_EVENT_BYTES:
+                            yield event_bytes
+                            oversized_event = False
+                            continue
+                        yield await _rewrite_event(raw_event, event_bytes)
+
+                    if len(buffer) > _MAX_SSE_SNIFF_EVENT_BYTES:
+                        oversized_event = True
+                        flush_length = len(buffer) - _SSE_BOUNDARY_SUFFIX_BYTES
+                        if flush_length > 0:
+                            yield buffer[:flush_length]
+                            buffer = buffer[flush_length:]
+                if buffer:
+                    if oversized_event:
+                        yield buffer
+                    else:
+                        yield await _rewrite_event(
+                            buffer,
+                            buffer,
+                            terminal=True,
+                        )
+                if saw_terminal_error:
+                    outcome = "failed"
+                elif saw_retryable_error:
+                    outcome = "retryable"
+                else:
+                    outcome = "succeeded"
             finally:
-                await upstream_response.aclose()
-                if snapshot is not None and snapshot.scope is not None:
-                    await self._mark_request_finished(snapshot.scope)
+                try:
+                    await upstream_response.aclose()
+                finally:
+                    if snapshot is not None and snapshot.scope is not None:
+                        await self._mark_request_finished(snapshot, outcome=outcome)
 
         response_headers = dict(upstream_response.headers)
         response_headers.pop("content-encoding", None)
@@ -1138,64 +1273,108 @@ class RolloutLLMProxy:
         assert self._client is not None
         try:
             upstream_response = await self._send_stream_request(url, body, headers)
-        except Exception:
+        except BaseException:
             if snapshot is not None and snapshot.scope is not None:
-                await self._mark_request_finished(snapshot.scope)
+                await self._mark_request_finished(snapshot, outcome="retryable")
             raise
 
         if upstream_response.status_code >= 400:
-            error_body = await upstream_response.aread()
-            self._log_upstream_error(
-                url=url,
-                status_code=upstream_response.status_code,
-                response_headers=dict(upstream_response.headers),
-                response_body=error_body,
-                retried=False,
-            )
-            if snapshot is not None and snapshot.scope is not None:
-                await self._record_context_overflow_error(
-                    snapshot.scope,
+            outcome: _ModelRequestOutcome = "retryable"
+            try:
+                error_body = await upstream_response.aread()
+                self._log_upstream_error(
+                    url=url,
+                    status_code=upstream_response.status_code,
+                    response_headers=dict(upstream_response.headers),
+                    response_body=error_body,
+                    retried=False,
+                )
+                if snapshot is not None and snapshot.scope is not None:
+                    await self._record_context_overflow_error(
+                        snapshot.scope,
+                        status_code=upstream_response.status_code,
+                        response_body=error_body,
+                    )
+                    if await self._record_rollout_invalidated_error(
+                        snapshot.scope,
+                        status_code=upstream_response.status_code,
+                        response_body=error_body,
+                    ):
+                        outcome = "failed"
+                        return self._synthetic_anthropic_message_stream_response()
+                await self._record_failed_upstream_error(
+                    snapshot,
+                    url=url,
+                    status_code=upstream_response.status_code,
+                    request_headers=headers,
+                    request_body=body,
+                    response_headers=dict(upstream_response.headers),
+                    response_body=error_body,
+                )
+                outcome = self._request_outcome_for_status(
+                    upstream_response.status_code
+                )
+                if 500 <= upstream_response.status_code < 600:
+                    return self._anthropic_non_retry_upstream_error_response(
+                        upstream_status_code=upstream_response.status_code,
+                        response_body=error_body,
+                    )
+                return self._anthropic_error_response_from_bytes(
                     status_code=upstream_response.status_code,
                     response_body=error_body,
                 )
-                if await self._record_rollout_invalidated_error(
-                    snapshot.scope,
-                    status_code=upstream_response.status_code,
-                    response_body=error_body,
-                ):
+            finally:
+                try:
                     await upstream_response.aclose()
-                    await self._mark_request_finished(snapshot.scope)
-                    return self._synthetic_anthropic_message_stream_response()
-            await self._record_failed_upstream_error(
-                snapshot,
-                url=url,
-                status_code=upstream_response.status_code,
-                request_headers=headers,
-                request_body=body,
-                response_headers=dict(upstream_response.headers),
-                response_body=error_body,
-            )
-            await upstream_response.aclose()
-            if snapshot is not None and snapshot.scope is not None:
-                await self._mark_request_finished(snapshot.scope)
-            if 500 <= upstream_response.status_code < 600:
-                return self._anthropic_non_retry_upstream_error_response(
-                    upstream_status_code=upstream_response.status_code,
-                    response_body=error_body,
-                )
-            return self._anthropic_error_response_from_bytes(
-                status_code=upstream_response.status_code,
-                response_body=error_body,
-            )
+                finally:
+                    if snapshot is not None and snapshot.scope is not None:
+                        await self._mark_request_finished(snapshot, outcome=outcome)
 
         async def _forward():
+            outcome: _ModelRequestOutcome = "retryable"
+            saw_retryable_error = False
+            saw_terminal_error = False
+
+            async def _on_in_stream_error(
+                error_status: int,
+                error_body: bytes,
+            ) -> _InStreamErrorKind:
+                nonlocal saw_retryable_error, saw_terminal_error
+                error_kind = await self._record_in_stream_error(
+                    snapshot,
+                    url=url,
+                    request_headers=headers,
+                    request_body=body,
+                    status_code=error_status,
+                    error_body=error_body,
+                )
+                if (
+                    error_kind == "failed_upstream"
+                    and self._request_outcome_for_status(error_status) == "retryable"
+                ):
+                    saw_retryable_error = True
+                else:
+                    saw_terminal_error = True
+                return error_kind
+
             try:
-                async for event in self._iter_anthropic_events_from_openai_stream(upstream_response):
+                async for event in self._iter_anthropic_events_from_openai_stream(
+                    upstream_response,
+                    on_in_stream_error=_on_in_stream_error,
+                ):
                     yield event
+                if saw_terminal_error:
+                    outcome = "failed"
+                elif saw_retryable_error:
+                    outcome = "retryable"
+                else:
+                    outcome = "succeeded"
             finally:
-                await upstream_response.aclose()
-                if snapshot is not None and snapshot.scope is not None:
-                    await self._mark_request_finished(snapshot.scope)
+                try:
+                    await upstream_response.aclose()
+                finally:
+                    if snapshot is not None and snapshot.scope is not None:
+                        await self._mark_request_finished(snapshot, outcome=outcome)
 
         return StreamingResponse(
             _forward(),
@@ -1214,67 +1393,109 @@ class RolloutLLMProxy:
         assert self._client is not None
         try:
             upstream_response = await self._send_stream_request(url, body, headers)
-        except Exception:
+        except BaseException:
             if snapshot is not None and snapshot.scope is not None:
-                await self._mark_request_finished(snapshot.scope)
+                await self._mark_request_finished(snapshot, outcome="retryable")
             raise
 
         if upstream_response.status_code >= 400:
-            error_body = await upstream_response.aread()
-            response_headers = dict(upstream_response.headers)
-            response_headers.pop("content-encoding", None)
-            response_headers.pop("transfer-encoding", None)
-            response_headers.pop("content-length", None)
-            self._log_upstream_error(
-                url=url,
-                status_code=upstream_response.status_code,
-                response_headers=dict(upstream_response.headers),
-                response_body=error_body,
-                retried=False,
-            )
-            if snapshot is not None and snapshot.scope is not None:
-                await self._record_context_overflow_error(
-                    snapshot.scope,
+            outcome: _ModelRequestOutcome = "retryable"
+            try:
+                error_body = await upstream_response.aread()
+                response_headers = dict(upstream_response.headers)
+                response_headers.pop("content-encoding", None)
+                response_headers.pop("transfer-encoding", None)
+                response_headers.pop("content-length", None)
+                self._log_upstream_error(
+                    url=url,
                     status_code=upstream_response.status_code,
+                    response_headers=dict(upstream_response.headers),
+                    response_body=error_body,
+                    retried=False,
+                )
+                if snapshot is not None and snapshot.scope is not None:
+                    await self._record_context_overflow_error(
+                        snapshot.scope,
+                        status_code=upstream_response.status_code,
+                        response_body=error_body,
+                    )
+                    if await self._record_rollout_invalidated_error(
+                        snapshot.scope,
+                        status_code=upstream_response.status_code,
+                        response_body=error_body,
+                    ):
+                        outcome = "failed"
+                        return self._synthetic_openai_response_stream_response()
+                await self._record_failed_upstream_error(
+                    snapshot,
+                    url=url,
+                    status_code=upstream_response.status_code,
+                    request_headers=headers,
+                    request_body=body,
+                    response_headers=dict(upstream_response.headers),
                     response_body=error_body,
                 )
-                if await self._record_rollout_invalidated_error(
-                    snapshot.scope,
+                outcome = self._request_outcome_for_status(
+                    upstream_response.status_code
+                )
+                return Response(
+                    content=error_body,
                     status_code=upstream_response.status_code,
-                    response_body=error_body,
-                ):
+                    headers=response_headers,
+                )
+            finally:
+                try:
                     await upstream_response.aclose()
-                    await self._mark_request_finished(snapshot.scope)
-                    return self._synthetic_openai_response_stream_response()
-            await self._record_failed_upstream_error(
-                snapshot,
-                url=url,
-                status_code=upstream_response.status_code,
-                request_headers=headers,
-                request_body=body,
-                response_headers=dict(upstream_response.headers),
-                response_body=error_body,
-            )
-            await upstream_response.aclose()
-            if snapshot is not None and snapshot.scope is not None:
-                await self._mark_request_finished(snapshot.scope)
-            return Response(
-                content=error_body,
-                status_code=upstream_response.status_code,
-                headers=response_headers,
-            )
+                finally:
+                    if snapshot is not None and snapshot.scope is not None:
+                        await self._mark_request_finished(snapshot, outcome=outcome)
 
         async def _forward():
+            outcome: _ModelRequestOutcome = "retryable"
+            saw_retryable_error = False
+            saw_terminal_error = False
+
+            async def _on_in_stream_error(
+                error_status: int,
+                error_body: bytes,
+            ) -> _InStreamErrorKind:
+                nonlocal saw_retryable_error, saw_terminal_error
+                error_kind = await self._record_in_stream_error(
+                    snapshot,
+                    url=url,
+                    request_headers=headers,
+                    request_body=body,
+                    status_code=error_status,
+                    error_body=error_body,
+                )
+                if (
+                    error_kind == "failed_upstream"
+                    and self._request_outcome_for_status(error_status) == "retryable"
+                ):
+                    saw_retryable_error = True
+                else:
+                    saw_terminal_error = True
+                return error_kind
+
             try:
                 async for event in self._iter_openai_response_events_from_chat_stream(
                     upstream_response,
                     original_request,
+                    on_in_stream_error=_on_in_stream_error,
                 ):
                     yield event
+                if saw_terminal_error:
+                    outcome = "failed"
+                elif saw_retryable_error:
+                    outcome = "retryable"
+                else:
+                    outcome = "succeeded"
             finally:
-                await upstream_response.aclose()
-                if snapshot is not None and snapshot.scope is not None:
-                    await self._mark_request_finished(snapshot.scope)
+                try:
+                    await upstream_response.aclose()
+                finally:
+                    if snapshot is not None and snapshot.scope is not None:
+                        await self._mark_request_finished(snapshot, outcome=outcome)
 
         return StreamingResponse(
             _forward(),
@@ -1351,7 +1572,26 @@ class RolloutLLMProxy:
             response_body=response_body,
         )
         async with self._scope_lock:
-            snapshot.scope.failed_upstream_error = payload
+            scope = snapshot.scope
+            new_retryable = status_code in _RETRYABLE_UPSTREAM_STATUSES
+            if (
+                new_retryable
+                and scope.latest_successful_step is not None
+                and snapshot.step <= scope.latest_successful_step
+            ):
+                return
+            existing = scope.failed_upstream_error
+            if isinstance(existing, dict):
+                existing_retryable = (
+                    existing.get("status_code") in _RETRYABLE_UPSTREAM_STATUSES
+                )
+                if not existing_retryable and new_retryable:
+                    return
+                if existing_retryable == new_retryable:
+                    existing_step = existing.get("step")
+                    if isinstance(existing_step, int) and existing_step > snapshot.step:
+                        return
+            scope.failed_upstream_error = payload
 
     def _failed_upstream_error_payload(
         self,
@@ -1551,15 +1791,88 @@ class RolloutLLMProxy:
         *,
         status_code: int,
         response_body: bytes,
-    ) -> None:
+    ) -> bool:
         payload = self._context_overflow_payload_from_response(
             status_code=status_code,
             response_body=response_body,
         )
         if payload is None:
-            return
+            return False
         async with self._scope_lock:
             scope.context_overflow_error = payload
+        return True
+
+    @staticmethod
+    def _in_stream_error_from_chunk(chunk: dict[str, Any]) -> tuple[int, bytes] | None:
+        """Detect an error event emitted after heartbeat streaming starts."""
+        error = chunk.get("error")
+        if not isinstance(error, dict):
+            return None
+        status_code = error.get("status_code")
+        if type(status_code) is not int or not 400 <= status_code <= 599:
+            return None
+        return status_code, json.dumps(error, ensure_ascii=False).encode("utf-8")
+
+    @staticmethod
+    def _in_stream_error_from_sse_event(raw_event: bytes) -> tuple[int, bytes] | None:
+        try:
+            text = raw_event.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+        for payload in _payloads_from_sse_event(text):
+            if payload == "[DONE]":
+                continue
+            try:
+                parsed = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            sniffed = RolloutLLMProxy._in_stream_error_from_chunk(parsed)
+            if sniffed is not None:
+                return sniffed
+        return None
+
+    async def _record_in_stream_error(
+        self,
+        snapshot: _TurnSnapshot | None,
+        *,
+        url: str,
+        request_headers: dict[str, str],
+        request_body: bytes,
+        status_code: int,
+        error_body: bytes,
+    ) -> _InStreamErrorKind:
+        self._log_upstream_error(
+            url=url,
+            status_code=status_code,
+            response_headers={"x-dressage-in-stream-error": "1"},
+            response_body=error_body,
+            retried=False,
+        )
+        context_overflow = False
+        if snapshot is not None and snapshot.scope is not None:
+            context_overflow = await self._record_context_overflow_error(
+                snapshot.scope,
+                status_code=status_code,
+                response_body=error_body,
+            )
+            if await self._record_rollout_invalidated_error(
+                snapshot.scope,
+                status_code=status_code,
+                response_body=error_body,
+            ):
+                return "rollout_invalidated"
+        await self._record_failed_upstream_error(
+            snapshot,
+            url=url,
+            status_code=status_code,
+            request_headers=request_headers,
+            request_body=request_body,
+            response_headers={},
+            response_body=error_body,
+        )
+        return "context_overflow" if context_overflow else "failed_upstream"
 
     async def _record_rollout_invalidated_error(
         self,
@@ -1590,7 +1903,10 @@ class RolloutLLMProxy:
             payload = json.loads(response_body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             return None
-        if not isinstance(payload, dict) or payload.get("error") != "context_overflow":
+        if (
+            not isinstance(payload, dict)
+            or (payload.get("code") or payload.get("error")) != "context_overflow"
+        ):
             return None
         return payload
 
@@ -1613,7 +1929,9 @@ class RolloutLLMProxy:
             candidate = detail
         else:
             candidate = payload
-        if candidate.get("error") not in DRESSAGE_ROLLOUT_INVALIDATED_ERRORS:
+        if (
+            candidate.get("code") or candidate.get("error")
+        ) not in DRESSAGE_ROLLOUT_INVALIDATED_ERRORS:
             return None
         return {str(key): value for key, value in candidate.items()}
 
@@ -1644,7 +1962,7 @@ class RolloutLLMProxy:
         )
 
     @staticmethod
-    def _synthetic_chat_completion_stream_response() -> StreamingResponse:
+    def _synthetic_chat_completion_chunk_bytes() -> bytes:
         payload = {
             "id": "chatcmpl-rollout-invalidated",
             "object": "chat.completion.chunk",
@@ -1658,9 +1976,12 @@ class RolloutLLMProxy:
                 }
             ],
         }
+        return f"data: {json.dumps(payload)}\n\n".encode("utf-8")
 
+    @staticmethod
+    def _synthetic_chat_completion_stream_response() -> StreamingResponse:
         async def _events():
-            yield f"data: {json.dumps(payload)}\n\n".encode("utf-8")
+            yield RolloutLLMProxy._synthetic_chat_completion_chunk_bytes()
             yield b"data: [DONE]\n\n"
 
         return StreamingResponse(
@@ -1815,6 +2136,11 @@ class RolloutLLMProxy:
         self,
         upstream_response: httpx.Response,
         original_request: dict[str, Any],
+        *,
+        on_in_stream_error: Callable[
+            [int, bytes],
+            Awaitable[_InStreamErrorKind],
+        ],
     ):
         response_id = "resp_proxy_stream"
         item_id = "msg_proxy_stream"
@@ -1840,6 +2166,9 @@ class RolloutLLMProxy:
         )
 
         async for payload_text in _iter_openai_sse_payloads(upstream_response):
+            if payload_text is None:
+                yield b": dressage-heartbeat\n\n"
+                continue
             if payload_text == "[DONE]":
                 break
             try:
@@ -1847,6 +2176,20 @@ class RolloutLLMProxy:
             except json.JSONDecodeError:
                 continue
             if not isinstance(chunk, dict):
+                continue
+            sniffed = self._in_stream_error_from_chunk(chunk)
+            if sniffed is not None:
+                error_kind = await on_in_stream_error(*sniffed)
+                if error_kind == "failed_upstream":
+                    status_code, error_body = sniffed
+                    yield _openai_response_sse(
+                        "error",
+                        self._openai_response_in_stream_error_payload(
+                            status_code=status_code,
+                            response_body=error_body,
+                        ),
+                    )
+                    return
                 continue
             if chunk.get("model"):
                 model = str(chunk["model"])
@@ -1982,10 +2325,21 @@ class RolloutLLMProxy:
             "usage": usage,
         }
 
-    async def _iter_anthropic_events_from_openai_stream(self, upstream_response: httpx.Response):
+    async def _iter_anthropic_events_from_openai_stream(
+        self,
+        upstream_response: httpx.Response,
+        *,
+        on_in_stream_error: Callable[
+            [int, bytes],
+            Awaitable[_InStreamErrorKind],
+        ],
+    ):
         state = _AnthropicStreamState()
         yield state.message_start(model="proxy-model")
         async for payload in _iter_openai_sse_payloads(upstream_response):
+            if payload is None:
+                yield _anthropic_sse("ping", {"type": "ping"})
+                continue
             if payload == "[DONE]":
                 break
             try:
@@ -1993,6 +2347,20 @@ class RolloutLLMProxy:
             except json.JSONDecodeError:
                 continue
             if not isinstance(chunk, dict):
+                continue
+            sniffed = self._in_stream_error_from_chunk(chunk)
+            if sniffed is not None:
+                error_kind = await on_in_stream_error(*sniffed)
+                if error_kind == "failed_upstream":
+                    status_code, error_body = sniffed
+                    yield _anthropic_sse(
+                        "error",
+                        self._anthropic_in_stream_error_payload(
+                            status_code=status_code,
+                            response_body=error_body,
+                        ),
+                    )
+                    return
                 continue
             if chunk.get("model"):
                 state.model = str(chunk["model"])
@@ -2048,17 +2416,10 @@ class RolloutLLMProxy:
         upstream_status_code: int,
         response_body: bytes,
     ) -> Response:
-        body_preview = RolloutLLMProxy._preview_bytes(response_body, limit=1000)
-        message = f"Upstream returned HTTP {upstream_status_code}"
-        if body_preview:
-            message = f"{message}: {body_preview}"
-        body = {
-            "type": "error",
-            "error": {
-                "type": "upstream_error",
-                "message": message,
-            },
-        }
+        body = RolloutLLMProxy._anthropic_upstream_error_payload(
+            upstream_status_code=upstream_status_code,
+            response_body=response_body,
+        )
         return Response(
             content=json.dumps(body, ensure_ascii=False).encode("utf-8"),
             status_code=400,
@@ -2066,7 +2427,45 @@ class RolloutLLMProxy:
         )
 
     @staticmethod
-    def _anthropic_error_response_from_bytes(*, status_code: int, response_body: bytes) -> Response:
+    def _anthropic_upstream_error_payload(
+        *,
+        upstream_status_code: int,
+        response_body: bytes,
+    ) -> dict[str, Any]:
+        body_preview = RolloutLLMProxy._preview_bytes(response_body, limit=1000)
+        message = f"Upstream returned HTTP {upstream_status_code}"
+        if body_preview:
+            message = f"{message}: {body_preview}"
+        return {
+            "type": "error",
+            "error": {
+                "type": "upstream_error",
+                "message": message,
+            },
+        }
+
+    @staticmethod
+    def _anthropic_error_response_from_bytes(
+        *,
+        status_code: int,
+        response_body: bytes,
+    ) -> Response:
+        body = RolloutLLMProxy._anthropic_error_payload_from_bytes(
+            status_code=status_code,
+            response_body=response_body,
+        )
+        return Response(
+            content=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            status_code=status_code,
+            media_type="application/json",
+        )
+
+    @staticmethod
+    def _anthropic_error_payload_from_bytes(
+        *,
+        status_code: int,
+        response_body: bytes,
+    ) -> dict[str, Any]:
         message = (
             RolloutLLMProxy._preview_bytes(response_body, limit=1000)
             if response_body
@@ -2084,18 +2483,54 @@ class RolloutLLMProxy:
                 error_type = str(raw_error.get("type") or raw_error.get("code") or error_type)
             elif payload.get("message") is not None:
                 message = str(payload.get("message"))
-        body = {
+                error_type = str(
+                    payload.get("type") or payload.get("code") or error_type
+                )
+        return {
             "type": "error",
             "error": {
                 "type": error_type,
                 "message": message,
             },
         }
-        return Response(
-            content=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+
+    @staticmethod
+    def _anthropic_in_stream_error_payload(
+        *,
+        status_code: int,
+        response_body: bytes,
+    ) -> dict[str, Any]:
+        if 500 <= status_code < 600:
+            return RolloutLLMProxy._anthropic_upstream_error_payload(
+                upstream_status_code=status_code,
+                response_body=response_body,
+            )
+        return RolloutLLMProxy._anthropic_error_payload_from_bytes(
             status_code=status_code,
-            media_type="application/json",
+            response_body=response_body,
         )
+
+    @staticmethod
+    def _openai_response_in_stream_error_payload(
+        *,
+        status_code: int,
+        response_body: bytes,
+    ) -> dict[str, Any]:
+        message = f"Upstream returned HTTP {status_code}"
+        code = "upstream_error"
+        try:
+            payload = json.loads(response_body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            payload = {}
+        if isinstance(payload, dict):
+            message = str(payload.get("message") or message)
+            code = str(payload.get("code") or payload.get("error") or code)
+        return {
+            "type": "error",
+            "code": code,
+            "message": message,
+            "param": None,
+        }
 
     @staticmethod
     def _preview_bytes(body: bytes, *, limit: int) -> str:
@@ -2942,16 +3377,55 @@ def _openai_finish_reason_to_anthropic(value: Any) -> str:
 
 
 async def _iter_openai_sse_payloads(response: httpx.Response):
+    """Yield SSE data payloads; comment-only events yield ``None``."""
     buffer = ""
     async for chunk in response.aiter_text():
         buffer += chunk
-        while "\n\n" in buffer:
-            raw_event, buffer = buffer.split("\n\n", 1)
-            for payload in _payloads_from_sse_event(raw_event):
+        while True:
+            framed = _pop_sse_event_text(buffer)
+            if framed is None:
+                break
+            raw_event, _delimiter, buffer = framed
+            payloads = _payloads_from_sse_event(raw_event)
+            if not payloads and _is_sse_comment_event(raw_event):
+                yield None
+                continue
+            for payload in payloads:
                 yield payload
     if buffer.strip():
         for payload in _payloads_from_sse_event(buffer):
             yield payload
+
+
+def _pop_sse_event_bytes(buffer: bytes) -> tuple[bytes, bytes, bytes] | None:
+    candidates = [
+        (index, delimiter)
+        for delimiter in (b"\r\n\r\n", b"\n\n", b"\r\r")
+        if (index := buffer.find(delimiter)) >= 0
+    ]
+    if not candidates:
+        return None
+    index, delimiter = min(candidates, key=lambda candidate: candidate[0])
+    end = index + len(delimiter)
+    return buffer[:index], delimiter, buffer[end:]
+
+
+def _pop_sse_event_text(buffer: str) -> tuple[str, str, str] | None:
+    candidates = [
+        (index, delimiter)
+        for delimiter in ("\r\n\r\n", "\n\n", "\r\r")
+        if (index := buffer.find(delimiter)) >= 0
+    ]
+    if not candidates:
+        return None
+    index, delimiter = min(candidates, key=lambda candidate: candidate[0])
+    end = index + len(delimiter)
+    return buffer[:index], delimiter, buffer[end:]
+
+
+def _is_sse_comment_event(raw_event: str) -> bool:
+    lines = [line for line in raw_event.splitlines() if line.strip()]
+    return bool(lines) and all(line.startswith(":") for line in lines)
 
 
 def _payloads_from_sse_event(raw_event: str) -> list[str]:

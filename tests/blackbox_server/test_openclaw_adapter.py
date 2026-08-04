@@ -97,6 +97,15 @@ class FakeProxy:
         self.calls.append(("clear", None))
 
 
+class FailedUpstreamProxy(FakeProxy):
+    async def consume_failed_upstream_error(self) -> dict[str, Any]:
+        self.calls.append(("consume_failed_upstream_error", None))
+        return {
+            "message": "Upstream returned HTTP 503: unavailable",
+            "response_path": "/tmp/upstream-response.json",
+        }
+
+
 def _make_binding_context(
     tmp_path: Path,
     *,
@@ -659,8 +668,7 @@ def test_send_message_posts_chat_completion_payload_and_headers(tmp_path: Path) 
     assert isinstance(adapter._proxy.calls[1][1], float)
     assert adapter._proxy.calls[2] == ("consume_context_overflow_error", None)
     assert adapter._proxy.calls[3] == ("consume_rollout_invalidated_error", None)
-    assert adapter._proxy.calls[4] == ("drain", None)
-    assert adapter._proxy.calls[5] == ("clear", None)
+    assert adapter._proxy.calls[4] == ("clear", None)
 
 
 def test_send_message_raises_proxy_rollout_invalidated_error(tmp_path: Path) -> None:
@@ -709,6 +717,46 @@ def test_send_message_raises_proxy_rollout_invalidated_error(tmp_path: Path) -> 
 
     assert ("consume_rollout_invalidated_error", None) in adapter._proxy.calls
     assert ("clear", None) in adapter._proxy.calls
+
+
+def test_send_message_preserves_proxy_failure_when_backend_raises(
+    tmp_path: Path,
+) -> None:
+    adapter = OpenClawAdapter()
+    adapter._binding_context = _make_binding_context(tmp_path)
+    adapter._options = _minimal_options()
+    adapter._proxy = FailedUpstreamProxy()
+
+    async def run_test() -> None:
+        with (
+            patch.object(adapter, "health", return_value=True),
+            patch.object(
+                adapter,
+                "_post_chat_completions",
+                side_effect=BackendProtocolError("invalid streamed response"),
+            ),
+        ):
+            with pytest.raises(BackendTransportError) as exc_info:
+                await adapter.send_message(
+                    _make_session_context(),
+                    _make_turn_context("turn-1"),
+                    [Message(role="user", content="hello")],
+                )
+
+        message = str(exc_info.value)
+        assert "invalid streamed response" in message
+        assert "Upstream returned HTTP 503" in message
+        assert "failed upstream response: /tmp/upstream-response.json" in message
+
+    asyncio.run(run_test())
+
+    calls = adapter._proxy.calls
+    assert calls[0] == ("open", ("turn-1", "bbs:inst-001:sess-001"))
+    assert calls[1] == ("drain", 2.0)
+    assert calls[2] == ("consume_context_overflow_error", None)
+    assert calls[3] == ("consume_rollout_invalidated_error", None)
+    assert calls[4] == ("consume_failed_upstream_error", None)
+    assert calls[5] == ("clear", None)
 
 
 def test_send_message_cancels_openclaw_chat_on_proxy_max_steps(tmp_path: Path) -> None:

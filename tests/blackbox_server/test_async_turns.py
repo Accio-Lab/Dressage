@@ -106,6 +106,58 @@ class SlowAdapter(FakeAdapter):
         )
 
 
+def test_repeated_cancellation_waits_for_backend_child_cleanup(
+    tmp_path: Path,
+) -> None:
+    async def run_test() -> None:
+        server = BlackboxServer(
+            BlackboxServerConfig(runtime_root=str(tmp_path / "runtime"))
+        )
+        backend_started = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        cleanup_release = asyncio.Event()
+        cleanup_finished = asyncio.Event()
+        cleanup_interrupted = asyncio.Event()
+
+        async def backend_call() -> None:
+            backend_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cleanup_started.set()
+                try:
+                    await cleanup_release.wait()
+                except asyncio.CancelledError:
+                    cleanup_interrupted.set()
+                    raise
+                cleanup_finished.set()
+                raise
+
+        waiter = asyncio.create_task(
+            server._wait_for_backend_call_excluding_pause(
+                backend_call(),
+                timeout=30.0,
+            )
+        )
+        await backend_started.wait()
+        waiter.cancel()
+        await cleanup_started.wait()
+        waiter.cancel()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert not waiter.done()
+        assert not cleanup_finished.is_set()
+        assert not cleanup_interrupted.is_set()
+
+        cleanup_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        assert cleanup_finished.is_set()
+
+    asyncio.run(run_test())
+
+
 def make_client(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

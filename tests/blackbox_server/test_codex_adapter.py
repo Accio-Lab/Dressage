@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from typing import Any
+from unittest.mock import patch
 
 import pytest
 
@@ -12,6 +14,7 @@ from blackbox_server.adapters.codex import (
     CodexAdapter,
     CodexBackendOptions,
     CodexConfigCompiler,
+    CodexRunResult,
     CodexSessionState,
     _CODEX_STDOUT_STREAM_LIMIT,
     _build_codex_exit_error_message,
@@ -21,9 +24,11 @@ from blackbox_server.config import BlackboxServerConfig
 from blackbox_server.core.models import (
     BindingContext,
     BindingInfo,
+    Message,
     SessionContext,
     SessionState,
     TurnContext,
+    TurnUsage,
     utcnow,
 )
 
@@ -805,6 +810,95 @@ def test_run_codex_turn_rejects_invalid_jsonl_and_terminates_process(
             await adapter.shutdown()
 
         assert killed_process_groups
+
+    asyncio.run(run_test())
+
+
+def test_codex_success_path_surfaces_proxy_failed_upstream(
+    tmp_path: Path,
+) -> None:
+    class FakeProxy:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, Any]] = []
+
+        async def open_turn(
+            self,
+            turn_id: str,
+            backend_session_id: str | None = None,
+        ) -> None:
+            self.calls.append(("open", (turn_id, backend_session_id)))
+
+        async def drain_turn(self, timeout: float | None = None) -> None:
+            self.calls.append(("drain", timeout))
+
+        async def consume_context_overflow_error(self) -> None:
+            self.calls.append(("consume_context_overflow_error", None))
+            return None
+
+        async def consume_rollout_invalidated_error(self) -> None:
+            self.calls.append(("consume_rollout_invalidated_error", None))
+            return None
+
+        async def consume_failed_upstream_error(self) -> dict[str, object]:
+            self.calls.append(("consume_failed_upstream_error", None))
+            return {"message": "Upstream returned HTTP 503: unavailable"}
+
+        async def clear_turn(self) -> None:
+            self.calls.append(("clear", None))
+
+    async def run_test() -> None:
+        adapter = CodexAdapter()
+        adapter._binding_context = _make_binding_context(tmp_path)
+        adapter._proxy = FakeProxy()  # type: ignore[assignment]
+        session = SessionContext(
+            session_id="test-session",
+            state=SessionState.ACTIVE,
+            blackbox_type="codex",
+            backend_session_id="codex-session-1",
+            router_base_url="http://127.0.0.1:30000/v1",
+            created_at=utcnow(),
+            updated_at=utcnow(),
+        )
+        turn = TurnContext(
+            turn_id="turn-1",
+            request_fingerprint="fp-turn-1",
+            deadline_seconds=30.0,
+        )
+
+        with (
+            patch.object(adapter, "health", return_value=True),
+            patch.object(
+                adapter,
+                "_run_codex_turn",
+                return_value=CodexRunResult(
+                    outputs=[],
+                    trace_events=[],
+                    usage=TurnUsage(),
+                    backend_session_id=None,
+                ),
+            ),
+        ):
+            with pytest.raises(
+                BackendTransportError,
+                match="Upstream returned HTTP 503",
+            ):
+                await adapter.send_message(
+                    session,
+                    turn,
+                    [Message(role="user", content="hello")],
+                )
+
+        assert adapter._proxy.calls[0] == (
+            "open",
+            ("turn-1", "codex-session-1"),
+        )
+        assert adapter._proxy.calls[1][0] == "drain"
+        assert adapter._proxy.calls[2:] == [
+            ("consume_context_overflow_error", None),
+            ("consume_rollout_invalidated_error", None),
+            ("consume_failed_upstream_error", None),
+            ("clear", None),
+        ]
 
     asyncio.run(run_test())
 

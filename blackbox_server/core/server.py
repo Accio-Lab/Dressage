@@ -202,9 +202,7 @@ class BlackboxServer:
 
                 remaining = deadline - loop.time()
                 if remaining <= 0:
-                    task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError, Exception):
-                        await task
+                    await self._cancel_task_safely(task)
                     raise asyncio.TimeoutError
 
                 done, pending = await asyncio.wait({task}, timeout=remaining)
@@ -212,10 +210,30 @@ class BlackboxServer:
                     return await task
                 if pending:
                     raise asyncio.TimeoutError
-        except Exception:
-            if not task.done():
-                task.cancel()
+        except asyncio.CancelledError:
+            await self._cancel_task_safely(task)
             raise
+        except Exception:
+            await self._cancel_task_safely(task)
+            raise
+
+    @staticmethod
+    async def _cancel_task_safely(task: asyncio.Task[Any]) -> None:
+        if not task.done():
+            task.cancel()
+        await BlackboxServer._wait_for_task_safely(task)
+
+    @staticmethod
+    async def _wait_for_task_safely(task: asyncio.Task[Any]) -> None:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
 
     async def graceful_shutdown(self) -> None:
         if self._shutdown_started:
