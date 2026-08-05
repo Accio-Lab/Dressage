@@ -6,7 +6,7 @@ import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, AsyncIterator, Mapping
 
 import httpx
 from fastapi import FastAPI, Request
@@ -1064,14 +1064,33 @@ class RolloutLLMProxy:
             raise
 
         if upstream_response.status_code >= 400:
+            error_status: int | None = upstream_response.status_code
             error_body = await upstream_response.aread()
+            error_content_type: str | None = None
+            first_bytes = b""
+            byte_iter: AsyncIterator[bytes] | None = None
+        else:
+            error_status = None
+            error_body = b""
+            error_content_type = None
+            byte_iter = upstream_response.aiter_bytes()
+            first_bytes, sniffed = await self._drain_keepalive_prelude(byte_iter)
+            if sniffed is not None:
+                error_status, error_body = sniffed
+                # The heartbeat stream committed text/event-stream upstream, but
+                # the recovered body is the JSON a plain error response carries.
+                error_content_type = "application/json"
+
+        if error_status is not None:
             response_headers = dict(upstream_response.headers)
             response_headers.pop("content-encoding", None)
             response_headers.pop("transfer-encoding", None)
             response_headers.pop("content-length", None)
+            if error_content_type is not None:
+                response_headers["content-type"] = error_content_type
             self._log_upstream_error(
                 url=url,
-                status_code=upstream_response.status_code,
+                status_code=error_status,
                 response_headers=dict(upstream_response.headers),
                 response_body=error_body,
                 retried=False,
@@ -1079,12 +1098,12 @@ class RolloutLLMProxy:
             if snapshot is not None and snapshot.scope is not None:
                 await self._record_context_overflow_error(
                     snapshot.scope,
-                    status_code=upstream_response.status_code,
+                    status_code=error_status,
                     response_body=error_body,
                 )
                 if await self._record_rollout_invalidated_error(
                     snapshot.scope,
-                    status_code=upstream_response.status_code,
+                    status_code=error_status,
                     response_body=error_body,
                 ):
                     await upstream_response.aclose()
@@ -1093,7 +1112,7 @@ class RolloutLLMProxy:
             await self._record_failed_upstream_error(
                 snapshot,
                 url=url,
-                status_code=upstream_response.status_code,
+                status_code=error_status,
                 request_headers=headers,
                 request_body=body,
                 response_headers=dict(upstream_response.headers),
@@ -1104,13 +1123,16 @@ class RolloutLLMProxy:
                 await self._mark_request_finished(snapshot.scope)
             return Response(
                 content=error_body,
-                status_code=upstream_response.status_code,
+                status_code=error_status,
                 headers=response_headers,
             )
 
+        assert byte_iter is not None
+
         async def _forward():
             try:
-                async for chunk in upstream_response.aiter_bytes():
+                yield first_bytes
+                async for chunk in byte_iter:
                     yield chunk
             finally:
                 await upstream_response.aclose()
@@ -1144,10 +1166,22 @@ class RolloutLLMProxy:
             raise
 
         if upstream_response.status_code >= 400:
+            error_status: int | None = upstream_response.status_code
             error_body = await upstream_response.aread()
+            first_bytes = b""
+            byte_iter: AsyncIterator[bytes] | None = None
+        else:
+            error_status = None
+            error_body = b""
+            byte_iter = upstream_response.aiter_bytes()
+            first_bytes, sniffed = await self._drain_keepalive_prelude(byte_iter)
+            if sniffed is not None:
+                error_status, error_body = sniffed
+
+        if error_status is not None:
             self._log_upstream_error(
                 url=url,
-                status_code=upstream_response.status_code,
+                status_code=error_status,
                 response_headers=dict(upstream_response.headers),
                 response_body=error_body,
                 retried=False,
@@ -1155,12 +1189,12 @@ class RolloutLLMProxy:
             if snapshot is not None and snapshot.scope is not None:
                 await self._record_context_overflow_error(
                     snapshot.scope,
-                    status_code=upstream_response.status_code,
+                    status_code=error_status,
                     response_body=error_body,
                 )
                 if await self._record_rollout_invalidated_error(
                     snapshot.scope,
-                    status_code=upstream_response.status_code,
+                    status_code=error_status,
                     response_body=error_body,
                 ):
                     await upstream_response.aclose()
@@ -1169,7 +1203,7 @@ class RolloutLLMProxy:
             await self._record_failed_upstream_error(
                 snapshot,
                 url=url,
-                status_code=upstream_response.status_code,
+                status_code=error_status,
                 request_headers=headers,
                 request_body=body,
                 response_headers=dict(upstream_response.headers),
@@ -1178,19 +1212,24 @@ class RolloutLLMProxy:
             await upstream_response.aclose()
             if snapshot is not None and snapshot.scope is not None:
                 await self._mark_request_finished(snapshot.scope)
-            if 500 <= upstream_response.status_code < 600:
+            if 500 <= error_status < 600:
                 return self._anthropic_non_retry_upstream_error_response(
-                    upstream_status_code=upstream_response.status_code,
+                    upstream_status_code=error_status,
                     response_body=error_body,
                 )
             return self._anthropic_error_response_from_bytes(
-                status_code=upstream_response.status_code,
+                status_code=error_status,
                 response_body=error_body,
             )
 
+        assert byte_iter is not None
+
         async def _forward():
             try:
-                async for event in self._iter_anthropic_events_from_openai_stream(upstream_response):
+                async for event in self._iter_anthropic_events_from_openai_stream(
+                    first_bytes,
+                    byte_iter,
+                ):
                     yield event
             finally:
                 await upstream_response.aclose()
@@ -1220,14 +1259,33 @@ class RolloutLLMProxy:
             raise
 
         if upstream_response.status_code >= 400:
+            error_status: int | None = upstream_response.status_code
             error_body = await upstream_response.aread()
+            error_content_type: str | None = None
+            first_bytes = b""
+            byte_iter: AsyncIterator[bytes] | None = None
+        else:
+            error_status = None
+            error_body = b""
+            error_content_type = None
+            byte_iter = upstream_response.aiter_bytes()
+            first_bytes, sniffed = await self._drain_keepalive_prelude(byte_iter)
+            if sniffed is not None:
+                error_status, error_body = sniffed
+                # The heartbeat stream committed text/event-stream upstream, but
+                # the recovered body is the JSON a plain error response carries.
+                error_content_type = "application/json"
+
+        if error_status is not None:
             response_headers = dict(upstream_response.headers)
             response_headers.pop("content-encoding", None)
             response_headers.pop("transfer-encoding", None)
             response_headers.pop("content-length", None)
+            if error_content_type is not None:
+                response_headers["content-type"] = error_content_type
             self._log_upstream_error(
                 url=url,
-                status_code=upstream_response.status_code,
+                status_code=error_status,
                 response_headers=dict(upstream_response.headers),
                 response_body=error_body,
                 retried=False,
@@ -1235,12 +1293,12 @@ class RolloutLLMProxy:
             if snapshot is not None and snapshot.scope is not None:
                 await self._record_context_overflow_error(
                     snapshot.scope,
-                    status_code=upstream_response.status_code,
+                    status_code=error_status,
                     response_body=error_body,
                 )
                 if await self._record_rollout_invalidated_error(
                     snapshot.scope,
-                    status_code=upstream_response.status_code,
+                    status_code=error_status,
                     response_body=error_body,
                 ):
                     await upstream_response.aclose()
@@ -1249,7 +1307,7 @@ class RolloutLLMProxy:
             await self._record_failed_upstream_error(
                 snapshot,
                 url=url,
-                status_code=upstream_response.status_code,
+                status_code=error_status,
                 request_headers=headers,
                 request_body=body,
                 response_headers=dict(upstream_response.headers),
@@ -1260,14 +1318,17 @@ class RolloutLLMProxy:
                 await self._mark_request_finished(snapshot.scope)
             return Response(
                 content=error_body,
-                status_code=upstream_response.status_code,
+                status_code=error_status,
                 headers=response_headers,
             )
+
+        assert byte_iter is not None
 
         async def _forward():
             try:
                 async for event in self._iter_openai_response_events_from_chat_stream(
-                    upstream_response,
+                    first_bytes,
+                    byte_iter,
                     original_request,
                 ):
                     yield event
@@ -1281,6 +1342,60 @@ class RolloutLLMProxy:
             status_code=upstream_response.status_code,
             media_type="text/event-stream",
         )
+
+    async def _drain_keepalive_prelude(
+        self,
+        byte_iter: AsyncIterator[bytes],
+    ) -> tuple[bytes, tuple[int, bytes] | None]:
+        """Drop the Dressage keepalive comment frames that open a stream.
+
+        Returns the first real SSE frame together with whatever was buffered
+        behind it, plus the error sniffed from that frame when generation
+        failed.  Dressage pseudo-streams an already-computed result, so
+        heartbeats and the terminal error event can only precede the first real
+        frame; everything after it is forwarded verbatim.
+        """
+        buffer = b""
+        async for chunk in byte_iter:
+            buffer += chunk
+            while (index := buffer.find(b"\n\n")) >= 0:
+                frame, buffer = buffer[:index], buffer[index + 2 :]
+                if not frame.strip() or frame.lstrip(b"\r\n").startswith(b":"):
+                    continue
+                return frame + b"\n\n" + buffer, self._sniff_first_frame_error(frame)
+        return buffer, None
+
+    @staticmethod
+    def _sniff_first_frame_error(frame: bytes) -> tuple[int, bytes] | None:
+        """Recover the status code a heartbeat-committed failure would have used.
+
+        Heartbeats force the upstream to commit HTTP 200 before generation
+        finishes, so a late failure arrives as
+        ``data: {"error": {..., "status_code": N}}``.  The embedded payload is
+        the exact body a plain >=400 response would have carried, so it is
+        re-encoded and fed to the same classifiers.
+        """
+        try:
+            text = frame.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+        for payload in _payloads_from_sse_event(text):
+            if payload == "[DONE]":
+                continue
+            try:
+                parsed = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            error = parsed.get("error")
+            if not isinstance(error, dict):
+                continue
+            status_code = error.get("status_code")
+            if type(status_code) is not int or not 400 <= status_code <= 599:
+                continue
+            return status_code, json.dumps(error, ensure_ascii=False).encode("utf-8")
+        return None
 
     async def _send_plain_request(
         self,
@@ -1590,7 +1705,9 @@ class RolloutLLMProxy:
             payload = json.loads(response_body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             return None
-        if not isinstance(payload, dict) or payload.get("error") != "context_overflow":
+        if not isinstance(payload, dict) or (
+            payload.get("code") or payload.get("error")
+        ) != "context_overflow":
             return None
         return payload
 
@@ -1613,7 +1730,9 @@ class RolloutLLMProxy:
             candidate = detail
         else:
             candidate = payload
-        if candidate.get("error") not in DRESSAGE_ROLLOUT_INVALIDATED_ERRORS:
+        if (
+            candidate.get("code") or candidate.get("error")
+        ) not in DRESSAGE_ROLLOUT_INVALIDATED_ERRORS:
             return None
         return {str(key): value for key, value in candidate.items()}
 
@@ -1813,7 +1932,8 @@ class RolloutLLMProxy:
 
     async def _iter_openai_response_events_from_chat_stream(
         self,
-        upstream_response: httpx.Response,
+        first_bytes: bytes,
+        byte_iter: AsyncIterator[bytes],
         original_request: dict[str, Any],
     ):
         response_id = "resp_proxy_stream"
@@ -1839,7 +1959,7 @@ class RolloutLLMProxy:
             },
         )
 
-        async for payload_text in _iter_openai_sse_payloads(upstream_response):
+        async for payload_text in _iter_openai_sse_payloads(first_bytes, byte_iter):
             if payload_text == "[DONE]":
                 break
             try:
@@ -1982,10 +2102,14 @@ class RolloutLLMProxy:
             "usage": usage,
         }
 
-    async def _iter_anthropic_events_from_openai_stream(self, upstream_response: httpx.Response):
+    async def _iter_anthropic_events_from_openai_stream(
+        self,
+        first_bytes: bytes,
+        byte_iter: AsyncIterator[bytes],
+    ):
         state = _AnthropicStreamState()
         yield state.message_start(model="proxy-model")
-        async for payload in _iter_openai_sse_payloads(upstream_response):
+        async for payload in _iter_openai_sse_payloads(first_bytes, byte_iter):
             if payload == "[DONE]":
                 break
             try:
@@ -2941,16 +3065,23 @@ def _openai_finish_reason_to_anthropic(value: Any) -> str:
     return normalized
 
 
-async def _iter_openai_sse_payloads(response: httpx.Response):
-    buffer = ""
-    async for chunk in response.aiter_text():
+async def _iter_openai_sse_payloads(first_bytes: bytes, byte_iter: AsyncIterator[bytes]):
+    # Frame in the byte domain and decode whole events: the SSE separator is
+    # ASCII, so an event boundary never splits a multi-byte character, while
+    # decoding raw chunks would corrupt one that straddles a chunk boundary.
+    buffer = first_bytes
+    while (index := buffer.find(b"\n\n")) >= 0:
+        raw_event, buffer = buffer[:index], buffer[index + 2 :]
+        for payload in _payloads_from_sse_event(raw_event.decode("utf-8", errors="replace")):
+            yield payload
+    async for chunk in byte_iter:
         buffer += chunk
-        while "\n\n" in buffer:
-            raw_event, buffer = buffer.split("\n\n", 1)
-            for payload in _payloads_from_sse_event(raw_event):
+        while (index := buffer.find(b"\n\n")) >= 0:
+            raw_event, buffer = buffer[:index], buffer[index + 2 :]
+            for payload in _payloads_from_sse_event(raw_event.decode("utf-8", errors="replace")):
                 yield payload
     if buffer.strip():
-        for payload in _payloads_from_sse_event(buffer):
+        for payload in _payloads_from_sse_event(buffer.decode("utf-8", errors="replace")):
             yield payload
 
 
