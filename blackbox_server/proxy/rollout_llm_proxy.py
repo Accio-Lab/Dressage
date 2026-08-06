@@ -1058,7 +1058,7 @@ class RolloutLLMProxy:
         assert self._client is not None
         try:
             upstream_response = await self._send_stream_request(url, body, headers)
-        except Exception:
+        except BaseException:
             if snapshot is not None and snapshot.scope is not None:
                 await self._mark_request_finished(snapshot.scope)
             raise
@@ -1074,7 +1074,16 @@ class RolloutLLMProxy:
             error_body = b""
             error_content_type = None
             byte_iter = upstream_response.aiter_bytes()
-            first_bytes, sniffed = await self._drain_keepalive_prelude(byte_iter)
+            try:
+                first_bytes, sniffed = await self._drain_keepalive_prelude(byte_iter)
+            except BaseException:
+                # The prelude awaits for the whole generation, so a disconnect
+                # or cancellation here must still release the connection and
+                # the request marker that _forward() would normally clean up.
+                await upstream_response.aclose()
+                if snapshot is not None and snapshot.scope is not None:
+                    await self._mark_request_finished(snapshot.scope)
+                raise
             if sniffed is not None:
                 error_status, error_body = sniffed
                 # The heartbeat stream committed text/event-stream upstream, but
@@ -1160,7 +1169,7 @@ class RolloutLLMProxy:
         assert self._client is not None
         try:
             upstream_response = await self._send_stream_request(url, body, headers)
-        except Exception:
+        except BaseException:
             if snapshot is not None and snapshot.scope is not None:
                 await self._mark_request_finished(snapshot.scope)
             raise
@@ -1174,7 +1183,16 @@ class RolloutLLMProxy:
             error_status = None
             error_body = b""
             byte_iter = upstream_response.aiter_bytes()
-            first_bytes, sniffed = await self._drain_keepalive_prelude(byte_iter)
+            try:
+                first_bytes, sniffed = await self._drain_keepalive_prelude(byte_iter)
+            except BaseException:
+                # The prelude awaits for the whole generation, so a disconnect
+                # or cancellation here must still release the connection and
+                # the request marker that _forward() would normally clean up.
+                await upstream_response.aclose()
+                if snapshot is not None and snapshot.scope is not None:
+                    await self._mark_request_finished(snapshot.scope)
+                raise
             if sniffed is not None:
                 error_status, error_body = sniffed
 
@@ -1253,7 +1271,7 @@ class RolloutLLMProxy:
         assert self._client is not None
         try:
             upstream_response = await self._send_stream_request(url, body, headers)
-        except Exception:
+        except BaseException:
             if snapshot is not None and snapshot.scope is not None:
                 await self._mark_request_finished(snapshot.scope)
             raise
@@ -1269,7 +1287,16 @@ class RolloutLLMProxy:
             error_body = b""
             error_content_type = None
             byte_iter = upstream_response.aiter_bytes()
-            first_bytes, sniffed = await self._drain_keepalive_prelude(byte_iter)
+            try:
+                first_bytes, sniffed = await self._drain_keepalive_prelude(byte_iter)
+            except BaseException:
+                # The prelude awaits for the whole generation, so a disconnect
+                # or cancellation here must still release the connection and
+                # the request marker that _forward() would normally clean up.
+                await upstream_response.aclose()
+                if snapshot is not None and snapshot.scope is not None:
+                    await self._mark_request_finished(snapshot.scope)
+                raise
             if sniffed is not None:
                 error_status, error_body = sniffed
                 # The heartbeat stream committed text/event-stream upstream, but

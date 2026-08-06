@@ -2857,3 +2857,151 @@ def test_prelude_conversion_survives_multibyte_char_split_across_chunks():
         if name == "content_block_delta"
     )
     assert text == "ok中文"
+
+
+class _BreakingByteStream(httpx.AsyncByteStream):
+    """Yield the given chunks, then break the stream with a ReadError."""
+
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = chunks
+
+    async def __aiter__(self):
+        for chunk in self._chunks:
+            yield chunk
+        raise httpx.ReadError("upstream connection broke during prelude")
+
+    async def aclose(self) -> None:
+        return None
+
+
+class _HangingByteStream(httpx.AsyncByteStream):
+    """Yield the given chunks, then hang until cancelled."""
+
+    def __init__(self, chunks: list[bytes], consumed: asyncio.Event) -> None:
+        self._chunks = chunks
+        self._consumed = consumed
+
+    async def __aiter__(self):
+        for chunk in self._chunks:
+            yield chunk
+        self._consumed.set()
+        await asyncio.Event().wait()
+
+    async def aclose(self) -> None:
+        return None
+
+
+def _prelude_request_payload(path: str) -> dict[str, Any]:
+    payload: dict[str, Any] = {"model": "proxy-model", "stream": True}
+    if path.endswith("/messages"):
+        payload.update({"max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]})
+    elif path.endswith("/responses"):
+        payload["input"] = "hi"
+    else:
+        payload["messages"] = [{"role": "user", "content": "hi"}]
+    return payload
+
+
+@pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/messages", "/v1/responses"])
+def test_prelude_upstream_break_releases_request_marker(path: str):
+    proxy = _make_proxy()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        _ = request
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=_BreakingByteStream([_HEARTBEAT]),
+        )
+
+    async def run_test() -> None:
+        proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await proxy.open_turn("turn-001", backend_session_id="session-1")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.app),
+            base_url="http://proxy",
+        ) as client:
+            with pytest.raises(httpx.ReadError):
+                await client.post(path, json=_prelude_request_payload(path))
+        # The break during the prelude must have released the request marker.
+        await asyncio.wait_for(proxy.drain_turn(timeout=0.5), timeout=1.0)
+        assert proxy._turn_scope is not None
+        assert proxy._turn_scope.inflight_requests == 0
+        await proxy._client.aclose()
+
+    asyncio.run(run_test())
+
+
+def test_prelude_cancellation_releases_request_marker():
+    proxy = _make_proxy()
+    consumed = asyncio.Event()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        _ = request
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=_HangingByteStream([_HEARTBEAT], consumed),
+        )
+
+    async def run_test() -> None:
+        proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await proxy.open_turn("turn-001", backend_session_id="session-1")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.app),
+            base_url="http://proxy",
+        ) as client:
+            task = asyncio.create_task(
+                client.post(
+                    "/v1/chat/completions",
+                    json=_prelude_request_payload("/v1/chat/completions"),
+                )
+            )
+            await asyncio.wait_for(consumed.wait(), timeout=1.0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        # Cancellation mid-prelude must have released the request marker.
+        await asyncio.wait_for(proxy.drain_turn(timeout=0.5), timeout=1.0)
+        assert proxy._turn_scope is not None
+        assert proxy._turn_scope.inflight_requests == 0
+        await proxy._client.aclose()
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/messages", "/v1/responses"])
+def test_send_stream_request_cancellation_releases_request_marker(path: str):
+    proxy = _make_proxy()
+    sending = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        # Hang before returning response headers, i.e. inside the await point of
+        # _send_stream_request, which cancellation must not leave unguarded.
+        _ = request
+        sending.set()
+        await asyncio.Event().wait()
+        return httpx.Response(200)
+
+    async def run_test() -> None:
+        proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await proxy.open_turn("turn-001", backend_session_id="session-1")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.app),
+            base_url="http://proxy",
+        ) as client:
+            task = asyncio.create_task(
+                client.post(path, json=_prelude_request_payload(path))
+            )
+            await asyncio.wait_for(sending.wait(), timeout=1.0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        # Cancellation before the response headers arrived must have released
+        # the request marker; otherwise drain_turn() hangs at turn teardown.
+        await asyncio.wait_for(proxy.drain_turn(timeout=0.5), timeout=1.0)
+        assert proxy._turn_scope is not None
+        assert proxy._turn_scope.inflight_requests == 0
+        await proxy._client.aclose()
+
+    asyncio.run(run_test())
