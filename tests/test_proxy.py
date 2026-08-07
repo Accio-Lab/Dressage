@@ -797,6 +797,7 @@ def make_client(
     use_rollout_routing_replay: bool = False,
     partial_rollout: bool = False,
     max_partial_rollout_preempts: int | None = None,
+    stream_heartbeat_interval_seconds: float | None = None,
 ):
     session_manager = SessionManager()
     trajectory_store = TrajectoryStore(min_group_size=1, group_timeout=0.0)
@@ -828,6 +829,10 @@ def make_client(
     )
     if tool_call_parser is not _UNSET:
         create_app_kwargs["tool_call_parser"] = tool_call_parser
+    if stream_heartbeat_interval_seconds is not None:
+        create_app_kwargs["stream_heartbeat_interval_seconds"] = (
+            stream_heartbeat_interval_seconds
+        )
     app = create_app(**create_app_kwargs)
     return (
         TestClient(app),
@@ -5805,3 +5810,189 @@ def test_generation_controller_shutdown_rejects_new_generations():
         raise AssertionError("Expected shutdown controller to reject generation")
 
     asyncio.run(run_test())
+
+
+def _heartbeat_app(sglang_client, *, interval: float, context_window: int | None = None):
+    return create_app(
+        sglang_router_url="http://router.test",
+        tokenizer=FakeTokenizer(),
+        session_manager=SessionManager(),
+        trajectory_store=TrajectoryStore(min_group_size=1, group_timeout=0.0),
+        sglang_client=sglang_client,
+        context_window=context_window,
+        stream_heartbeat_interval_seconds=interval,
+    )
+
+
+async def _collect_stream(app, payload: dict, *, session: str) -> tuple[int, str]:
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            headers={"X-Session-Id": session, "X-Instance-Id": f"inst-{session}"},
+            json=payload,
+        ) as response:
+            body = "".join([chunk async for chunk in response.aiter_text()])
+            return response.status_code, body
+
+
+def test_stream_heartbeat_emits_keepalive_before_chunks():
+    blocking_client = BlockingSGLangClient([make_response("hello")])
+    app = _heartbeat_app(blocking_client, interval=0.05)
+
+    async def run_test() -> None:
+        collect = asyncio.create_task(
+            _collect_stream(
+                app,
+                {
+                    "model": "fake-model",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                session="sess-hb",
+            )
+        )
+        assert await asyncio.to_thread(blocking_client.first_call_started.wait, 2.0)
+        # Let at least two heartbeat intervals elapse before generation returns.
+        await asyncio.sleep(0.2)
+        blocking_client.release_first_call.set()
+        status_code, body = await collect
+
+        assert status_code == 200
+        assert body.count(": dressage-heartbeat") >= 2
+        assert body.index(": dressage-heartbeat") < body.index("data: ")
+        assert '"role": "assistant"' in body or '"role":"assistant"' in body
+        assert body.rstrip().endswith("data: [DONE]")
+
+    asyncio.run(run_test())
+
+
+def test_stream_heartbeat_fast_completion_matches_legacy_stream():
+    payload = {
+        "model": "fake-model",
+        "stream": True,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+
+    async def run_test() -> None:
+        with_heartbeat = await _collect_stream(
+            _heartbeat_app(FakeSGLangClient([make_response("hello")]), interval=5.0),
+            payload,
+            session="sess-hb-fast",
+        )
+        disabled = await _collect_stream(
+            _heartbeat_app(FakeSGLangClient([make_response("hello")]), interval=0.0),
+            payload,
+            session="sess-hb-off",
+        )
+
+        assert with_heartbeat[0] == disabled[0] == 200
+        assert ": dressage-heartbeat" not in with_heartbeat[1]
+        assert ": dressage-heartbeat" not in disabled[1]
+        # Response ids differ per request; compare everything else verbatim.
+        strip_id = lambda text: re.sub(r'"id": ?"chatcmpl-[0-9a-f]+"', '"id":"X"', text)
+        assert strip_id(with_heartbeat[1]) == strip_id(disabled[1])
+
+    asyncio.run(run_test())
+
+
+def test_stream_heartbeat_preserves_status_code_for_fast_errors():
+    messages = [{"role": "user", "content": "hi"}]
+    tokenizer = FakeTokenizer()
+    prompt_ids = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+    )["input_ids"]
+    client, _, _, sglang_client = make_client(
+        tokenizer=tokenizer,
+        sglang_client=FakeSGLangClient([make_response("a")]),
+        context_window=len(prompt_ids) + 1,
+        stream_heartbeat_interval_seconds=5.0,
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"X-Session-Id": "sess-hb-fast-err", "X-Instance-Id": "inst-1"},
+        json={"model": "fake-model", "stream": True, "messages": messages},
+    )
+
+    assert response.status_code == 413
+    assert response.json()["error"] == "context_overflow"
+    assert sglang_client.calls == []
+
+
+def test_stream_heartbeat_reports_late_error_in_stream():
+    messages = [{"role": "user", "content": "hi"}]
+    tokenizer = FakeTokenizer()
+    prompt_ids = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=True,
+    )["input_ids"]
+    blocking_client = BlockingSGLangClient([make_response("abc")])
+    app = _heartbeat_app(
+        blocking_client,
+        interval=0.05,
+        context_window=len(prompt_ids) + 2,
+    )
+
+    async def run_test() -> None:
+        collect = asyncio.create_task(
+            _collect_stream(
+                app,
+                {
+                    "model": "fake-model",
+                    "stream": True,
+                    "messages": messages,
+                    "max_tokens": 3,
+                },
+                session="sess-hb-late-err",
+            )
+        )
+        assert await asyncio.to_thread(blocking_client.first_call_started.wait, 2.0)
+        await asyncio.sleep(0.2)
+        blocking_client.release_first_call.set()
+        status_code, body = await collect
+
+        # The heartbeat already committed HTTP 200, so the 413 is relayed inside
+        # the stream with its status code preserved for the blackbox proxy.
+        assert status_code == 200
+        assert ": dressage-heartbeat" in body
+        error_line = [
+            line for line in body.splitlines() if line.startswith("data: {")
+        ][-1]
+        error = json.loads(error_line[len("data: ") :])["error"]
+        assert error["status_code"] == 413
+        assert error["code"] == "context_overflow"
+        assert error["type"] == "dressage_proxy_error"
+        assert body.rstrip().endswith("data: [DONE]")
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf")])
+def test_create_app_rejects_invalid_stream_heartbeat_interval_seconds(value):
+    with pytest.raises(ValueError, match="stream_heartbeat_interval_seconds"):
+        create_app(
+            sglang_router_url="http://router.test",
+            tokenizer=FakeTokenizer(),
+            session_manager=SessionManager(),
+            trajectory_store=TrajectoryStore(min_group_size=1, group_timeout=0.0),
+            sglang_client=FakeSGLangClient([make_response("hello")]),
+            stream_heartbeat_interval_seconds=value,
+        )
+
+
+def test_health_reports_stream_heartbeat_interval():
+    client, _, _, _ = make_client(
+        make_response("hello"),
+        stream_heartbeat_interval_seconds=7.5,
+    )
+
+    config = client.get("/health").json()["config"]
+
+    assert config["stream_heartbeat_interval_seconds"] == 7.5

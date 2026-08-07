@@ -117,7 +117,10 @@ class BackendContextOverflowError(BackendError):
 def backend_context_overflow_from_proxy_payload(
     payload: object,
 ) -> BackendContextOverflowError | None:
-    if not isinstance(payload, dict) or payload.get("error") != "context_overflow":
+    if (
+        not isinstance(payload, dict)
+        or (payload.get("code") or payload.get("error")) != "context_overflow"
+    ):
         return None
     details = payload.get("details")
     if not isinstance(details, dict):

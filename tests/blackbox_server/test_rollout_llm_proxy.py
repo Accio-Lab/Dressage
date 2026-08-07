@@ -9,6 +9,7 @@ from typing import Any
 import httpx
 import pytest
 
+from blackbox_server.adapters.base import backend_context_overflow_from_proxy_payload
 from blackbox_server.proxy.rollout_llm_proxy import RolloutLLMProxy
 
 
@@ -2578,3 +2579,429 @@ def test_rollout_proxy_recognizes_partial_staleness_invalidated_response():
     )
 
     assert recorded == payload["detail"]
+
+
+_HEARTBEAT = b": dressage-heartbeat\n\n"
+
+
+def _dressage_error_event(status_code: int, code: str) -> bytes:
+    return _sse_event(
+        {
+            "error": {
+                "type": "dressage_proxy_error",
+                "code": code,
+                "message": f"Dressage proxy {code}.",
+                "status_code": status_code,
+            }
+        }
+    )
+
+
+def _stream_through_proxy(proxy: RolloutLLMProxy, path: str, chunks: list[bytes]):
+    """Drive one streaming model request; return (status_code, body, content_type)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        _ = request
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=MockAsyncByteStream(chunks),
+        )
+
+    payload: dict[str, Any] = {"model": "proxy-model", "stream": True}
+    if path.endswith("/messages"):
+        payload.update({"max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]})
+    elif path.endswith("/responses"):
+        payload["input"] = "hi"
+    else:
+        payload["messages"] = [{"role": "user", "content": "hi"}]
+
+    async def run_test() -> tuple[int, bytes]:
+        proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await proxy.open_turn("turn-001", backend_session_id="session-1")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.app),
+            base_url="http://proxy",
+        ) as client:
+            async with client.stream("POST", path, json=payload) as response:
+                body = await response.aread()
+                status_code = response.status_code
+                content_type = response.headers.get("content-type")
+        await proxy.drain_turn(timeout=1.0)
+        await proxy._client.aclose()
+        return status_code, body, content_type
+
+    return asyncio.run(run_test())
+
+
+def test_prelude_drops_heartbeats_and_forwards_chat_stream_verbatim():
+    proxy = _make_proxy()
+    real_chunks = [
+        _sse_event({"id": "chatcmpl-1", "choices": [{"delta": {"role": "assistant"}}]}),
+        _sse_event({"id": "chatcmpl-1", "choices": [{"delta": {"content": "hi"}}]}),
+        b"data: [DONE]\n\n",
+    ]
+
+    status_code, body, content_type = _stream_through_proxy(
+        proxy,
+        "/v1/chat/completions",
+        [_HEARTBEAT, _HEARTBEAT, *real_chunks],
+    )
+
+    assert status_code == 200
+    assert b"dressage-heartbeat" not in body
+    assert body == b"".join(real_chunks)
+
+
+def test_prelude_drops_heartbeats_split_and_glued_across_chunks():
+    proxy = _make_proxy()
+    real_chunks = [
+        _sse_event({"id": "chatcmpl-1", "choices": [{"delta": {"content": "hi"}}]}),
+        b"data: [DONE]\n\n",
+    ]
+
+    status_code, body, content_type = _stream_through_proxy(
+        proxy,
+        "/v1/chat/completions",
+        [
+            b": dressage-",
+            b"heartbeat\n\n: dressage-heartbeat\n\n" + real_chunks[0][:10],
+            real_chunks[0][10:] + real_chunks[1],
+        ],
+    )
+
+    assert status_code == 200
+    assert b"dressage-heartbeat" not in body
+    assert body == b"".join(real_chunks)
+
+
+def test_prelude_drops_every_comment_frame_ahead_of_the_first_real_frame():
+    proxy = _make_proxy()
+
+    status_code, body, content_type = _stream_through_proxy(
+        proxy,
+        "/v1/chat/completions",
+        [_HEARTBEAT, b": other-comment\n\n", b"data: [DONE]\n\n"],
+    )
+
+    # Every comment frame ahead of the first real frame is prelude noise, so the
+    # forwarded stream starts at the first non-comment frame.
+    assert status_code == 200
+    assert b"dressage-heartbeat" not in body
+    assert b": other-comment" not in body
+    assert body == b"data: [DONE]\n\n"
+
+
+def test_prelude_restores_status_code_for_late_chat_completion_error():
+    proxy = _make_proxy()
+
+    status_code, body, content_type = _stream_through_proxy(
+        proxy,
+        "/v1/chat/completions",
+        [_HEARTBEAT, _dressage_error_event(413, "context_overflow"), b"data: [DONE]\n\n"],
+    )
+
+    async def consume() -> dict[str, Any] | None:
+        return await proxy.consume_context_overflow_error()
+
+    overflow = asyncio.run(consume())
+
+    assert status_code == 413
+    assert content_type == "application/json"
+    assert b"dressage-heartbeat" not in body
+    assert json.loads(body)["code"] == "context_overflow"
+    assert overflow is not None
+    # The marker must still convert into the typed error the adapters raise,
+    # otherwise the overflow is silently swallowed by the turn teardown.
+    assert backend_context_overflow_from_proxy_payload(overflow) is not None
+
+
+def test_prelude_restores_status_code_for_late_anthropic_error():
+    proxy = _make_proxy()
+
+    status_code, body, content_type = _stream_through_proxy(
+        proxy,
+        "/v1/messages",
+        [_HEARTBEAT, _dressage_error_event(413, "context_overflow"), b"data: [DONE]\n\n"],
+    )
+
+    # No message_start is emitted, so the agent cannot mistake the failure for a
+    # successful empty message.
+    assert status_code == 413
+    assert b"message_start" not in body
+    assert json.loads(body)["type"] == "error"
+
+
+def test_prelude_maps_late_5xx_to_non_retry_anthropic_error():
+    proxy = _make_proxy()
+
+    status_code, body, content_type = _stream_through_proxy(
+        proxy,
+        "/v1/messages",
+        [_HEARTBEAT, _dressage_error_event(502, "upstream_failure"), b"data: [DONE]\n\n"],
+    )
+
+    payload = json.loads(body)
+
+    assert status_code == 400
+    assert payload["error"]["type"] == "upstream_error"
+    assert "HTTP 502" in payload["error"]["message"]
+
+
+def test_prelude_returns_synthetic_stream_for_late_rollout_invalidation():
+    proxy = _make_proxy()
+
+    status_code, body, content_type = _stream_through_proxy(
+        proxy,
+        "/v1/chat/completions",
+        [
+            _HEARTBEAT,
+            _dressage_error_event(502, "generation_preempted"),
+            b"data: [DONE]\n\n",
+        ],
+    )
+
+    async def consume() -> dict[str, Any] | None:
+        return await proxy.consume_rollout_invalidated_error()
+
+    invalidated = asyncio.run(consume())
+
+    assert status_code == 200
+    assert b"dressage-heartbeat" not in body
+    assert b"data: [DONE]" in body
+    assert invalidated is not None
+
+
+def test_prelude_converts_heartbeated_anthropic_success_stream():
+    proxy = _make_proxy()
+
+    status_code, body, content_type = _stream_through_proxy(
+        proxy,
+        "/v1/messages",
+        [
+            _HEARTBEAT,
+            _sse_event({"model": "proxy-model", "choices": [{"delta": {"content": "hi"}}]}),
+            _sse_event({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+            b"data: [DONE]\n\n",
+        ],
+    )
+    events = _sse_events_from_body(body)
+
+    assert status_code == 200
+    assert b"dressage-heartbeat" not in body
+    assert [name for name, _ in events][0] == "message_start"
+    assert "message_stop" in [name for name, _ in events]
+
+
+def test_prelude_converts_heartbeated_openai_responses_stream():
+    proxy = _make_proxy()
+
+    status_code, body, content_type = _stream_through_proxy(
+        proxy,
+        "/v1/responses",
+        [
+            _HEARTBEAT,
+            _sse_event({"id": "chatcmpl-1", "choices": [{"delta": {"content": "hi"}}]}),
+            _sse_event({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+            b"data: [DONE]\n\n",
+        ],
+    )
+    events = _sse_events_from_body(body)
+
+    assert status_code == 200
+    assert b"dressage-heartbeat" not in body
+    assert [name for name, _ in events][0] == "response.created"
+    assert [name for name, _ in events][-1] == "response.completed"
+
+
+def test_prelude_handles_stream_that_is_only_heartbeats():
+    proxy = _make_proxy()
+
+    status_code, body, content_type = _stream_through_proxy(
+        proxy,
+        "/v1/chat/completions",
+        [_HEARTBEAT, _HEARTBEAT],
+    )
+
+    assert status_code == 200
+    assert body == b""
+
+
+def test_prelude_conversion_survives_multibyte_char_split_across_chunks():
+    proxy = _make_proxy()
+    # The split must land after the prelude handed over the first real frame,
+    # because that is the region decoded chunk by chunk.  Non-ASCII content is
+    # reachable whenever the upstream serializes with ensure_ascii=False.
+    first_frame = _sse_event({"choices": [{"delta": {"content": "ok"}}]})
+    second_frame = b'data: {"choices":[{"delta":{"content":"\xe4\xb8\xad\xe6\x96\x87"}}]}\n\n'
+    split = second_frame.index(b"\xe6\x96\x87") + 1
+
+    status_code, body, _ = _stream_through_proxy(
+        proxy,
+        "/v1/messages",
+        [
+            _HEARTBEAT,
+            first_frame,
+            second_frame[:split],
+            second_frame[split:]
+            + _sse_event({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+            b"data: [DONE]\n\n",
+        ],
+    )
+
+    assert status_code == 200
+    assert "\ufffd" not in body.decode("utf-8")
+    text = "".join(
+        payload["delta"]["text"]
+        for name, payload in _sse_events_from_body(body)
+        if name == "content_block_delta"
+    )
+    assert text == "ok中文"
+
+
+class _BreakingByteStream(httpx.AsyncByteStream):
+    """Yield the given chunks, then break the stream with a ReadError."""
+
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = chunks
+
+    async def __aiter__(self):
+        for chunk in self._chunks:
+            yield chunk
+        raise httpx.ReadError("upstream connection broke during prelude")
+
+    async def aclose(self) -> None:
+        return None
+
+
+class _HangingByteStream(httpx.AsyncByteStream):
+    """Yield the given chunks, then hang until cancelled."""
+
+    def __init__(self, chunks: list[bytes], consumed: asyncio.Event) -> None:
+        self._chunks = chunks
+        self._consumed = consumed
+
+    async def __aiter__(self):
+        for chunk in self._chunks:
+            yield chunk
+        self._consumed.set()
+        await asyncio.Event().wait()
+
+    async def aclose(self) -> None:
+        return None
+
+
+def _prelude_request_payload(path: str) -> dict[str, Any]:
+    payload: dict[str, Any] = {"model": "proxy-model", "stream": True}
+    if path.endswith("/messages"):
+        payload.update({"max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]})
+    elif path.endswith("/responses"):
+        payload["input"] = "hi"
+    else:
+        payload["messages"] = [{"role": "user", "content": "hi"}]
+    return payload
+
+
+@pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/messages", "/v1/responses"])
+def test_prelude_upstream_break_releases_request_marker(path: str):
+    proxy = _make_proxy()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        _ = request
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=_BreakingByteStream([_HEARTBEAT]),
+        )
+
+    async def run_test() -> None:
+        proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await proxy.open_turn("turn-001", backend_session_id="session-1")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.app),
+            base_url="http://proxy",
+        ) as client:
+            with pytest.raises(httpx.ReadError):
+                await client.post(path, json=_prelude_request_payload(path))
+        # The break during the prelude must have released the request marker.
+        await asyncio.wait_for(proxy.drain_turn(timeout=0.5), timeout=1.0)
+        assert proxy._turn_scope is not None
+        assert proxy._turn_scope.inflight_requests == 0
+        await proxy._client.aclose()
+
+    asyncio.run(run_test())
+
+
+def test_prelude_cancellation_releases_request_marker():
+    proxy = _make_proxy()
+    consumed = asyncio.Event()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        _ = request
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=_HangingByteStream([_HEARTBEAT], consumed),
+        )
+
+    async def run_test() -> None:
+        proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await proxy.open_turn("turn-001", backend_session_id="session-1")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.app),
+            base_url="http://proxy",
+        ) as client:
+            task = asyncio.create_task(
+                client.post(
+                    "/v1/chat/completions",
+                    json=_prelude_request_payload("/v1/chat/completions"),
+                )
+            )
+            await asyncio.wait_for(consumed.wait(), timeout=1.0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        # Cancellation mid-prelude must have released the request marker.
+        await asyncio.wait_for(proxy.drain_turn(timeout=0.5), timeout=1.0)
+        assert proxy._turn_scope is not None
+        assert proxy._turn_scope.inflight_requests == 0
+        await proxy._client.aclose()
+
+    asyncio.run(run_test())
+
+
+@pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/messages", "/v1/responses"])
+def test_send_stream_request_cancellation_releases_request_marker(path: str):
+    proxy = _make_proxy()
+    sending = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        # Hang before returning response headers, i.e. inside the await point of
+        # _send_stream_request, which cancellation must not leave unguarded.
+        _ = request
+        sending.set()
+        await asyncio.Event().wait()
+        return httpx.Response(200)
+
+    async def run_test() -> None:
+        proxy._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await proxy.open_turn("turn-001", backend_session_id="session-1")
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.app),
+            base_url="http://proxy",
+        ) as client:
+            task = asyncio.create_task(
+                client.post(path, json=_prelude_request_payload(path))
+            )
+            await asyncio.wait_for(sending.wait(), timeout=1.0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        # Cancellation before the response headers arrived must have released
+        # the request marker; otherwise drain_turn() hangs at turn teardown.
+        await asyncio.wait_for(proxy.drain_turn(timeout=0.5), timeout=1.0)
+        assert proxy._turn_scope is not None
+        assert proxy._turn_scope.inflight_requests == 0
+        await proxy._client.aclose()
+
+    asyncio.run(run_test())
