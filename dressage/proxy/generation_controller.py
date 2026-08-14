@@ -90,7 +90,6 @@ class PreemptibleGenerateResult:
     finish_reason: str
     all_logprobs_invalid: bool
     rollout_epoch: int | None = None
-    routed_experts: str | None = None
     routed_experts_chunks: list[dict[str, Any]] = field(default_factory=list)
     chunks: list[GenerationChunk] = field(default_factory=list)
 
@@ -361,6 +360,7 @@ class GenerationController:
                 )
             finish_reason = response.finish_reason
             meta_info = dict(response.meta_info or {})
+            meta_info.pop("routed_experts", None)
             all_logprobs_invalid = all_logprobs_invalid or response.all_logprobs_invalid
 
             # Mark model-side quiescence only after the partial chunk from the
@@ -422,15 +422,6 @@ class GenerationController:
         if output_versions:
             meta_info["weight_version"] = output_versions[-1]
 
-        single_routed_experts = (
-            routed_experts_chunks[0]["data"]
-            if (
-                len(routed_experts_chunks) == 1
-                and routed_experts_chunks[0].get("is_first_chunk")
-            )
-            else None
-        )
-
         return PreemptibleGenerateResult(
             input_token_ids=list(input_ids),
             input_token_logprobs_raw=full_input_logprobs,
@@ -446,7 +437,6 @@ class GenerationController:
             finish_reason=finish_reason,
             all_logprobs_invalid=all_logprobs_invalid,
             rollout_epoch=rollout_epoch,
-            routed_experts=single_routed_experts,
             routed_experts_chunks=routed_experts_chunks,
             chunks=chunks,
         )

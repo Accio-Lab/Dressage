@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
 import re
 import threading
+from array import array
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +40,13 @@ from dressage.proxy.tool_call_parser import (
 )
 from dressage.proxy.tito import load_fixed_template
 from dressage.proxy.trajectory_store import TrajectoryStore
+from dressage.training.tq_hydration import hydrate_training_layouts
+from dressage.transport import (
+    TQFieldRef,
+    TransferQueueRuntime,
+    TransferQueueStore,
+    is_tq_field_layout_dict,
+)
 
 _UNSET = object()
 _STRICT_TOOL_CALL_ID_RE = re.compile(r"^call[0-9a-f]{8}$")
@@ -618,6 +627,41 @@ def make_response(
     )
 
 
+def encode_routed_experts(values: list[int]) -> str:
+    encoded = array("i", values)
+    assert encoded.itemsize == 4
+    return base64.b64encode(encoded.tobytes()).decode("ascii")
+
+
+def decode_routed_expert_chunks(chunks: list[dict]) -> list[int]:
+    values: list[int] = []
+    for chunk in chunks:
+        typecode = {"uint8": "B", "uint16": "H", "int32": "i"}[
+            chunk.get("dtype", "int32")
+        ]
+        decoded = array(typecode)
+        decoded.frombytes(base64.b64decode(chunk["data"]))
+        values.extend(decoded)
+    return values
+
+
+class RoutingSGLangClient(FakeSGLangClient):
+    async def generate(self, input_ids, sampling_params, **kwargs):
+        kwargs.pop("request_id", None)
+        response = await super().generate(
+            input_ids,
+            sampling_params,
+            **kwargs,
+        )
+        response_index = len(self.calls) - 1
+        row_count = len(response.all_token_ids) - 1
+        response.routed_experts = encode_routed_experts(
+            [response_index * 100_000 + index for index in range(row_count)]
+        )
+        response.meta_info["routed_experts"] = response.routed_experts
+        return response
+
+
 def make_prompt_logprob_missing_response(text: str) -> SGLangResponse:
     return make_response(text, prompt_logprobs=[])
 
@@ -775,6 +819,61 @@ def assert_concat_mask_for_outputs(item: dict, output_texts: list[str]) -> None:
     ]
 
 
+class InMemoryTransferQueue:
+    def __init__(self):
+        self.data: dict[tuple[str, str], dict[str, Any]] = {}
+        self.tags: dict[tuple[str, str], dict[str, Any]] = {}
+        self.read_count = 0
+
+    async def async_kv_put(self, *, key, partition_id, fields, tag):
+        self.data[(partition_id, key)] = dict(fields)
+        self.tags[(partition_id, key)] = dict(tag)
+
+    async def async_kv_batch_get(self, *, keys, partition_id, select_fields):
+        self.read_count += 1
+        fields = [select_fields] if isinstance(select_fields, str) else select_fields
+        return {
+            field: [self.data[(partition_id, key)][field] for key in keys]
+            for field in fields
+        }
+
+    async def async_kv_clear(self, *, keys, partition_id):
+        for key in keys:
+            self.data.pop((partition_id, key), None)
+            self.tags.pop((partition_id, key), None)
+
+    async def async_kv_list(self, *, partition_id):
+        return {
+            partition_id: {
+                key: tag
+                for (partition, key), tag in self.tags.items()
+                if partition == partition_id
+            }
+        }
+
+
+def test_transfer_queue_configuration_requires_explicit_consistent_fields():
+    tq = InMemoryTransferQueue()
+    runtime = TransferQueueRuntime(
+        TransferQueueStore(tq, store_id="test-store"),
+        transfer_params=("logprobs",),
+        token_build_mode="snapshot",
+    )
+    with pytest.raises(ValueError, match="at least one"):
+        make_client(transfer_queue_runtime=runtime)
+
+    routed_runtime = TransferQueueRuntime(
+        TransferQueueStore(tq, store_id="test-store"),
+        transfer_params=("routed_experts",),
+        token_build_mode="snapshot",
+    )
+    with pytest.raises(ValueError, match="requires use_rollout_routing_replay"):
+        make_client(
+            transfer_queue_runtime=routed_runtime,
+            transfer_params=("routed_experts",),
+        )
+
+
 def make_client(
     *responses: SGLangResponse,
     tokenizer=None,
@@ -795,9 +894,12 @@ def make_client(
     context_window: int | None = None,
     dynamic_max_tokens: bool = True,
     use_rollout_routing_replay: bool = False,
+    routed_experts_dtype: str = "int32",
     partial_rollout: bool = False,
     max_partial_rollout_preempts: int | None = None,
     stream_heartbeat_interval_seconds: float | None = None,
+    transfer_queue_runtime: TransferQueueRuntime | None = None,
+    transfer_params: tuple[str, ...] = (),
 ):
     session_manager = SessionManager()
     trajectory_store = TrajectoryStore(min_group_size=1, group_timeout=0.0)
@@ -824,8 +926,12 @@ def make_client(
         context_window=context_window,
         dynamic_max_tokens=dynamic_max_tokens,
         use_rollout_routing_replay=use_rollout_routing_replay,
+        routed_experts_dtype=routed_experts_dtype,
         partial_rollout=partial_rollout,
         max_partial_rollout_preempts=max_partial_rollout_preempts,
+        enable_transfer_queue=transfer_queue_runtime is not None,
+        transfer_queue_runtime=transfer_queue_runtime,
+        transfer_params=transfer_params,
     )
     if tool_call_parser is not _UNSET:
         create_app_kwargs["tool_call_parser"] = tool_call_parser
@@ -889,6 +995,89 @@ def test_proxy_health_reports_sampling_limits():
     config = result.json()["config"]
     assert config["rollout_temperature"] == 0.7
     assert config["max_output_tokens"] == 2048
+
+
+def test_proxy_health_omits_transfer_queue_fields_when_disabled():
+    client, _, _, _ = make_client(make_response("hello"))
+
+    payload = client.get("/health").json()
+
+    assert "transfer_queue" not in payload
+    assert "enable_transfer_queue" not in payload["config"]
+    assert "transfer_params" not in payload["config"]
+    assert "transfer_queue_retention_seconds" not in payload["config"]
+
+
+def test_proxy_ignores_transfer_queue_configuration_when_disabled():
+    app = create_app(
+        sglang_router_url="http://router.test",
+        tokenizer=FakeTokenizer(),
+        session_manager=SessionManager(),
+        trajectory_store=TrajectoryStore(min_group_size=1, group_timeout=0.0),
+        sglang_client=FakeSGLangClient([make_response("hello")]),
+        transfer_params=("unsupported",),
+        transfer_queue_retention_seconds=-1.0,
+    )
+
+    assert TestClient(app).get("/health").status_code == 200
+
+
+def test_parse_args_ignores_transfer_queue_environment_when_disabled(monkeypatch):
+    monkeypatch.setenv("DRESSAGE_ENABLE_TRANSFER_QUEUE", "0")
+    monkeypatch.setenv("DRESSAGE_TRANSFER_PARAMS", "unsupported")
+    monkeypatch.setenv("DRESSAGE_TRANSFER_QUEUE_RETENTION_SECONDS", "invalid")
+    monkeypatch.setattr(
+        "sys.argv",
+        ["dressage-proxy", "--tokenizer-path", "fake-tokenizer"],
+    )
+
+    args = parse_args()
+
+    assert args.enable_transfer_queue is False
+    assert args.transfer_params == []
+    assert args.transfer_queue_retention_seconds == 86400.0
+
+
+def test_parse_args_reads_transfer_queue_environment_when_enabled(monkeypatch):
+    monkeypatch.setenv("DRESSAGE_ENABLE_TRANSFER_QUEUE", "1")
+    monkeypatch.setenv("DRESSAGE_TRANSFER_QUEUE_CONFIG", "tq.yaml")
+    monkeypatch.setenv("DRESSAGE_TRANSFER_PARAMS", "logprobs,routed_experts")
+    monkeypatch.setenv("DRESSAGE_TRANSFER_QUEUE_RETENTION_SECONDS", "120")
+    monkeypatch.setattr(
+        "sys.argv",
+        ["dressage-proxy", "--tokenizer-path", "fake-tokenizer"],
+    )
+
+    args = parse_args()
+
+    assert args.transfer_queue_config == "tq.yaml"
+    assert args.transfer_params == ["logprobs", "routed_experts"]
+    assert args.transfer_queue_retention_seconds == 120.0
+
+
+def test_proxy_does_not_generate_transfer_queue_ids_when_disabled(monkeypatch):
+    def fail_uuid():
+        raise AssertionError("unexpected UUID")
+
+    monkeypatch.setattr("dressage.proxy.server.uuid.uuid4", fail_uuid)
+    monkeypatch.setattr("dressage.proxy.session_manager.uuid.uuid4", fail_uuid)
+    manager = SessionManager()
+    session, created = manager.get_or_create_session(
+        "session",
+        [],
+        "instance",
+    )
+    app = create_app(
+        sglang_router_url="http://router.test",
+        tokenizer=FakeTokenizer(),
+        session_manager=manager,
+        trajectory_store=TrajectoryStore(min_group_size=1, group_timeout=0.0),
+        sglang_client=FakeSGLangClient([make_response("hello")]),
+    )
+
+    assert created is True
+    assert session.incarnation_id is None
+    assert TestClient(app).get("/health").status_code == 200
 
 
 def test_integration_capabilities_require_auth_and_report_version():
@@ -1038,6 +1227,31 @@ def test_proxy_rollout_routing_replay_initializes_router_client(monkeypatch):
     )
 
     assert captured["return_routed_experts"] is True
+
+
+def test_proxy_records_configured_routed_experts_dtype():
+    client, session_manager, _, _ = make_client(
+        sglang_client=RoutingSGLangClient([make_response("one")]),
+        use_rollout_routing_replay=True,
+        routed_experts_dtype="uint16",
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"X-Session-Id": "sess-r3-dtype", "X-Instance-Id": "inst"},
+        json={
+            "model": "fake-model",
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+
+    assert response.status_code == 200
+    latest_step = session_manager.get_session("sess-r3-dtype").latest_step
+    chunks = latest_step.response_routed_experts_chunks
+    assert all(chunk["dtype"] == "uint16" for chunk in chunks)
+    assert decode_routed_expert_chunks(chunks) == list(
+        range(len(latest_step.all_token_ids) - 1)
+    )
 
 
 def test_proxy_sampling_params_use_rollout_temperature_fallback():
@@ -1245,6 +1459,71 @@ def test_finalize_is_idempotent_and_marks_complete_segment_set():
     )
 
 
+def test_discard_session_removes_finalized_cache_and_trajectory_idempotently():
+    client, session_manager, trajectory_store, _ = make_client(make_response("done"))
+    generated = client.post(
+        "/v1/chat/completions",
+        headers={
+            "X-Session-Id": "discard-me",
+            "X-Instance-Id": "instance-discard",
+        },
+        json={
+            "model": "fake-model",
+            "messages": [{"role": "user", "content": "go"}],
+        },
+    )
+    assert generated.status_code == 200
+
+    finalized = client.post(
+        "/session/finalize",
+        json={"session_id": "discard-me", "instance_id": "instance-discard"},
+    )
+    assert finalized.status_code == 200
+    assert session_manager.get_finalization_result("discard-me") is not None
+    assert trajectory_store.stats()["total_items"] == 1
+
+    first = client.post("/session/discard", json={"session_id": "discard-me"})
+    second = client.post("/session/discard", json={"session_id": "discard-me"})
+
+    assert first.status_code == 200
+    assert first.json()["session_removed"] is True
+    assert first.json()["segments_removed"] == 1
+    assert second.status_code == 200
+    assert second.json()["session_removed"] is False
+    assert second.json()["segments_removed"] == 0
+    assert session_manager.get_session("discard-me") is None
+    assert session_manager.get_finalization_result("discard-me") is None
+    assert trajectory_store.stats()["total_items"] == 0
+
+
+def test_discard_session_removes_unfinalized_active_session():
+    client, session_manager, trajectory_store, _ = make_client(make_response("done"))
+    generated = client.post(
+        "/v1/chat/completions",
+        headers={
+            "X-Session-Id": "discard-active",
+            "X-Instance-Id": "instance-active",
+        },
+        json={
+            "model": "fake-model",
+            "messages": [{"role": "user", "content": "go"}],
+        },
+    )
+    assert generated.status_code == 200
+    assert session_manager.get_session("discard-active") is not None
+
+    response = client.post(
+        "/session/discard",
+        json={"session_id": "discard-active"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["session_removed"] is True
+    assert response.json()["segments_removed"] == 0
+    assert session_manager.get_session("discard-active") is None
+    assert trajectory_store.stats()["total_items"] == 0
+
+
 def test_finalize_write_failure_preserves_active_session_and_empty_store():
     class FailingTrajectoryStore(TrajectoryStore):
         def write_many(self, records):
@@ -1316,6 +1595,7 @@ def test_parse_args_defaults_to_sglang_api_parser_backends(monkeypatch):
     assert args.context_window is None
     assert args.max_output_tokens is None
     assert args.dynamic_max_tokens is True
+    assert args.routed_experts_dtype == "int32"
 
 
 def test_parse_args_rejects_non_positive_context_window(monkeypatch):
@@ -1909,12 +2189,15 @@ def test_parse_args_accepts_rollout_routing_replay(monkeypatch):
             "--tokenizer-path",
             "fake-tokenizer",
             "--use-rollout-routing-replay",
+            "--routed-experts-dtype",
+            "uint16",
         ],
     )
 
     args = parse_args()
 
     assert args.use_rollout_routing_replay is True
+    assert args.routed_experts_dtype == "uint16"
 
 
 def test_append_only_normalizes_tool_call_index_json_arguments_and_empty_content():
@@ -4059,6 +4342,497 @@ def test_finalize_concat_mode_uses_tito_recorded_step_fragments():
     assert extra["num_steps"] == 2
     assert "mask_template_equivalent" not in extra
     assert "mask_fallback_reason" not in extra
+
+
+def test_tito_r3_is_incremental_for_create_append_branch_and_both_views():
+    sglang_client = RoutingSGLangClient(
+        [make_response("one"), make_response("two"), make_response("three")]
+    )
+    client, session_manager, _, _ = make_client(
+        sglang_client=sglang_client,
+        token_build_mode="tito",
+        tito_model="qwen3_5",
+        use_rollout_routing_replay=True,
+    )
+
+    def post(messages: list[dict]) -> None:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"X-Session-Id": "sess-r3", "X-Instance-Id": "inst-r3"},
+            json={"model": "fake-model", "messages": messages},
+        )
+        assert response.status_code == 200
+
+    post([{"role": "user", "content": "root"}])
+    after_first = list(session_manager.get_session("sess-r3").full_messages)
+    post(after_first + [{"role": "user", "content": "append"}])
+    post(after_first + [{"role": "user", "content": "branch"}])
+
+    session = session_manager.get_session("sess-r3")
+    assert [step.route_type for step in session.steps] == ["create", "append", "branch"]
+    first, second, third = session.steps
+    first_values = decode_routed_expert_chunks(first.response_routed_experts_chunks)
+    second_values = decode_routed_expert_chunks(second.response_routed_experts_chunks)
+    third_values = decode_routed_expert_chunks(third.response_routed_experts_chunks)
+    assert first_values == list(range(len(first.concat_token_ids) - 1))
+    second_start = len(first.concat_token_ids) - 1
+    assert second_values == list(
+        range(
+            100_000 + second_start,
+            100_000 + second_start + len(second.concat_token_ids),
+        )
+    )
+    assert third_values == list(
+        range(200_000, 200_000 + len(third.concat_token_ids) - 1)
+    )
+
+    finalized = client.post(
+        "/session/finalize",
+        json={"session_id": "sess-r3", "instance_id": "inst-r3"},
+    )
+    assert finalized.status_code == 200
+
+    lineage_items = client.post(
+        "/trajectory/read",
+        json={"trajectory_id": "sess-r3", "segment_view": "lineage"},
+    ).json()["data"]
+    timeline_items = client.post(
+        "/trajectory/read",
+        json={"trajectory_id": "sess-r3", "segment_view": "timeline"},
+    ).json()["data"]
+    assert len(lineage_items) == 2
+    assert len(timeline_items) == 3
+    for item in [*lineage_items, *timeline_items]:
+        assert "routed_experts" not in item
+        assert "routed_experts_parts" not in item
+        chunks = item["routed_experts_chunks"]
+        assert sum(chunk["row_count"] for chunk in chunks) == len(item["tokens"]) - 1
+        assert len(decode_routed_expert_chunks(chunks)) == len(item["tokens"]) - 1
+
+
+def test_transfer_queue_snapshot_offloads_selected_fields_without_proxy_reads():
+    tq = InMemoryTransferQueue()
+    runtime = TransferQueueRuntime(
+        TransferQueueStore(tq, store_id="test-store"),
+        transfer_params=("logprobs", "routed_experts"),
+        token_build_mode="snapshot",
+    )
+    client, session_manager, _, _ = make_client(
+        sglang_client=RoutingSGLangClient([make_response("answer")]),
+        use_rollout_routing_replay=True,
+        transfer_queue_runtime=runtime,
+        transfer_params=("logprobs", "routed_experts"),
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"X-Session-Id": "sess-tq", "X-Instance-Id": "inst"},
+        json={"model": "fake-model", "messages": [{"role": "user", "content": "q"}]},
+    )
+    assert response.status_code == 200
+    session = session_manager.get_session("sess-tq")
+    assert session.incarnation_id is not None
+    step = session.latest_step
+    assert isinstance(step.prompt_token_logprobs, TQFieldRef)
+    assert isinstance(step.response_logprobs, TQFieldRef)
+    assert isinstance(step.all_logprobs, TQFieldRef)
+    assert isinstance(step.response_routed_experts_chunks, TQFieldRef)
+    assert not isinstance(step.all_token_ids, TQFieldRef)
+    assert {tuple(fields) for fields in tq.data.values()} == {
+        (
+            "prompt_token_logprobs",
+            "response_logprobs",
+            "all_logprobs",
+            "response_routed_experts_chunks",
+        )
+    }
+    health = client.get("/health").json()
+    assert health["config"]["enable_transfer_queue"] is True
+    assert health["transfer_queue"]["transfer_params"] == [
+        "logprobs",
+        "routed_experts",
+    ]
+
+    assert client.post(
+        "/session/finalize",
+        json={"session_id": "sess-tq", "instance_id": "inst"},
+    ).status_code == 200
+    item = client.post(
+        "/trajectory/read",
+        json={"trajectory_id": "sess-tq", "drain": True},
+    ).json()["data"][0]
+    assert is_tq_field_layout_dict(item["full_logprobs"])
+    assert is_tq_field_layout_dict(item["routed_experts_chunks"])
+    assert item["full_logprobs"]["token_count"] == len(item["tokens"])
+    assert item["routed_experts_chunks"]["shape"] == [len(item["tokens"]) - 1]
+    assert tq.read_count == 0
+
+    def batch_get(*, keys, partition_id, select_fields):
+        return {
+            select_fields: [
+                tq.data[(partition_id, key)][select_fields] for key in keys
+            ]
+        }
+
+    rollout_data = {
+        "total_lengths": [len(item["tokens"])],
+        "response_lengths": [item["aligned_response_length"]],
+    }
+    hydrate_training_layouts(
+        type(
+            "Args",
+            (),
+            {
+                "use_rollout_routing_replay": True,
+                "num_layers": 1,
+                "moe_router_topk": 1,
+            },
+        )(),
+        rollout_data,
+        [
+            {
+                "full_logprobs": item["full_logprobs"],
+                "routed_experts": item["routed_experts_chunks"],
+            }
+        ],
+        remote_fields={"full_logprobs", "routed_experts"},
+        batch_get=batch_get,
+    )
+    assert len(rollout_data["rollout_log_probs"][0]) == item[
+        "aligned_response_length"
+    ]
+    assert rollout_data["rollout_routed_experts"][0].shape == (
+        len(item["tokens"]) - 1,
+        1,
+        1,
+    )
+
+    discarded = client.post("/session/discard", json={"session_id": "sess-tq"})
+    assert discarded.status_code == 200
+    assert tq.data == {}
+
+
+def test_transfer_queue_tito_builds_lineage_and_timeline_layouts():
+    tq = InMemoryTransferQueue()
+    runtime = TransferQueueRuntime(
+        TransferQueueStore(tq, store_id="test-store"),
+        transfer_params=("logprobs", "routed_experts"),
+        token_build_mode="tito",
+    )
+    client, session_manager, _, _ = make_client(
+        sglang_client=RoutingSGLangClient(
+            [make_response("one"), make_response("two"), make_response("three")]
+        ),
+        token_build_mode="tito",
+        tito_model="qwen3_5",
+        use_rollout_routing_replay=True,
+        transfer_queue_runtime=runtime,
+        transfer_params=("logprobs", "routed_experts"),
+    )
+
+    first = client.post(
+        "/v1/chat/completions",
+        headers={"X-Session-Id": "sess-tq-tito", "X-Instance-Id": "inst"},
+        json={"model": "fake-model", "messages": [{"role": "user", "content": "q"}]},
+    )
+    assert first.status_code == 200
+    messages = list(session_manager.get_session("sess-tq-tito").full_messages)
+    second = client.post(
+        "/v1/chat/completions",
+        headers={"X-Session-Id": "sess-tq-tito", "X-Instance-Id": "inst"},
+        json={
+            "model": "fake-model",
+            "messages": messages + [{"role": "user", "content": "next"}],
+        },
+    )
+    assert second.status_code == 200
+    branch = client.post(
+        "/v1/chat/completions",
+        headers={"X-Session-Id": "sess-tq-tito", "X-Instance-Id": "inst"},
+        json={
+            "model": "fake-model",
+            "messages": messages + [{"role": "user", "content": "branch"}],
+        },
+    )
+    assert branch.status_code == 200
+    for step in session_manager.get_session("sess-tq-tito").steps:
+        assert isinstance(step.prompt_token_logprobs, TQFieldRef)
+        assert isinstance(step.response_logprobs, TQFieldRef)
+        assert isinstance(step.all_logprobs, TQFieldRef)
+        assert isinstance(step.concat_response_logprobs, TQFieldRef)
+        assert isinstance(step.response_routed_experts_chunks, TQFieldRef)
+
+    assert client.post(
+        "/session/finalize",
+        json={"session_id": "sess-tq-tito", "instance_id": "inst"},
+    ).status_code == 200
+    lineage = client.post(
+        "/trajectory/read",
+        json={"trajectory_id": "sess-tq-tito", "segment_view": "lineage"},
+    ).json()["data"]
+    timeline = client.post(
+        "/trajectory/read",
+        json={"trajectory_id": "sess-tq-tito", "segment_view": "timeline"},
+    ).json()["data"]
+    assert len(lineage) == 2
+    assert len(timeline) == 3
+    assert len(lineage[0]["full_logprobs"]["fragments"]) == 2
+    assert len(lineage[0]["routed_experts_chunks"]["fragments"]) == 2
+    assert len(timeline[1]["routed_experts_chunks"]["fragments"]) == 2
+    assert len(timeline[2]["routed_experts_chunks"]["fragments"]) == 1
+    assert tq.read_count == 0
+    assert "tracked_trajectories" not in runtime.stats()
+
+
+@pytest.mark.parametrize(
+    ("transfer_params", "remote_logprobs", "remote_routed_experts"),
+    [
+        (("logprobs",), True, False),
+        (("routed_experts",), False, True),
+    ],
+)
+def test_transfer_queue_offloads_only_selected_field(
+    transfer_params,
+    remote_logprobs,
+    remote_routed_experts,
+):
+    tq = InMemoryTransferQueue()
+    runtime = TransferQueueRuntime(
+        TransferQueueStore(tq, store_id="test-store"),
+        transfer_params=transfer_params,
+        token_build_mode="snapshot",
+    )
+    client, session_manager, _, _ = make_client(
+        sglang_client=RoutingSGLangClient([make_response("answer")]),
+        use_rollout_routing_replay=True,
+        transfer_queue_runtime=runtime,
+        transfer_params=transfer_params,
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"X-Session-Id": "sess-tq-selected", "X-Instance-Id": "inst"},
+        json={"model": "fake-model", "messages": [{"role": "user", "content": "q"}]},
+    )
+    assert response.status_code == 200
+    step = session_manager.get_session("sess-tq-selected").latest_step
+    assert isinstance(step.response_logprobs, TQFieldRef) is remote_logprobs
+    assert (
+        isinstance(step.response_routed_experts_chunks, TQFieldRef)
+        is remote_routed_experts
+    )
+
+    assert client.post(
+        "/session/finalize",
+        json={"session_id": "sess-tq-selected", "instance_id": "inst"},
+    ).status_code == 200
+    item = client.post(
+        "/trajectory/read",
+        json={"trajectory_id": "sess-tq-selected"},
+    ).json()["data"][0]
+    assert is_tq_field_layout_dict(item["full_logprobs"]) is remote_logprobs
+    assert (
+        is_tq_field_layout_dict(item["routed_experts_chunks"])
+        is remote_routed_experts
+    )
+
+
+def test_transfer_queue_partial_rollout_keeps_incremental_r3_layout():
+    tq = InMemoryTransferQueue()
+    runtime = TransferQueueRuntime(
+        TransferQueueStore(tq, store_id="test-store"),
+        transfer_params=("routed_experts",),
+        token_build_mode="snapshot",
+    )
+    client, _, _, sglang_client = make_client(
+        sglang_client=RoutingSGLangClient(
+            [
+                make_response("a", finish_reason="abort"),
+                make_response("b"),
+            ]
+        ),
+        use_rollout_routing_replay=True,
+        partial_rollout=True,
+        transfer_queue_runtime=runtime,
+        transfer_params=("routed_experts",),
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"X-Session-Id": "sess-tq-partial", "X-Instance-Id": "inst"},
+        json={"model": "fake-model", "messages": [{"role": "user", "content": "q"}]},
+    )
+    assert response.status_code == 200
+    assert len(sglang_client.calls) == 2
+    assert client.post(
+        "/session/finalize",
+        json={"session_id": "sess-tq-partial", "instance_id": "inst"},
+    ).status_code == 200
+    item = client.post(
+        "/trajectory/read",
+        json={"trajectory_id": "sess-tq-partial"},
+    ).json()["data"][0]
+
+    layout = item["routed_experts_chunks"]
+    assert is_tq_field_layout_dict(layout)
+    assert layout["shape"] == [len(item["tokens"]) - 1]
+    assert len(layout["fragments"]) == 1
+
+
+def test_transfer_queue_discard_keeps_native_cleanup_when_remote_clear_fails():
+    tq = InMemoryTransferQueue()
+    runtime = TransferQueueRuntime(
+        TransferQueueStore(tq, store_id="test-store"),
+        transfer_params=("logprobs",),
+        token_build_mode="snapshot",
+    )
+    client, session_manager, _, _ = make_client(
+        sglang_client=RoutingSGLangClient([make_response("answer")]),
+        transfer_queue_runtime=runtime,
+        transfer_params=("logprobs",),
+    )
+    assert client.post(
+        "/v1/chat/completions",
+        headers={"X-Session-Id": "sess-tq-discard", "X-Instance-Id": "inst"},
+        json={"model": "fake-model", "messages": [{"role": "user", "content": "q"}]},
+    ).status_code == 200
+
+    async def fail_clear(*, keys, partition_id):
+        del keys, partition_id
+        raise RuntimeError("unavailable")
+
+    tq.async_kv_clear = fail_clear
+    discarded = client.post(
+        "/session/discard",
+        json={"session_id": "sess-tq-discard"},
+    )
+
+    assert discarded.status_code == 200
+    assert session_manager.get_session("sess-tq-discard") is None
+    assert tq.data
+
+
+def test_native_record_step_keeps_missing_session_behavior(monkeypatch):
+    client, session_manager, _, _ = make_client(make_response("answer"))
+    monkeypatch.setattr(session_manager, "record_step", lambda **kwargs: None)
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"X-Session-Id": "native-missing", "X-Instance-Id": "inst"},
+        json={
+            "model": "fake-model",
+            "messages": [{"role": "user", "content": "q"}],
+        },
+    )
+
+    assert response.status_code == 200
+
+
+def test_native_discard_does_not_wait_for_transfer_queue_lock():
+    client, session_manager, _, _ = make_client(make_response("answer"))
+    session, _ = session_manager.get_or_create_session(
+        "native-discard",
+        [],
+        "inst",
+    )
+
+    class FailingLock:
+        async def __aenter__(self):
+            raise AssertionError("native discard entered TransferQueue lock")
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    session.request_lock = FailingLock()
+
+    response = client.post(
+        "/session/discard",
+        json={"session_id": "native-discard"},
+    )
+
+    assert response.status_code == 200
+
+
+def test_snapshot_r3_is_canonicalized_before_step_storage():
+    sglang_client = RoutingSGLangClient([make_response("answer")])
+    client, session_manager, _, _ = make_client(
+        sglang_client=sglang_client,
+        use_rollout_routing_replay=True,
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"X-Session-Id": "sess-snapshot-r3", "X-Instance-Id": "inst"},
+        json={"model": "fake-model", "messages": [{"role": "user", "content": "q"}]},
+    )
+    assert response.status_code == 200
+    step = session_manager.get_session("sess-snapshot-r3").latest_step
+    assert sum(
+        chunk["row_count"] for chunk in step.response_routed_experts_chunks
+    ) == len(step.all_token_ids) - 1
+
+    finalized = client.post(
+        "/session/finalize",
+        json={"session_id": "sess-snapshot-r3", "instance_id": "inst"},
+    )
+    assert finalized.status_code == 200
+    item = client.post(
+        "/trajectory/read",
+        json={"trajectory_id": "sess-snapshot-r3"},
+    ).json()["data"][0]
+    assert sum(
+        chunk["row_count"] for chunk in item["routed_experts_chunks"]
+    ) == len(item["tokens"]) - 1
+
+
+def test_tito_r3_restarts_at_lineage_segment_boundary():
+    sglang_client = RoutingSGLangClient(
+        [make_response("one"), make_response("two")]
+    )
+    client, session_manager, _, _ = make_client(
+        sglang_client=sglang_client,
+        token_build_mode="tito",
+        tito_model="qwen3_5",
+        use_rollout_routing_replay=True,
+    )
+
+    first = client.post(
+        "/v1/chat/completions",
+        headers={"X-Session-Id": "sess-boundary-r3", "X-Instance-Id": "inst"},
+        json={"model": "fake-model", "messages": [{"role": "user", "content": "q"}]},
+    )
+    assert first.status_code == 200
+    messages = list(session_manager.get_session("sess-boundary-r3").full_messages)
+    second = client.post(
+        "/v1/chat/completions",
+        headers={"X-Session-Id": "sess-boundary-r3", "X-Instance-Id": "inst"},
+        json={
+            "model": "fake-model",
+            "messages": messages + [{"role": "user", "content": "next"}],
+            "tools": make_tools("search"),
+        },
+    )
+    assert second.status_code == 200
+
+    steps = session_manager.get_session("sess-boundary-r3").steps
+    assert steps[1].lineage_segment_boundary_before is True
+    assert sum(
+        chunk["row_count"] for chunk in steps[1].response_routed_experts_chunks
+    ) == len(steps[1].concat_token_ids) - 1
+
+    finalized = client.post(
+        "/session/finalize",
+        json={"session_id": "sess-boundary-r3", "instance_id": "inst"},
+    )
+    assert finalized.status_code == 200
+    lineage_items = client.post(
+        "/trajectory/read",
+        json={"trajectory_id": "sess-boundary-r3", "segment_view": "lineage"},
+    ).json()["data"]
+    assert len(lineage_items) == 2
+    assert sum(
+        chunk["row_count"] for chunk in lineage_items[1]["routed_experts_chunks"]
+    ) == len(lineage_items[1]["tokens"]) - 1
 
 
 def test_concat_append_only_prompt_uses_online_tito_without_full_tokenize():

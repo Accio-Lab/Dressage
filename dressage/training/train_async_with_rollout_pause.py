@@ -125,7 +125,22 @@ def train(args):
     router_addr = ray.get(rollout_manager.get_metrics_router_addr.remote())
     update_tracking_open_metrics(args, router_addr)
 
-    actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
+    actor_cls = None
+    if _env_flag("DRESSAGE_ENABLE_TRANSFER_QUEUE", False):
+        from dressage.training.tq_hydration import (
+            clear_tq_rollout_data,
+            validate_tq_training_config,
+        )
+        from dressage.training.tq_megatron_actor import TQMegatronTrainRayActor
+
+        validate_tq_training_config(args)
+        actor_cls = TQMegatronTrainRayActor
+    actor_model, critic_model = create_training_models(
+        args,
+        pgs,
+        rollout_manager,
+        actor_cls=actor_cls,
+    )
 
     # Always push actor weights to rollout once weights are loaded. No rollout should
     # be active yet, but keeping the wrapper here makes the update path consistent.
@@ -149,6 +164,8 @@ def train(args):
                 ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref, external_data=value_refs))
             else:
                 ray.get(value_refs)
+                if _env_flag("DRESSAGE_ENABLE_TRANSFER_QUEUE", False):
+                    clear_tq_rollout_data(rollout_data_curr_ref)
         else:
             ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
 

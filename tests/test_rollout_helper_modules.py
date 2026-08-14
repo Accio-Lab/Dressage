@@ -267,6 +267,154 @@ def test_generate_runtime_get_proxy_client_uses_proxy_url(monkeypatch):
     assert first.url == "http://proxy.test:8800"
 
 
+def test_generate_runtime_discards_all_group_sessions_once(monkeypatch):
+    class FakeProxy:
+        def __init__(self):
+            self.session_ids = []
+
+        async def discard_session(self, session_id):
+            self.session_ids.append(session_id)
+            return {"success": True}
+
+    proxy = FakeProxy()
+    monkeypatch.setattr(generate_runtime, "_PROXY_CLIENT", proxy)
+    generated_group = [
+        [
+            SimpleNamespace(
+                session_id=None,
+                status=SimpleNamespace(name="ABORTED"),
+                metadata={
+                    "last_failed_session_id": "failed-session",
+                    "parent_traj_id": "failed-session",
+                },
+            ),
+            SimpleNamespace(
+                session_id="completed-session",
+                status=SimpleNamespace(name="COMPLETED"),
+                metadata={"parent_traj_id": "completed-session"},
+            ),
+        ]
+    ]
+    original_group = [
+        SimpleNamespace(
+            session_id="failed-session",
+            metadata={"session_id": "failed-session"},
+        )
+    ]
+
+    async def generate(args, group, sampling_params, evaluation=False):
+        del args, group, sampling_params, evaluation
+        return generated_group
+
+    result = asyncio.run(
+        generate_runtime.generate_group(
+            generate,
+            SimpleNamespace(),
+            original_group,
+            {},
+        )
+    )
+
+    assert result is generated_group
+    assert set(proxy.session_ids) == {"completed-session", "failed-session"}
+
+
+def test_generate_runtime_discards_group_when_generation_raises(monkeypatch):
+    class FakeProxy:
+        def __init__(self):
+            self.session_ids = []
+
+        async def discard_session(self, session_id):
+            self.session_ids.append(session_id)
+
+    async def generate(args, group, sampling_params, evaluation=False):
+        del args, sampling_params, evaluation
+        group[0].session_id = "started-session"
+        raise RuntimeError("generation failed")
+
+    proxy = FakeProxy()
+    monkeypatch.setattr(generate_runtime, "_PROXY_CLIENT", proxy)
+
+    with pytest.raises(RuntimeError, match="generation failed"):
+        asyncio.run(
+            generate_runtime.generate_group(
+                generate,
+                SimpleNamespace(),
+                [SimpleNamespace(session_id=None, metadata={})],
+                {},
+            )
+        )
+
+    assert proxy.session_ids == ["started-session"]
+
+
+def test_generate_runtime_cleanup_failure_does_not_mask_generation_error(monkeypatch):
+    class FakeProxy:
+        def __init__(self):
+            self.session_ids = []
+
+        async def discard_session(self, session_id):
+            self.session_ids.append(session_id)
+            raise RuntimeError("cleanup failed")
+
+    async def generate(args, group, sampling_params, evaluation=False):
+        del args, sampling_params, evaluation
+        group[0].session_id = "started-session"
+        raise RuntimeError("generation failed")
+
+    proxy = FakeProxy()
+    monkeypatch.setattr(generate_runtime, "_PROXY_CLIENT", proxy)
+
+    with pytest.raises(RuntimeError, match="generation failed"):
+        asyncio.run(
+            generate_runtime.generate_group(
+                generate,
+                SimpleNamespace(),
+                [SimpleNamespace(session_id=None, metadata={})],
+                {},
+            )
+        )
+
+    assert proxy.session_ids == ["started-session"]
+
+
+def test_generate_runtime_discards_group_when_generation_is_cancelled(monkeypatch):
+    class FakeProxy:
+        def __init__(self):
+            self.session_ids = []
+
+        async def discard_session(self, session_id):
+            self.session_ids.append(session_id)
+
+    async def run():
+        started = asyncio.Event()
+
+        async def generate(args, group, sampling_params, evaluation=False):
+            del args, sampling_params, evaluation
+            group[0].session_id = "started-session"
+            started.set()
+            await asyncio.Future()
+
+        task = asyncio.create_task(
+            generate_runtime.generate_group(
+                generate,
+                SimpleNamespace(),
+                [SimpleNamespace(session_id=None, metadata={})],
+                {},
+            )
+        )
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    proxy = FakeProxy()
+    monkeypatch.setattr(generate_runtime, "_PROXY_CLIENT", proxy)
+    asyncio.run(run())
+
+    assert proxy.session_ids == ["started-session"]
+
+
 def test_generate_runtime_get_paddock_from_env_mode_rules(monkeypatch):
     import dressage.paddock.factory as paddock_factory
 

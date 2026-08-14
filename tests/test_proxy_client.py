@@ -67,3 +67,30 @@ def test_proxy_client_default_timeout_is_bounded():
 
     assert connect == 10.0
     assert read == 300.0
+
+
+def test_proxy_client_discards_session_with_default_headers():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"success": True})
+
+    async def run_test() -> dict:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+        ) as http_client:
+            client = ProxyClient(
+                "http://proxy.test/",
+                client=http_client,
+                default_headers={"Authorization": "Bearer proxy-secret"},
+            )
+            return await client.discard_session("failed-session")
+
+    result = asyncio.run(run_test())
+
+    assert result == {"success": True}
+    assert len(requests) == 1
+    assert requests[0].url.path == "/session/discard"
+    assert requests[0].headers["authorization"] == "Bearer proxy-secret"
+    assert requests[0].read() == b'{"session_id":"failed-session"}'

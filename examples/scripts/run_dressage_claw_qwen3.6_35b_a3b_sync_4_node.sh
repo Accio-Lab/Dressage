@@ -247,6 +247,22 @@ RAY_DASHBOARD_HOST="${RAY_DASHBOARD_HOST:-0.0.0.0}"
 COMM_ARGS=(
    --rollout-temperature "${ROLLOUT_TEMPERATURE:-1.0}"
 )
+TQ_PROXY_ARGS=()
+TRAIN_ENTRY=(python3 train.py)
+if dressage_transfer_queue_enabled; then
+    NORMALIZED_TRANSFER_PARAMS="${DRESSAGE_TRANSFER_PARAMS//,/ }"
+    read -r -a TRANSFER_PARAMS <<< "${NORMALIZED_TRANSFER_PARAMS}"
+    TQ_PROXY_ARGS=(
+        --enable-transfer-queue
+        --transfer-queue-config "${DRESSAGE_TRANSFER_QUEUE_CONFIG}"
+        --transfer-queue-retention-seconds "${DRESSAGE_TRANSFER_QUEUE_RETENTION_SECONDS}"
+        --transfer-params "${TRANSFER_PARAMS[@]}"
+    )
+    if [[ " ${NORMALIZED_TRANSFER_PARAMS} " == *" routed_experts "* ]]; then
+        COMM_ARGS+=(--use-rollout-routing-replay)
+    fi
+    TRAIN_ENTRY=(python3 -m dressage.training.tq_train)
+fi
 
 TOKENIZER_PATH="${TOKENIZER_PATH:-${MODEL_ROOT}/${MODEL_NAME}}"
 PROXY_ARGS=(
@@ -256,6 +272,7 @@ PROXY_ARGS=(
    --token-build-mode "${TOKEN_BUILD_MODE}"
    --token-build-model "${TOKEN_BUILD_MODEL}"
    "${COMM_ARGS[@]}"
+   "${TQ_PROXY_ARGS[@]}"
    --context-window "${CONTEXT_WINDOW}"
    --default-max-tokens "${ROLLOUT_MAX_RESPONSE_LEN}"
 )
@@ -466,6 +483,8 @@ keys = [
   "DRESSAGE_ROLLOUT_MAX_RETRIES",
   "DRESSAGE_ALLOW_EMPTY_TRAIN_BATCH",
   "DRESSAGE_SYNC_FAILED_GROUP_REPLACEMENT_MULTIPLIER",
+  "DRESSAGE_ENABLE_TRANSFER_QUEUE", "DRESSAGE_TRANSFER_QUEUE_CONFIG",
+  "DRESSAGE_TRANSFER_PARAMS", "DRESSAGE_TRANSFER_QUEUE_STORE_ID",
 ]
 for raw_key in os.environ.get("DRESSAGE_EXTRA_RUNTIME_ENV_KEYS", "").split(","):
     key = raw_key.strip()
@@ -477,7 +496,7 @@ print(json.dumps({"env_vars": {k: os.environ.get(k, "") for k in keys if os.envi
 echo "[MASTER RANK=0] Submitting Ray job..."
 ray job submit --address="http://127.0.0.1:${RAY_DASHBOARD_PORT}" \
   --runtime-env-json="${RUNTIME_ENV_JSON}" \
-  -- python3 train.py \
+  -- "${TRAIN_ENTRY[@]}" \
   --actor-num-nodes "${ACTOR_NUM_NODES}" \
   --actor-num-gpus-per-node "${ACTOR_NUM_GPUS_PER_NODE}" \
   --colocate \

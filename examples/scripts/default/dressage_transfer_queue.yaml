@@ -1,0 +1,8 @@
+controller:
+    polling_mode: true
+
+backend:
+    storage_backend: SimpleStorage
+    SimpleStorage:
+        total_storage_size: null
+        num_data_storage_units: 2

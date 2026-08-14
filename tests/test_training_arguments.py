@@ -69,6 +69,37 @@ def test_whitebox_partial_async_scripts_enable_staleness_controls():
         assert "WANDB_KEY:-" not in source
 
 
+def test_whitebox_scripts_support_optional_transfer_queue():
+    script_entries = {
+        Path(
+            "examples/scripts/run_alfworld_whitebox_agent_qwen3.5_4b.sh"
+        ): "dressage.training.tq_train",
+        Path(
+            "examples/scripts/run_alfworld_whitebox_agent_qwen3.5_4b_async.sh"
+        ): "dressage.training.tq_train_async",
+        Path(
+            "examples/scripts/run_alfworld_whitebox_agent_qwen3.5_4b_partial_rollout_async.sh"
+        ): "dressage.training.train_async_with_rollout_pause",
+        Path(
+            "examples/scripts/run_hotpotqa_whitebox_agent_qwen3.5_4b.sh"
+        ): "dressage.training.tq_train",
+        Path(
+            "examples/scripts/run_hotpotqa_whitebox_agent_qwen3.5_4b_async.sh"
+        ): "dressage.training.tq_train_async",
+    }
+
+    for path, entry in script_entries.items():
+        source = path.read_text()
+        assert 'DRESSAGE_TRANSFER_PARAMS=${DRESSAGE_TRANSFER_PARAMS:-logprobs}' in source
+        assert "--enable-transfer-queue" in source
+        assert "--transfer-queue-config" in source
+        assert "--transfer-queue-retention-seconds" in source
+        assert "--transfer-params" in source
+        assert f"TRAIN_ENTRY=(python3 -m {entry})" in source
+        assert '"DRESSAGE_ENABLE_TRANSFER_QUEUE"' in source
+        assert '"DRESSAGE_TRANSFER_QUEUE_STORE_ID"' in source
+
+
 def test_blackbox_sync_scripts_do_not_use_staleness_custom_config():
     script_paths = [
         Path("examples/scripts/run_blackbox_qwen3.5_35b_a3b_sync_local.sh"),
@@ -144,3 +175,18 @@ def test_train_async_entrypoint_uses_slime_common_parser():
     assert "from slime.utils.arguments import parse_args" in source
     assert "add_dressage_arguments" not in source
     assert "train(parse_args())" in source
+
+
+def test_dressage_claw_script_supports_optional_transfer_queue():
+    source = Path(
+        "examples/scripts/run_dressage_claw_qwen3.6_35b_a3b_sync_4_node.sh"
+    ).read_text()
+
+    assert "TRAIN_ENTRY=(python3 train.py)" in source
+    assert "TRAIN_ENTRY=(python3 -m dressage.training.tq_train)" in source
+    assert "--enable-transfer-queue" in source
+    assert "--transfer-queue-config" in source
+    assert "--transfer-queue-retention-seconds" in source
+    assert "--transfer-params" in source
+    assert '"DRESSAGE_ENABLE_TRANSFER_QUEUE"' in source
+    assert '"DRESSAGE_TRANSFER_QUEUE_STORE_ID"' in source

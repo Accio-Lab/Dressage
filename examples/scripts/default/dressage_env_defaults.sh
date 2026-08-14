@@ -1,5 +1,12 @@
 #!/bin/bash
 
+dressage_transfer_queue_enabled() {
+    case "${DRESSAGE_ENABLE_TRANSFER_QUEUE:-0}" in
+        1|true|TRUE|yes|YES|on|ON) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 dressage_apply_common_defaults() {
   local run_name="$1"
   local paddock_mode="${2:-blackbox}"
@@ -37,6 +44,14 @@ dressage_apply_common_defaults() {
 
   TOKEN_BUILD_MODE="${TOKEN_BUILD_MODE:-tito}"
   TOKEN_BUILD_MODEL="${TOKEN_BUILD_MODEL:-qwen3_5}"
+    DRESSAGE_ENABLE_TRANSFER_QUEUE="${DRESSAGE_ENABLE_TRANSFER_QUEUE:-0}"
+    DRESSAGE_TRANSFER_QUEUE_CONFIG="${DRESSAGE_TRANSFER_QUEUE_CONFIG:-${REPO_ROOT}/examples/scripts/default/dressage_transfer_queue.yaml}"
+    DRESSAGE_TRANSFER_QUEUE_RETENTION_SECONDS="${DRESSAGE_TRANSFER_QUEUE_RETENTION_SECONDS:-86400}"
+    DRESSAGE_TRANSFER_PARAMS="${DRESSAGE_TRANSFER_PARAMS:-}"
+    if dressage_transfer_queue_enabled && [[ -z "${DRESSAGE_TRANSFER_PARAMS}" ]]; then
+        DRESSAGE_TRANSFER_PARAMS="logprobs routed_experts"
+    fi
+    DRESSAGE_TRANSFER_QUEUE_STORE_ID="${DRESSAGE_TRANSFER_QUEUE_STORE_ID:-${RUN_NAME}}"
 
   DRESSAGE_TRAJECTORY_PAYLOAD_LOG_DIR="${DRESSAGE_TRAJECTORY_PAYLOAD_LOG_DIR:-${LOG_DIR}/traj_payload/${RUN_NAME}}"
   DRESSAGE_TRAJECTORY_ERROR_LOG_DIR="${DRESSAGE_TRAJECTORY_ERROR_LOG_DIR:-${LOG_DIR}/traj_err/${RUN_NAME}}"
@@ -127,6 +142,9 @@ dressage_export_common_env() {
   export DRESSAGE_BLACKBOX_MAX_STEPS DRESSAGE_BLACKBOX_COMPACT_THRESHOLD
   export DRESSAGE_TRAJECTORY_PAYLOAD_LOG_DIR DRESSAGE_TRAJECTORY_ERROR_LOG_DIR
   export DRESSAGE_RUN_NAME="${RUN_NAME}"
+    export DRESSAGE_ENABLE_TRANSFER_QUEUE DRESSAGE_TRANSFER_QUEUE_CONFIG
+    export DRESSAGE_TRANSFER_QUEUE_RETENTION_SECONDS DRESSAGE_TRANSFER_PARAMS
+    export DRESSAGE_TRANSFER_QUEUE_STORE_ID
 }
 
 dressage_export_local_bwrap_env() {

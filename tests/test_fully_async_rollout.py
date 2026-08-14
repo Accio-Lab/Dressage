@@ -6,7 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from dressage.rollout import fully_async_rollout
+from dressage.rollout import fully_async_rollout, sync_rollout
+from dressage.rollout.generate import runtime as generate_runtime
 
 
 @dataclass
@@ -48,6 +49,18 @@ class DataBuffer:
 
 def teardown_function():
     fully_async_rollout.stop_global_worker()
+
+
+@pytest.fixture(autouse=True)
+def group_cleanup_calls(monkeypatch):
+    calls = []
+
+    class FakeProxy:
+        async def discard_session(self, session_id):
+            calls.append(session_id)
+
+    monkeypatch.setattr(generate_runtime, "_PROXY_CLIENT", FakeProxy())
+    return calls
 
 
 def test_increment_retry_resets_session_ids_for_whole_group():
@@ -136,7 +149,7 @@ def test_fully_async_rollout_stops_worker_after_final_rollout(monkeypatch):
     assert fully_async_rollout._GLOBAL_WORKER is None
 
 
-def test_fully_async_rollout_retries_aborted_group(monkeypatch):
+def test_fully_async_rollout_retries_aborted_group(monkeypatch, group_cleanup_calls):
     attempts = {"count": 0}
 
     async def fake_generate_and_rm_group(args, group, sampling_params, evaluation=False):
@@ -170,8 +183,108 @@ def test_fully_async_rollout_retries_aborted_group(monkeypatch):
 
     assert attempts["count"] == 2
     assert len(data.requeued) == 1
+    assert group_cleanup_calls == ["old-session"]
     assert result[0][0].status == SampleLike.Status.COMPLETED
     assert result[0][0].session_id == "new-session"
+
+
+def test_fully_async_failed_group_discards_successful_siblings(
+    monkeypatch,
+    group_cleanup_calls,
+):
+    attempts = {"count": 0}
+
+    async def fake_generate_and_rm_group(args, group, sampling_params, evaluation=False):
+        del args, sampling_params, evaluation
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            group[0].status = SampleLike.Status.COMPLETED
+            group[0].metadata["parent_traj_id"] = "traj-success-old"
+            group[1].status = SampleLike.Status.ABORTED
+            group[1].metadata["parent_traj_id"] = "traj-failed-old"
+        else:
+            for sample in group:
+                sample.status = SampleLike.Status.COMPLETED
+                sample.metadata["parent_traj_id"] = f"traj-new-{sample.index}"
+                sample.tokens = [1, 2]
+                sample.response_length = 1
+                sample.loss_mask = [1]
+                sample.rollout_log_probs = [-0.1]
+        return group
+
+    monkeypatch.setattr(
+        fully_async_rollout,
+        "generate_and_rm_group",
+        fake_generate_and_rm_group,
+    )
+    monkeypatch.setattr(fully_async_rollout, "GenerateState", None)
+    monkeypatch.setenv("DRESSAGE_ROLLOUT_MAX_RETRIES", "1")
+
+    data = DataBuffer([[
+        SampleLike(index=0, session_id="old-success"),
+        SampleLike(index=1, session_id="old-failed"),
+    ]])
+    args = SimpleNamespace(rollout_batch_size=1)
+
+    fully_async_rollout.generate_rollout_fully_async(args, 0, data)
+
+    assert set(group_cleanup_calls) == {"traj-success-old", "traj-failed-old"}
+
+
+@pytest.mark.asyncio
+async def test_sync_failed_group_discards_successful_siblings(
+    monkeypatch,
+    group_cleanup_calls,
+):
+    attempts = {"count": 0}
+
+    class State:
+        def __init__(self, args):
+            del args
+            self.sampling_params = {}
+
+        def reset(self):
+            return None
+
+    async def fake_generate_and_rm_group(args, group, sampling_params, evaluation=False):
+        del args, sampling_params, evaluation
+        attempts["count"] += 1
+        for sample in group:
+            sample.status = (
+                SampleLike.Status.ABORTED
+                if attempts["count"] == 1 and sample.index == 1
+                else SampleLike.Status.COMPLETED
+            )
+            sample.metadata["parent_traj_id"] = (
+                f"traj-old-{sample.index}"
+                if attempts["count"] == 1
+                else f"traj-new-{sample.index}"
+            )
+            sample.tokens = [1, 2]
+            sample.response_length = 1
+            sample.loss_mask = [1]
+        return group
+
+    monkeypatch.setattr(sync_rollout, "GenerateState", State)
+    monkeypatch.setattr(
+        sync_rollout,
+        "generate_and_rm_group",
+        fake_generate_and_rm_group,
+    )
+    monkeypatch.setenv("DRESSAGE_ROLLOUT_MAX_RETRIES", "1")
+
+    data = DataBuffer([[
+        SampleLike(index=0),
+        SampleLike(index=1),
+    ]])
+    groups = await sync_rollout._run_sync_rollout(
+        SimpleNamespace(rollout_batch_size=1),
+        0,
+        data,
+    )
+
+    assert len(groups) == 1
+    assert set(group_cleanup_calls) == {"traj-old-0", "traj-old-1"}
 
 
 def test_fully_async_rollout_fails_fast_when_all_groups_failed(monkeypatch):
@@ -239,7 +352,10 @@ def test_fully_async_rollout_drops_exhausted_failed_group_and_keeps_collecting(m
     assert result[0][0].status == SampleLike.Status.COMPLETED
 
 
-def test_fully_async_rollout_drops_stale_group_by_trajectory(monkeypatch):
+def test_fully_async_rollout_leaves_stale_tq_data_to_retention(
+    monkeypatch,
+    group_cleanup_calls,
+):
     fully_async_rollout.stop_global_worker()
 
     async def fake_generate_and_rm_group(args, group, sampling_params, evaluation=False):
@@ -271,6 +387,60 @@ def test_fully_async_rollout_drops_stale_group_by_trajectory(monkeypatch):
 
     assert all(isinstance(group, list) for group in result)
     assert [[sample.index for sample in group] for group in result] == [[1], [2]]
+    assert group_cleanup_calls == []
+
+
+@pytest.mark.asyncio
+async def test_fully_async_rollout_leaves_oversampled_tq_data_to_retention(
+    monkeypatch,
+    group_cleanup_calls,
+):
+    selected = SampleLike(
+        index=0,
+        metadata={"parent_traj_id": "traj-selected"},
+        status=SampleLike.Status.COMPLETED,
+        tokens=[1, 2],
+        response_length=1,
+        loss_mask=[1],
+    )
+    extra = SampleLike(
+        index=1,
+        metadata={"parent_traj_id": "traj-extra"},
+        status=SampleLike.Status.COMPLETED,
+        tokens=[1, 2],
+        response_length=1,
+        loss_mask=[1],
+    )
+    completed = [
+        fully_async_rollout.CompletedGroup(0, [selected], result=[selected]),
+        fully_async_rollout.CompletedGroup(1, [extra], result=[extra]),
+    ]
+
+    class Worker:
+        def __init__(self):
+            self.staleness = fully_async_rollout.StalenessTracker(
+                fully_async_rollout.config_from_args(SimpleNamespace())
+            )
+
+        def get_completed_groups(self):
+            nonlocal completed
+            result, completed = completed, []
+            return result
+
+    monkeypatch.setattr(
+        fully_async_rollout,
+        "get_global_worker",
+        lambda args, data_buffer: Worker(),
+    )
+
+    groups, _ = await fully_async_rollout.generate_rollout_async(
+        SimpleNamespace(rollout_batch_size=1),
+        0,
+        DataBuffer([]),
+    )
+
+    assert groups == [[selected]]
+    assert group_cleanup_calls == []
 
 
 def test_fully_async_rollout_staleness_metrics_are_trajectory_weighted(monkeypatch):

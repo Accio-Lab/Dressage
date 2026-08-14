@@ -26,6 +26,18 @@ from dressage.config import (
     sglang_router_url as default_sglang_router_url,
     token_build_defaults,
 )
+from dressage.transport import (
+    TQFieldLayout,
+    TQFieldRef,
+    TQTrajectoryRef,
+    TransferQueueRuntime,
+    build_concatenated_logprobs,
+    build_concatenated_routed_experts,
+    build_snapshot_logprobs,
+    is_tq_trajectory_ref_dict,
+    normalize_logprobs_to_length,
+    normalize_transfer_params,
+)
 
 from .generation_controller import (
     GenerationController,
@@ -40,6 +52,7 @@ from .last_step import (
     create_default_mask_template_registry,
 )
 from .reasoning_parser import ProxyReasoningParser, canonicalize_reasoning_content
+from .routed_experts import canonicalize_routed_experts
 from .session_manager import Route, Session, SessionFinalizedError, SessionManager, StepRecord
 from .sglang_client import SGLangRouterClient
 from .tool_call_parser import (
@@ -64,6 +77,13 @@ _SSE_RESPONSE_HEADERS = {
 }
 TokenBuildMode = Literal["tito", "snapshot"]
 SegmentView = Literal["lineage", "timeline"]
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"", "0", "false", "no", "off"}
 
 
 def _canonical_json(value: Any) -> str:
@@ -620,11 +640,18 @@ def create_app(
     context_window: int | None = None,
     dynamic_max_tokens: bool = True,
     use_rollout_routing_replay: bool = False,
+    routed_experts_dtype: Literal["uint8", "uint16", "int32"] = "int32",
     partial_rollout: bool = False,
     max_partial_rollout_preempts: int | None = None,
     stream_heartbeat_interval_seconds: float = (
         _DEFAULT_STREAM_HEARTBEAT_INTERVAL_SECONDS
     ),
+    enable_transfer_queue: bool = False,
+    transfer_queue_config: str | None = None,
+    transfer_queue_retention_seconds: float = 86400.0,
+    transfer_params: tuple[str, ...] | list[str] | str | None = None,
+    transfer_queue_store_id: str | None = None,
+    transfer_queue_runtime: TransferQueueRuntime | None = None,
 ) -> FastAPI:
     """Create the Dressage proxy FastAPI app."""
 
@@ -647,6 +674,37 @@ def create_app(
             "token_build_mode must be 'snapshot' or 'tito', "
             f"got {token_build_mode!r}"
         )
+    if routed_experts_dtype not in {"uint8", "uint16", "int32"}:
+        raise ValueError(
+            "routed_experts_dtype must be 'uint8', 'uint16', or 'int32'"
+        )
+    if transfer_queue_runtime is not None and not enable_transfer_queue:
+        raise ValueError("transfer_queue_runtime requires TransferQueue")
+    normalized_transfer_params: tuple[str, ...] = ()
+    if enable_transfer_queue:
+        normalized_transfer_params = normalize_transfer_params(transfer_params)
+        if not normalized_transfer_params:
+            raise ValueError("TransferQueue requires at least one transfer parameter")
+        if (
+            "routed_experts" in normalized_transfer_params
+            and not use_rollout_routing_replay
+        ):
+            raise ValueError(
+                "routed_experts transfer requires use_rollout_routing_replay"
+            )
+        if transfer_queue_runtime is None and not transfer_queue_config:
+            raise ValueError(
+                "transfer_queue_config is required when TransferQueue is enabled"
+            )
+        if (
+            transfer_queue_runtime is not None
+            and transfer_queue_runtime.transfer_params != normalized_transfer_params
+        ):
+            raise ValueError("transfer_params does not match transfer_queue_runtime")
+        if transfer_queue_retention_seconds < 0:
+            raise ValueError(
+                "transfer_queue_retention_seconds must be greater than or equal to 0"
+            )
     if tool_call_parse_backend not in {"local", "sglang_api", "hybrid"}:
         raise ValueError(
             "tool_call_parse_backend must be 'local', 'sglang_api', or 'hybrid', "
@@ -753,6 +811,14 @@ def create_app(
     tito_template_kwargs = (
         {"preserve_thinking": True} if token_build_mode == "tito" else None
     )
+    effective_transfer_queue_store_id = None
+    if enable_transfer_queue and transfer_queue_runtime is None:
+        effective_transfer_queue_store_id = (
+            transfer_queue_store_id
+            or os.environ.get("DRESSAGE_TRANSFER_QUEUE_STORE_ID")
+            or os.environ.get("DRESSAGE_RUN_NAME")
+            or uuid.uuid4().hex
+        )
 
     def _candidate_snapshot_rendered(
         *,
@@ -859,13 +925,108 @@ def create_app(
             base_step_id=selected.step_id,
         )
 
+    transfer_queue_init_lock = asyncio.Lock()
+
+    async def _ensure_transfer_queue_runtime() -> TransferQueueRuntime | None:
+        nonlocal transfer_queue_runtime
+        if not enable_transfer_queue or transfer_queue_runtime is not None:
+            return transfer_queue_runtime
+        async with transfer_queue_init_lock:
+            if transfer_queue_runtime is None:
+                assert transfer_queue_config is not None
+                assert effective_transfer_queue_store_id is not None
+                transfer_queue_runtime = await TransferQueueRuntime.from_config(
+                    transfer_queue_config,
+                    store_id=effective_transfer_queue_store_id,
+                    transfer_params=normalized_transfer_params,
+                    token_build_mode=token_build_mode,
+                    retention_seconds=transfer_queue_retention_seconds,
+                )
+                transfer_queue_runtime.start_retention()
+        return transfer_queue_runtime
+
+    async def _record_step(
+        session: Session,
+        **step_kwargs: Any,
+    ) -> StepRecord | None:
+        runtime = await _ensure_transfer_queue_runtime()
+        if runtime is None:
+            return session_manager.record_step(**step_kwargs)
+
+        incarnation_id = session.incarnation_id
+        if incarnation_id is None:
+            incarnation_id = uuid.uuid4().hex
+            session.incarnation_id = incarnation_id
+
+        refs: dict[str, TQFieldRef] = {}
+        try:
+            refs = await runtime.offload_step(
+                session_id=session.session_id,
+                incarnation_id=incarnation_id,
+                step_index=len(session.steps),
+                fields=step_kwargs,
+            )
+            step_kwargs.update(refs)
+            step = session_manager.record_step(**step_kwargs)
+            if step is None:
+                raise RuntimeError("session disappeared while recording trajectory step")
+            return step
+        except BaseException:
+            if refs:
+                await runtime.clear_refs(refs.values())
+            raise
+
+    async def _record_step_atomically(
+        session: Session,
+        **step_kwargs: Any,
+    ) -> StepRecord | None:
+        if not enable_transfer_queue:
+            return await _record_step(session, **step_kwargs)
+
+        task = asyncio.create_task(_record_step(session, **step_kwargs))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            try:
+                await task
+            except Exception:
+                logger.exception(
+                    "TransferQueue step commit failed while the request was cancelled"
+                )
+            raise
+
+    def _step_routed_experts_row_count(step: StepRecord) -> int:
+        if token_build_mode == "snapshot":
+            return max(0, len(step.all_token_ids) - 1)
+        if (
+            step.route_type in {"create", "branch"}
+            or step.lineage_segment_boundary_before
+        ):
+            return max(0, len(step.concat_token_ids) - 1)
+        return len(step.concat_token_ids)
+
+    def _build_routed_experts_field(
+        steps: list[StepRecord],
+        *,
+        token_count: int,
+    ) -> list[dict[str, Any]] | TQFieldLayout | None:
+        return build_concatenated_routed_experts(
+            [step.response_routed_experts_chunks for step in steps],
+            [_step_routed_experts_row_count(step) for step in steps],
+            token_count=token_count,
+        )
+
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        if transfer_queue_runtime is not None:
+            transfer_queue_runtime.start_retention()
         try:
             yield
         finally:
             await generation_controller.shutdown(timeout_seconds=5.0)
             await sglang_client.close()
+            if transfer_queue_runtime is not None:
+                await transfer_queue_runtime.close()
 
     app = FastAPI(title="Dressage Proxy", lifespan=lifespan)
 
@@ -963,8 +1124,6 @@ def create_app(
             record["full_versions"] = full_versions
         if base_step.response_routed_experts_chunks:
             record["routed_experts_chunks"] = base_step.response_routed_experts_chunks
-        if base_step.response_routed_experts is not None:
-            record["routed_experts"] = base_step.response_routed_experts
         return record
 
     def _build_step_snapshot_record(
@@ -982,12 +1141,14 @@ def create_app(
         tokens = list(step.all_token_ids)
         prompt_len = min(len(step.prompt_token_ids), len(tokens))
         response_len = max(0, len(tokens) - prompt_len)
-        response_logprobs, invalid = _normalize_logprobs_to_length(
-            list(step.response_logprobs),
-            response_len,
+        response_logprobs, invalid = build_snapshot_logprobs(
+            step.response_logprobs,
+            prompt_length=prompt_len,
+            response_length=response_len,
+            token_count=len(tokens),
+            remote_invalid=step.all_logprobs_invalid,
         )
         response_mask = [0] * prompt_len + [1] * response_len
-        response_logprobs = [0.0] * prompt_len + response_logprobs
 
         full_versions = None
         if record_token_versions:
@@ -1045,29 +1206,28 @@ def create_app(
         }
         if full_versions is not None:
             record["full_versions"] = full_versions
-        if step.response_routed_experts_chunks:
-            record["routed_experts_chunks"] = step.response_routed_experts_chunks
-        if step.response_routed_experts is not None:
-            record["routed_experts"] = step.response_routed_experts
+        routed_experts_steps = [step]
+        if token_build_mode_for_record == "tito":
+            lineage_steps = [
+                item for item in session.steps if item.lineage_id == step.lineage_id
+            ]
+            target_index = next(
+                index
+                for index, item in enumerate(lineage_steps)
+                if item.step_id == step.step_id
+            )
+            start_index = 0
+            for index, item in enumerate(lineage_steps[: target_index + 1]):
+                if item.lineage_segment_boundary_before:
+                    start_index = index
+            routed_experts_steps = lineage_steps[start_index : target_index + 1]
+        routed_experts_field = _build_routed_experts_field(
+            routed_experts_steps,
+            token_count=len(tokens),
+        )
+        if routed_experts_field is not None:
+            record["routed_experts_chunks"] = routed_experts_field
         return record
-
-    def _normalize_logprobs_to_length(
-        values: list[float],
-        token_count: int,
-    ) -> tuple[list[float], bool]:
-        invalid = len(values) != token_count
-        normalized: list[float] = []
-        for index in range(token_count):
-            if index >= len(values):
-                normalized.append(0.0)
-                continue
-            value = values[index]
-            try:
-                normalized.append(float(value))
-            except (TypeError, ValueError):
-                normalized.append(0.0)
-                invalid = True
-        return normalized, invalid
 
     def _build_tito_lineage_segment_record(
         *,
@@ -1086,7 +1246,7 @@ def create_app(
         tools = base_step.tools
 
         tokens: list[int] = []
-        response_logprobs: list[float] = []
+        step_logprobs = [step.concat_response_logprobs for step in steps]
         response_mask: list[int] = []
         full_versions: list[str] = []
         context_token_count = 0
@@ -1096,7 +1256,6 @@ def create_app(
 
         for step in steps:
             tokens.extend(step.concat_token_ids)
-            response_logprobs.extend(step.concat_response_logprobs)
             response_mask.extend(step.concat_response_mask)
             if record_token_versions:
                 full_versions.extend(step.concat_versions)
@@ -1137,18 +1296,21 @@ def create_app(
         if mask_nonlast_version_tokens:
             extra_info["mask_nonlast_version_tokens"] = True
 
-        if not (len(tokens) == len(response_logprobs) == len(response_mask)):
+        response_logprobs = build_concatenated_logprobs(
+            step_logprobs,
+            [len(step.concat_token_ids) for step in steps],
+            token_count=len(tokens),
+        )
+        if len(tokens) != len(response_mask):
             raise RuntimeError(
                 "tito segment arrays are not aligned: "
                 f"tokens={len(tokens)}, "
-                f"full_logprobs={len(response_logprobs)}, "
                 f"full_loss_mask={len(response_mask)}"
             )
         if record_token_versions and len(full_versions) != len(tokens):
             raise RuntimeError(
                 "tito segment arrays are not aligned: "
                 f"tokens={len(tokens)}, "
-                f"full_logprobs={len(response_logprobs)}, "
                 f"full_loss_mask={len(response_mask)}, "
                 f"full_versions={len(full_versions)}"
             )
@@ -1173,23 +1335,12 @@ def create_app(
         if record_token_versions:
             record["full_versions"] = full_versions
 
-        routed_experts_parts: list[dict[str, Any]] = []
-        accumulated_prefix_len = 0
-        for step_index, step in enumerate(steps):
-            if step.response_routed_experts_chunks or step.response_routed_experts is not None:
-                part = {
-                    "prefix_token_count": accumulated_prefix_len,
-                    "concat_token_count": len(step.concat_token_ids),
-                    "is_first_step": step_index == 0,
-                }
-                if step.response_routed_experts_chunks:
-                    part["chunks"] = step.response_routed_experts_chunks
-                if step.response_routed_experts is not None:
-                    part["data"] = step.response_routed_experts
-                routed_experts_parts.append(part)
-            accumulated_prefix_len += len(step.concat_token_ids)
-        if routed_experts_parts:
-            record["routed_experts_parts"] = routed_experts_parts
+        routed_experts_field = _build_routed_experts_field(
+            steps,
+            token_count=len(tokens),
+        )
+        if routed_experts_field is not None:
+            record["routed_experts_chunks"] = routed_experts_field
 
         return record
 
@@ -1296,7 +1447,7 @@ def create_app(
         concat_incremental_tokenization_failed: bool,
     ) -> dict[str, Any]:
         context_ids = list(context_delta_ids)
-        output_logprobs, invalid = _normalize_logprobs_to_length(
+        output_logprobs, invalid = normalize_logprobs_to_length(
             list(response_logprobs),
             len(response_token_ids),
         )
@@ -1927,7 +2078,41 @@ def create_app(
                     template_kwargs=tito_template_kwargs,
                 )
 
-            session_manager.record_step(
+            if token_build_mode == "tito":
+                previous_prefix_count = (
+                    0
+                    if route.type in {"create", "branch"}
+                    or lineage_segment_boundary_before
+                    else len(
+                        _lineage_tito_prefix_token_ids(
+                            session,
+                            route.lineage_id,
+                        )
+                    )
+                )
+                concat_token_count = len(concat_payload["concat_token_ids"])
+                if previous_prefix_count == 0:
+                    routed_experts_target_start = 0
+                    routed_experts_target_count = max(0, concat_token_count - 1)
+                else:
+                    routed_experts_target_start = previous_prefix_count - 1
+                    routed_experts_target_count = concat_token_count
+            else:
+                routed_experts_target_start = 0
+                routed_experts_target_count = max(
+                    0,
+                    len(recorded_all_token_ids) - 1,
+                )
+            response_routed_experts_chunks = canonicalize_routed_experts(
+                router_response.routed_experts_chunks,
+                target_start=routed_experts_target_start,
+                target_count=routed_experts_target_count,
+                expert_id_dtype=routed_experts_dtype,
+            )
+            router_response.routed_experts_chunks.clear()
+
+            await _record_step_atomically(
+                session,
                 session_id=session_id,
                 turn_id=effective_turn_id,
                 request_messages=messages,
@@ -1948,8 +2133,7 @@ def create_app(
                 raw_response_text=recorded_raw_text,
                 all_logprobs_invalid=router_response.all_logprobs_invalid,
                 **concat_payload,
-                response_routed_experts=router_response.routed_experts,
-                response_routed_experts_chunks=router_response.routed_experts_chunks,
+                response_routed_experts_chunks=response_routed_experts_chunks,
                 tools=tools,
                 segment_boundary_before=segment_boundary_before,
                 rewrite_reason=rewrite_reason,
@@ -2118,6 +2302,68 @@ def create_app(
             headers=_SSE_RESPONSE_HEADERS,
         )
 
+    @app.post("/session/discard")
+    async def discard_session(request: Request):
+        """Idempotently remove proxy state for a rejected rollout attempt."""
+
+        _check_auth(request)
+        body = await request.json()
+        session_id = str(body["session_id"])
+
+        if not enable_transfer_queue:
+            session_removed = session_manager.discard_session(session_id)
+            removed_segments = trajectory_store.pop_trajectory(session_id)
+            return {
+                "success": True,
+                "session_id": session_id,
+                "session_removed": session_removed,
+                "segments_removed": len(removed_segments),
+            }
+
+        async def _discard_state(active_session: Session | None) -> dict[str, Any]:
+            runtime = transfer_queue_runtime
+            trajectory_refs: list[TQTrajectoryRef] = []
+            if runtime is not None:
+                if (
+                    active_session is not None
+                    and active_session.incarnation_id is not None
+                ):
+                    trajectory_refs.append(runtime.trajectory_ref(active_session))
+                cached_result = session_manager.get_finalization_result(session_id)
+                if cached_result is not None:
+                    raw_ref = cached_result.get("tq_trajectory_ref")
+                    if isinstance(raw_ref, TQTrajectoryRef):
+                        trajectory_refs.append(raw_ref)
+                    elif is_tq_trajectory_ref_dict(raw_ref):
+                        trajectory_refs.append(TQTrajectoryRef.from_dict(raw_ref))
+
+            session_removed = session_manager.discard_session(session_id)
+            removed_segments = trajectory_store.pop_trajectory(session_id)
+            if runtime is not None:
+                try:
+                    await runtime.clear_refs(
+                        ref
+                        for trajectory_ref in trajectory_refs
+                        for ref in trajectory_ref.refs
+                    )
+                except Exception:
+                    logger.exception(
+                        "TransferQueue discard failed; retention will reclaim the data"
+                    )
+
+            return {
+                "success": True,
+                "session_id": session_id,
+                "session_removed": session_removed,
+                "segments_removed": len(removed_segments),
+            }
+
+        active_session = session_manager.get_session(session_id)
+        if active_session is None:
+            return await _discard_state(None)
+        async with active_session.request_lock:
+            return await _discard_state(active_session)
+
     @app.post("/session/finalize")
     async def finalize_session(request: Request):
         _check_auth(request)
@@ -2162,6 +2408,11 @@ def create_app(
             effective_instance_id = instance_id or session.instance_id
             trajectory_id = session.session_id
             finalization_id = uuid.uuid4().hex
+            trajectory_ref = (
+                transfer_queue_runtime.trajectory_ref(session)
+                if transfer_queue_runtime is not None
+                else None
+            )
             records: list[dict[str, Any]] = []
             if token_build_mode == "tito":
                 lineage_segments = _split_session_into_lineage_segments(session)
@@ -2220,7 +2471,6 @@ def create_app(
                     }
                 )
                 record["extra_info"] = extra_info
-
             finalization_result = {
                 "success": True,
                 "session_id": session_id,
@@ -2237,6 +2487,8 @@ def create_app(
                 "record_token_versions": record_token_versions,
                 "mask_nonlast_version_tokens": mask_nonlast_version_tokens,
             }
+            if trajectory_ref is not None:
+                finalization_result["tq_trajectory_ref"] = trajectory_ref.to_dict()
 
             # Record conversion validates every item before write_many enters
             # its one-lock commit.  The active Session is removed only after
@@ -2299,7 +2551,10 @@ def create_app(
     @app.get("/trajectory/stats")
     async def trajectory_stats(request: Request):
         _check_auth(request)
-        return trajectory_store.stats()
+        stats = trajectory_store.stats()
+        if transfer_queue_runtime is not None:
+            stats["transfer_queue"] = transfer_queue_runtime.stats()
+        return stats
 
     @app.post("/v1/rollout/pause")
     async def pause_rollout(request: Request):
@@ -2392,7 +2647,7 @@ def create_app(
 
     @app.get("/health")
     async def health():
-        return {
+        payload = {
             "status": "ok",
             "active_sessions": session_manager.active_count(),
             "store": trajectory_store.stats(),
@@ -2415,6 +2670,22 @@ def create_app(
                 ),
             },
         }
+        if enable_transfer_queue:
+            payload["transfer_queue"] = (
+                None
+                if transfer_queue_runtime is None
+                else transfer_queue_runtime.stats()
+            )
+            payload["config"].update(
+                {
+                    "enable_transfer_queue": True,
+                    "transfer_params": normalized_transfer_params,
+                    "transfer_queue_retention_seconds": (
+                        transfer_queue_retention_seconds
+                    ),
+                }
+            )
+        return payload
 
     return app
 
@@ -2458,6 +2729,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=False,
         help="Request routed expert IDs from SGLang for rollout routing replay.",
+    )
+    parser.add_argument(
+        "--routed-experts-dtype",
+        choices=("uint8", "uint16", "int32"),
+        default="int32",
+        help="Storage dtype for routed expert IDs.",
     )
     parser.add_argument("--model-mask-type")
     parser.add_argument("--model-tool-call-type")
@@ -2530,7 +2807,58 @@ def parse_args() -> argparse.Namespace:
             "keeps the legacy respond-after-completion behavior."
         ),
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--enable-transfer-queue",
+        action="store_true",
+        default=_env_flag("DRESSAGE_ENABLE_TRANSFER_QUEUE"),
+        help="Offload selected trajectory fields to TransferQueue.",
+    )
+    parser.add_argument(
+        "--transfer-queue-config",
+        default=None,
+        help="TransferQueue YAML configuration path.",
+    )
+    parser.add_argument(
+        "--transfer-queue-retention-seconds",
+        type=_non_negative_finite_float,
+        default=None,
+        help="Retention fallback for unconsumed TransferQueue fields.",
+    )
+    parser.add_argument(
+        "--transfer-params",
+        nargs="+",
+        default=None,
+        help="Trajectory fields to offload: logprobs routed_experts.",
+    )
+    args = parser.parse_args()
+    if not args.enable_transfer_queue:
+        args.transfer_queue_config = None
+        args.transfer_queue_retention_seconds = 86400.0
+        args.transfer_params = []
+        return args
+
+    if args.transfer_queue_config is None:
+        args.transfer_queue_config = os.environ.get(
+            "DRESSAGE_TRANSFER_QUEUE_CONFIG"
+        )
+    if args.transfer_queue_retention_seconds is None:
+        raw_retention = os.environ.get(
+            "DRESSAGE_TRANSFER_QUEUE_RETENTION_SECONDS",
+            "86400",
+        )
+        try:
+            args.transfer_queue_retention_seconds = _non_negative_finite_float(
+                raw_retention
+            )
+        except argparse.ArgumentTypeError as exc:
+            parser.error(str(exc))
+    if args.transfer_params is None:
+        args.transfer_params = (
+            os.environ.get("DRESSAGE_TRANSFER_PARAMS", "")
+            .replace(",", " ")
+            .split()
+        )
+    return args
 
 
 def main() -> None:
@@ -2560,9 +2888,14 @@ def main() -> None:
         context_window=args.context_window,
         dynamic_max_tokens=args.dynamic_max_tokens,
         use_rollout_routing_replay=args.use_rollout_routing_replay,
+        routed_experts_dtype=args.routed_experts_dtype,
         partial_rollout=args.dressage_partial_rollout,
         max_partial_rollout_preempts=args.max_partial_rollout_preempts,
         stream_heartbeat_interval_seconds=args.stream_heartbeat_interval_seconds,
+        enable_transfer_queue=args.enable_transfer_queue,
+        transfer_queue_config=args.transfer_queue_config,
+        transfer_queue_retention_seconds=args.transfer_queue_retention_seconds,
+        transfer_params=args.transfer_params,
     )
     uvicorn.run(app, host=args.host, port=args.port)
 

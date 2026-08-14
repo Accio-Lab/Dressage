@@ -37,6 +37,7 @@ except ImportError:
     Sample = None  # type: ignore[assignment]
 
 from dressage.paddock.lifecycle import drain_lifecycle_tasks
+from dressage.rollout.generate.runtime import generate_group
 from dressage.rollout.multi_segment import (
     compute_multi_segment_metrics,
     compute_prewarm_metrics,
@@ -396,11 +397,11 @@ class AsyncRolloutWorker:
     async def _run_group(self, group: list[Any], sampling_params: dict[str, Any]) -> list[Any]:
         if generate_and_rm_group is None:
             raise RuntimeError("slime.rollout.sglang_rollout.generate_and_rm_group is unavailable")
-        result = await generate_and_rm_group(
+        result = await generate_group(
+            generate_and_rm_group,
             self.args,
             group,
             sampling_params=sampling_params,
-            evaluation=False,
         )
         return _flatten_multi_segment_result(result)
 

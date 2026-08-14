@@ -23,7 +23,8 @@ RUN apt-get update && \
       bash \
       bubblewrap \
       ca-certificates \
-      curl && \
+      curl \
+      git && \
     rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSL https://opencode.ai/install | bash -s -- --version "${OPENCODE_VERSION}" && \
@@ -63,7 +64,7 @@ RUN curl -fsSL "https://github.com/openai/codex/releases/download/rust-v${CODEX_
 WORKDIR /root/Dressage
 COPY . /root/Dressage
 
-RUN python -m pip install --no-cache-dir --no-build-isolation -e "." && \
+RUN python -m pip install --no-cache-dir --no-build-isolation -e ".[transfer-queue]" && \
     python -m pip install --no-cache-dir --no-build-isolation ./blackbox_server
 
 CMD ["bash"]
