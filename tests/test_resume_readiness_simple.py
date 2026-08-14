@@ -265,7 +265,7 @@ def test_generation_controller_skips_zero_output_preempt_routed_experts():
     result = asyncio.run(run_test())
 
     assert result.output_ids == [42]
-    assert result.routed_experts == "fresh-routes"
+    assert "routed_experts" not in result.meta_info
     assert result.routed_experts_chunks == [
         {
             "data": "fresh-routes",

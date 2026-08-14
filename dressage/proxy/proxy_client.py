@@ -81,6 +81,17 @@ class ProxyClient:
         response.raise_for_status()
         return response.json()
 
+    async def discard_session(self, session_id: str) -> dict:
+        """Discard all in-memory proxy state for one rejected rollout attempt."""
+
+        response = await self._client.post(
+            f"{self._proxy_url}/session/discard",
+            json={"session_id": session_id},
+            headers=self._headers(),
+        )
+        response.raise_for_status()
+        return response.json()
+
     async def read_trajectory(
         self,
         *,

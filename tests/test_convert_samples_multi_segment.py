@@ -11,10 +11,12 @@ from dataclasses import dataclass, field
 from enum import Enum
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from dressage.rollout.multi_segment import mark_aborted_no_grad
 from dressage.rollout import convert_samples as cs
+from dressage.transport import TQ_SAMPLE_REF_METADATA_KEY
 
 
 class _Status(Enum):
@@ -241,6 +243,61 @@ def test_convert_samples_dead_sample_mask_zeroed():
     assert train_data["rollout_mask_sums"] == [0]
 
 
+def test_convert_samples_passes_only_remote_fields_through_prompt():
+    args = _traj_equal_args()
+    args.use_rollout_routing_replay = True
+    args.num_layers = 2
+    args.moe_router_topk = 2
+    live = _real_seg(ptid="t1", instance_id="p1", mask=[1, 1])
+    live.rollout_log_probs = None
+    live.rollout_routed_experts = None
+    layouts = {
+        "full_logprobs": {"schema_version": "layout"},
+        "routed_experts": {"schema_version": "layout"},
+    }
+    live.metadata[TQ_SAMPLE_REF_METADATA_KEY] = layouts
+    failed = _failed_seg(ptid="t2", instance_id="p2", index=1)
+
+    train_data = cs.convert_samples_to_train_data(args, [live, failed])
+
+    assert train_data["prompt"] == [layouts, None]
+    assert "rollout_log_probs" not in train_data
+    assert "rollout_routed_experts" not in train_data
+
+
+def test_convert_samples_keeps_unselected_r3_on_normal_path():
+    args = _traj_equal_args()
+    args.use_rollout_routing_replay = True
+    args.num_layers = 2
+    args.moe_router_topk = 2
+    live = _real_seg(ptid="t1", instance_id="p1", mask=[1, 1])
+    live.rollout_log_probs = None
+    live.rollout_routed_experts = np.ones((2, 2, 2), dtype=np.int32)
+    layouts = {"full_logprobs": {"schema_version": "layout"}}
+    live.metadata[TQ_SAMPLE_REF_METADATA_KEY] = layouts
+    failed = _failed_seg(ptid="t2", instance_id="p2", index=1)
+
+    train_data = cs.convert_samples_to_train_data(args, [live, failed])
+
+    assert train_data["prompt"] == [layouts, None]
+    assert "rollout_log_probs" not in train_data
+    assert train_data["rollout_routed_experts"][0] is live.rollout_routed_experts
+    assert train_data["rollout_routed_experts"][1].shape == (0, 2, 2)
+
+
+def test_convert_samples_rejects_normal_actual_and_remote_field_mix():
+    args = _traj_equal_args()
+    remote = _real_seg(ptid="t1", instance_id="p1", mask=[1, 1])
+    remote.rollout_log_probs = None
+    remote.metadata[TQ_SAMPLE_REF_METADATA_KEY] = {
+        "full_logprobs": {"schema_version": "layout"}
+    }
+    local = _real_seg(ptid="t2", instance_id="p2", mask=[1, 1], index=1)
+
+    with pytest.raises(ValueError, match="cannot mix actual values"):
+        cs.convert_samples_to_train_data(args, [remote, local])
+
+
 def test_convert_samples_prompt_equal_when_multi_segment_grpo():
     args = _prompt_equal_args(gbs=4)
     samples = [
@@ -313,3 +370,72 @@ def test_aborted_no_grad_sample_passes_convert_samples():
     # Dead sample shares instance_id="p1" → same denom; harmless because
     # its loss_mask is zeroed so it contributes 0 to loss regardless.
     assert train_data["rollout_mask_sums"][1] == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize("failed_first", [False, True])
+def test_convert_samples_fills_r3_for_failed_no_grad_sample(failed_first):
+    args = _prompt_equal_args(gbs=4)
+    args.use_rollout_routing_replay = True
+    args.num_layers = 2
+    args.moe_router_topk = 2
+    real = _real_seg(
+        ptid="t1",
+        instance_id="p1",
+        mask=[1, 1],
+        index=0,
+        rollout_id=0,
+    )
+    real_r3 = np.ones((2, 2, 2), dtype=np.int32)
+    real.rollout_routed_experts = real_r3
+    failed = _failed_seg(ptid="t2", instance_id="p2", index=1)
+    samples = [failed, real] if failed_first else [real, failed]
+
+    train_data = cs.convert_samples_to_train_data(args, samples)
+
+    real_index = 1 if failed_first else 0
+    failed_index = 0 if failed_first else 1
+    assert train_data["rollout_routed_experts"][real_index] is real_r3
+    failed_r3 = train_data["rollout_routed_experts"][failed_index]
+    assert failed_r3.shape == (0, 2, 2)
+    assert failed_r3.dtype == np.int32
+
+
+def test_convert_samples_fills_r3_for_multiple_failed_no_grad_samples():
+    args = _prompt_equal_args(gbs=4)
+    args.use_rollout_routing_replay = True
+    args.num_layers = 2
+    args.moe_router_topk = 2
+    failed_empty = _failed_seg(ptid="t1", instance_id="p1", index=0)
+    failed_partial = _failed_seg(ptid="t2", instance_id="p2", index=1)
+    failed_partial.tokens = [0, 0, 0]
+    failed_partial.response_length = 2
+    failed_partial.loss_mask = [0, 0]
+
+    train_data = cs.convert_samples_to_train_data(
+        args,
+        [failed_empty, failed_partial],
+    )
+
+    first_r3, second_r3 = train_data["rollout_routed_experts"]
+    assert first_r3.shape == (0, 2, 2)
+    assert second_r3.shape == (2, 2, 2)
+    assert np.count_nonzero(first_r3) == 0
+    assert np.count_nonzero(second_r3) == 0
+
+
+def test_convert_samples_does_not_fill_failed_r3_without_routing_replay():
+    args = _prompt_equal_args(gbs=4)
+    args.use_rollout_routing_replay = False
+    failed = _failed_seg(ptid="t1", instance_id="p1", index=0)
+    real = _real_seg(
+        ptid="t2",
+        instance_id="p2",
+        mask=[1, 1],
+        index=1,
+        rollout_id=1,
+    )
+    real.rollout_routed_experts = np.ones((2, 2, 2), dtype=np.int32)
+
+    train_data = cs.convert_samples_to_train_data(args, [failed, real])
+
+    assert "rollout_routed_experts" not in train_data

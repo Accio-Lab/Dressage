@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 import os
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
 from dressage.config import proxy_url
@@ -48,6 +50,107 @@ def get_proxy_client() -> ProxyClientType:
 
         _PROXY_CLIENT = ProxyClient(proxy_url())
     return _PROXY_CLIENT
+
+
+async def discard_proxy_session_best_effort(
+    session_id: str | None,
+    *,
+    proxy_client: ProxyClientType | None = None,
+) -> bool:
+    """Discard one rejected attempt without turning cleanup into rollout failure."""
+
+    if not session_id:
+        return True
+
+    try:
+        client = proxy_client or get_proxy_client()
+        result = await asyncio.wait_for(
+            client.discard_session(str(session_id)),
+            timeout=10.0,
+        )
+        if isinstance(result, dict) and result.get("success") is False:
+            logger.warning(
+                "proxy refused to discard failed rollout session_id=%s: %r",
+                session_id,
+                result,
+            )
+            return False
+    except Exception:
+        logger.warning(
+            "failed to discard proxy state for aborted rollout session_id=%s",
+            session_id,
+            exc_info=True,
+        )
+        return False
+
+    logger.debug("discarded proxy state for aborted rollout session_id=%s", session_id)
+    return True
+
+
+async def discard_rollout_groups_best_effort(
+    groups: Iterable[Iterable[Any]],
+    *,
+    proxy_client: ProxyClientType | None = None,
+) -> bool:
+    trajectory_ids: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for sample in group:
+            metadata = getattr(sample, "metadata", None)
+            if not isinstance(metadata, dict):
+                metadata = {}
+            trajectory_id = (
+                metadata.get("parent_traj_id")
+                or metadata.get("last_failed_session_id")
+                or metadata.get("session_id")
+                or getattr(sample, "session_id", None)
+            )
+            if trajectory_id is None:
+                continue
+            trajectory_id = str(trajectory_id)
+            if trajectory_id in seen:
+                continue
+            seen.add(trajectory_id)
+            trajectory_ids.append(trajectory_id)
+
+    results = await asyncio.gather(
+        *(
+            discard_proxy_session_best_effort(
+                trajectory_id,
+                proxy_client=proxy_client,
+            )
+            for trajectory_id in trajectory_ids
+        )
+    )
+    return all(results)
+
+
+async def generate_group(
+    generate: Any,
+    args: Any,
+    group: list[Any],
+    sampling_params: dict[str, Any],
+) -> list[Any]:
+    result = None
+    try:
+        result = await generate(
+            args,
+            group,
+            sampling_params=sampling_params,
+            evaluation=False,
+        )
+        return result
+    finally:
+        generated = [
+            sample
+            for item in (result or [])
+            for sample in (item if isinstance(item, list) else [item])
+        ]
+        if result is None or any(
+            getattr(getattr(sample, "status", None), "name", None) == "ABORTED"
+            for sample in generated
+        ):
+            await discard_rollout_groups_best_effort([generated, group])
 
 
 def get_paddock_from_env(

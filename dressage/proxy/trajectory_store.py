@@ -9,6 +9,11 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from dressage.transport import (
+    TQFieldLayout,
+    is_tq_field_layout_dict,
+)
+
 
 @dataclass
 class TrajectorySegment:
@@ -23,13 +28,11 @@ class TrajectorySegment:
     messages: list[dict]
     tools: list[dict[str, Any]] | None
     tokens: list[int]
-    full_logprobs: list[float]
+    full_logprobs: list[float] | TQFieldLayout
     full_loss_mask: list[int]
     aligned_response_length: int
     full_versions: list[str] | None = None
-    routed_experts: str | None = None
-    routed_experts_chunks: list[dict[str, Any]] | None = None
-    routed_experts_parts: list[dict[str, Any]] | None = None
+    routed_experts_chunks: list[dict[str, Any]] | TQFieldLayout | None = None
     label: Any | None = None
     finish_reason: str = "stop"
     timestamp: float = field(default_factory=time.time)
@@ -51,7 +54,11 @@ class TrajectorySegment:
             "messages": self.messages,
             "tools": self.tools,
             "tokens": self.tokens,
-            "full_logprobs": self.full_logprobs,
+            "full_logprobs": (
+                self.full_logprobs.to_dict()
+                if isinstance(self.full_logprobs, TQFieldLayout)
+                else self.full_logprobs
+            ),
             "full_loss_mask": self.full_loss_mask,
             "aligned_response_length": self.aligned_response_length,
             "label": self.label,
@@ -61,12 +68,12 @@ class TrajectorySegment:
         }
         if self.full_versions is not None:
             data["full_versions"] = self.full_versions
-        if self.routed_experts is not None:
-            data["routed_experts"] = self.routed_experts
         if self.routed_experts_chunks is not None:
-            data["routed_experts_chunks"] = self.routed_experts_chunks
-        if self.routed_experts_parts is not None:
-            data["routed_experts_parts"] = self.routed_experts_parts
+            data["routed_experts_chunks"] = (
+                self.routed_experts_chunks.to_dict()
+                if isinstance(self.routed_experts_chunks, TQFieldLayout)
+                else self.routed_experts_chunks
+            )
         return data
 
 
@@ -130,18 +137,48 @@ class TrajectoryStore:
                 raise ValueError(f"trajectory segment missing required field: {key}")
 
         token_count = len(data["tokens"])
-        for key in ("full_logprobs", "full_loss_mask"):
-            if len(data[key]) != token_count:
+        raw_logprobs = data["full_logprobs"]
+        full_logprobs = (
+            TQFieldLayout.from_dict(raw_logprobs)
+            if is_tq_field_layout_dict(raw_logprobs)
+            else raw_logprobs
+        )
+        if isinstance(full_logprobs, TQFieldLayout):
+            if full_logprobs.token_count != token_count:
                 raise ValueError(
-                    f"trajectory segment field length mismatch: {key} has "
-                    f"{len(data[key])}, tokens has {token_count}"
+                    "trajectory segment field length mismatch: full_logprobs "
+                    f"layout has {full_logprobs.token_count}, tokens has {token_count}"
                 )
+        elif len(full_logprobs) != token_count:
+            raise ValueError(
+                "trajectory segment field length mismatch: full_logprobs has "
+                f"{len(full_logprobs)}, tokens has {token_count}"
+            )
+        if len(data["full_loss_mask"]) != token_count:
+            raise ValueError(
+                "trajectory segment field length mismatch: full_loss_mask has "
+                f"{len(data['full_loss_mask'])}, tokens has {token_count}"
+            )
         if data.get("full_versions") is not None and len(data["full_versions"]) != token_count:
             raise ValueError(
                 "trajectory segment field length mismatch: full_versions has "
                 f"{len(data['full_versions'])}, tokens has {token_count}"
             )
 
+        raw_routed_experts = data.get("routed_experts_chunks")
+        routed_experts_chunks = (
+            TQFieldLayout.from_dict(raw_routed_experts)
+            if is_tq_field_layout_dict(raw_routed_experts)
+            else raw_routed_experts
+        )
+        if (
+            isinstance(routed_experts_chunks, TQFieldLayout)
+            and routed_experts_chunks.token_count != token_count
+        ):
+            raise ValueError(
+                "trajectory segment field length mismatch: routed_experts_chunks "
+                f"layout has {routed_experts_chunks.token_count}, tokens has {token_count}"
+            )
         return TrajectorySegment(
             uid=data.get("uid", str(uuid.uuid4())),
             trajectory_id=trajectory_id,
@@ -152,7 +189,7 @@ class TrajectoryStore:
             messages=data["messages"],
             tools=data.get("tools"),
             tokens=data["tokens"],
-            full_logprobs=data["full_logprobs"],
+            full_logprobs=full_logprobs,
             full_loss_mask=data["full_loss_mask"],
             aligned_response_length=data.get("aligned_response_length", 0),
             full_versions=(
@@ -160,9 +197,7 @@ class TrajectoryStore:
                 if data.get("full_versions") is None
                 else [str(value) for value in data["full_versions"]]
             ),
-            routed_experts=data.get("routed_experts"),
-            routed_experts_chunks=data.get("routed_experts_chunks"),
-            routed_experts_parts=data.get("routed_experts_parts"),
+            routed_experts_chunks=routed_experts_chunks,
             label=data.get("label"),
             finish_reason=data.get("finish_reason", "stop"),
             extra_info=data.get("extra_info", {}),

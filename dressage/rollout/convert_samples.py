@@ -20,6 +20,10 @@ from __future__ import annotations
 import os
 from typing import Any
 
+import numpy as np
+
+from dressage.transport import TQ_SAMPLE_REF_METADATA_KEY
+
 _PROMPT_EQUAL_ESTIMATORS = ("grpo", "reinforce_plus_plus_baseline")
 
 
@@ -114,6 +118,24 @@ def convert_samples_to_train_data(args: Any, samples: list) -> dict:
         "sample_indices": [sample.index for sample in samples],
         "rollout_ids": rollout_ids,
     }
+    tq_layouts = [
+        (sample.metadata or {}).get(TQ_SAMPLE_REF_METADATA_KEY)
+        for sample in samples
+    ]
+    tq_remote_fields = {
+        field
+        for layouts in tq_layouts
+        if layouts is not None
+        for field in layouts
+    }
+    for sample, layouts in zip(samples, tq_layouts, strict=True):
+        sample_fields = set(layouts or {})
+        missing_fields = tq_remote_fields.difference(sample_fields)
+        if missing_fields and not bool(getattr(sample, "remove_sample", False)):
+            raise ValueError(
+                "TransferQueue fields cannot mix actual values and layouts in "
+                f"one batch: {', '.join(sorted(missing_fields))}"
+            )
 
     # loss mask
     # TODO: compress the loss mask
@@ -176,12 +198,36 @@ def convert_samples_to_train_data(args: Any, samples: list) -> dict:
         ]
 
     # Add rollout log probabilities for off-policy correction
-    if samples[0].rollout_log_probs is not None:
+    if (
+        "full_logprobs" not in tq_remote_fields
+        and samples[0].rollout_log_probs is not None
+    ):
         train_data["rollout_log_probs"] = [
             sample.rollout_log_probs for sample in samples
         ]
 
-    if samples[0].rollout_routed_experts is not None:
+    if (
+        getattr(args, "use_rollout_routing_replay", False)
+        and "routed_experts" not in tq_remote_fields
+    ):
+        routed_experts = []
+        for sample in samples:
+            value = sample.rollout_routed_experts
+            if value is None and sample.remove_sample:
+                value = np.zeros(
+                    (
+                        len(sample.tokens) - 1,
+                        args.num_layers,
+                        args.moe_router_topk,
+                    ),
+                    dtype=np.int32,
+                )
+            routed_experts.append(value)
+        train_data["rollout_routed_experts"] = routed_experts
+    elif (
+        "routed_experts" not in tq_remote_fields
+        and samples[0].rollout_routed_experts is not None
+    ):
         train_data["rollout_routed_experts"] = [
             sample.rollout_routed_experts for sample in samples
         ]
@@ -197,7 +243,11 @@ def convert_samples_to_train_data(args: Any, samples: list) -> dict:
     config_path = getattr(args, "mopd_teacher_config", None) or os.environ.get(
         "DRESSAGE_MOPD_TEACHER_CONFIG"
     )
-    if config_path:
+    if tq_remote_fields and config_path:
+        raise ValueError("TransferQueue and MOPD cannot share train_data['prompt']")
+    if tq_remote_fields:
+        train_data["prompt"] = tq_layouts
+    elif config_path:
         if (
             not bool(getattr(args, "use_opd", False))
             or getattr(args, "opd_type", None) != "megatron"

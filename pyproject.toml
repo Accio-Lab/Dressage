@@ -15,6 +15,9 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=8.3.0", "pytest-asyncio>=0.24.0"]
+transfer-queue = [
+    "TransferQueue @ git+https://github.com/Ascend/TransferQueue.git@b75d570d88c50bbfcbe2171baa727fadd7216f76",
+]
 harbor = [
     "harbor==0.18.0",
     "dressage-blackbox-server==1.1.0",

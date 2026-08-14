@@ -137,6 +137,9 @@ mkdir -p "${SAVE_ROOT}" "${LOG_DIR}"
 
 PROXY_PUBLIC_HOST="${PROXY_PUBLIC_HOST:-${CURRENT_NODE_IP:-${MASTER_ADDR}}}"
 DRESSAGE_SANDBOX_PROVIDER="${DRESSAGE_SANDBOX_PROVIDER:-e2b}"
+if dressage_transfer_queue_enabled && [[ -z "${DRESSAGE_TRANSFER_PARAMS:-}" ]]; then
+    DRESSAGE_TRANSFER_PARAMS="logprobs"
+fi
 dressage_apply_common_defaults "${RUN_NAME}" blackbox "${DRESSAGE_SANDBOX_PROVIDER}"
 DRESSAGE_PROXY_PUBLIC_URL="${DRESSAGE_PROXY_PUBLIC_URL:-${DRESSAGE_PROXY_URL}}"
 
@@ -172,6 +175,25 @@ echo "effective_claude_code: version=${CLAUDE_CODE_VERSION} bbs_version=${CLAUDE
 echo "effective_batch: num_rollout=${NUM_ROLLOUT} rollout_batch_size=${ROLLOUT_BATCH_SIZE} n_samples_per_prompt=${N_SAMPLES_PER_PROMPT} global_batch_size=${GLOBAL_BATCH_SIZE}"
 echo "effective_grpo: normalize_advantages=${NORMALIZE_ADVANTAGES} use_tis=${USE_TIS} use_kl_loss=${USE_KL_LOSS} kl_coef=${KL_COEF} entropy_coef=${ENTROPY_COEF} eps_clip=${EPS_CLIP} eps_clip_high=${EPS_CLIP_HIGH} kl_loss_coef=${KL_LOSS_COEF} kl_loss_type=${KL_LOSS_TYPE}"
 
+TQ_PROXY_ARGS=()
+TQ_TRAINING_ARGS=()
+TRAIN_ENTRY=(python3 "${SLIME_ROOT}/train.py")
+if dressage_transfer_queue_enabled; then
+    NORMALIZED_TRANSFER_PARAMS="${DRESSAGE_TRANSFER_PARAMS//,/ }"
+    read -r -a TRANSFER_PARAMS <<< "${NORMALIZED_TRANSFER_PARAMS}"
+    TQ_PROXY_ARGS=(
+        --enable-transfer-queue
+        --transfer-queue-config "${DRESSAGE_TRANSFER_QUEUE_CONFIG}"
+        --transfer-queue-retention-seconds "${DRESSAGE_TRANSFER_QUEUE_RETENTION_SECONDS}"
+        --transfer-params "${TRANSFER_PARAMS[@]}"
+    )
+    if [[ " ${NORMALIZED_TRANSFER_PARAMS} " == *" routed_experts "* ]]; then
+        TQ_PROXY_ARGS+=(--use-rollout-routing-replay)
+        TQ_TRAINING_ARGS+=(--use-rollout-routing-replay)
+    fi
+    TRAIN_ENTRY=(python3 -m dressage.training.tq_train)
+fi
+
 TOKENIZER_PATH="${TOKENIZER_PATH:-${MODEL_ROOT}/${MODEL_NAME}}"
 PROXY_ARGS=(
   --tokenizer-path "${TOKENIZER_PATH}"
@@ -181,6 +203,7 @@ PROXY_ARGS=(
   --token-build-model "${TOKEN_BUILD_MODEL}"
   --rollout-temperature "${ROLLOUT_TEMPERATURE:-1.0}"
   --context-window "${CONTEXT_WINDOW}"
+  "${TQ_PROXY_ARGS[@]}"
 )
 
 HF_CHECKPOINT="${HF_CHECKPOINT:-${MODEL_ROOT}/${MODEL_NAME}}"
@@ -434,6 +457,10 @@ keys = [
     "DRESSAGE_PROXY_MAX_STEPS_PER_SESSION",
     "DRESSAGE_ROLLOUT_MAX_RETRIES",
     "DRESSAGE_ALLOW_EMPTY_TRAIN_BATCH",
+    "DRESSAGE_ENABLE_TRANSFER_QUEUE",
+    "DRESSAGE_TRANSFER_QUEUE_CONFIG",
+    "DRESSAGE_TRANSFER_PARAMS",
+    "DRESSAGE_TRANSFER_QUEUE_STORE_ID",
 ]
 for raw_key in os.environ.get("DRESSAGE_EXTRA_RUNTIME_ENV_KEYS", "").split(","):
     key = raw_key.strip()
@@ -450,7 +477,7 @@ PY
 
 ray job submit --address="http://127.0.0.1:${RAY_DASHBOARD_PORT}" \
   --runtime-env-json="${RUNTIME_ENV_JSON}" \
-  -- python3 "${SLIME_ROOT}/train.py" \
+  -- "${TRAIN_ENTRY[@]}" \
   --actor-num-nodes "${ACTOR_NUM_NODES}" \
   --actor-num-gpus-per-node "${ACTOR_NUM_GPUS_PER_NODE}" \
   --colocate \
@@ -463,4 +490,5 @@ ray job submit --address="http://127.0.0.1:${RAY_DASHBOARD_PORT}" \
   "${WANDB_ARGS[@]}" \
   "${PERF_ARGS[@]}" \
   "${SGLANG_ARGS[@]}" \
-  "${MISC_ARGS[@]}"
+  "${MISC_ARGS[@]}" \
+  "${TQ_TRAINING_ARGS[@]}"

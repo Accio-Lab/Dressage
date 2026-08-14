@@ -65,12 +65,12 @@ class SampleLike:
     status: Status = Status.PENDING
 
 
-def _encode_routed_experts(values, *, num_layers=1, topk=1):
+def _encode_routed_experts(values, *, num_layers=1, topk=1, dtype="int32"):
     import base64
 
     import numpy as np
 
-    array = np.asarray(values, dtype=np.int32).reshape(-1, num_layers, topk)
+    array = np.asarray(values, dtype=dtype).reshape(-1, num_layers, topk)
     return base64.b64encode(array.tobytes()).decode("ascii")
 
 
@@ -387,6 +387,35 @@ def test_generate_runtime_rejects_whitebox_mode_for_blackbox(monkeypatch):
         generate_runtime._PADDOCK = previous
 
 
+@pytest.mark.asyncio
+async def test_discard_rollout_groups_deduplicates_trajectory_ids(monkeypatch):
+    discarded: list[str] = []
+
+    async def fake_discard(session_id, *, proxy_client=None):
+        del proxy_client
+        discarded.append(session_id)
+        return True
+
+    monkeypatch.setattr(
+        generate_runtime,
+        "discard_proxy_session_best_effort",
+        fake_discard,
+    )
+    groups = [
+        [
+            SimpleNamespace(metadata={"parent_traj_id": "traj-a"}),
+            SimpleNamespace(metadata={"parent_traj_id": "traj-a"}),
+            SimpleNamespace(metadata={"last_failed_session_id": "traj-b"}),
+        ],
+        [SimpleNamespace(session_id="traj-c", metadata={})],
+    ]
+
+    result = await generate_runtime.discard_rollout_groups_best_effort(groups)
+
+    assert result is True
+    assert discarded == ["traj-a", "traj-b", "traj-c"]
+
+
 def test_blackbox_dispatch_passes_max_steps_env_in_register_payload(monkeypatch):
     asyncio.run(
         _run_blackbox_dispatch_passes_max_steps_env_in_register_payload(monkeypatch)
@@ -444,6 +473,10 @@ class FakeProxy:
                 },
             ],
         }
+
+    async def discard_session(self, session_id):
+        self.calls.append(("discard", session_id))
+        return {"success": True, "session_id": session_id}
 
 
 def _rollout_args(
@@ -600,21 +633,17 @@ def test_parse_blackbox_execute_cmds_requires_explicit_bool_required():
         )
 
 
-def test_extract_routed_experts_combines_partial_last_step_chunks():
+def test_extract_routed_experts_combines_canonical_chunks():
     args = SimpleNamespace(num_layers=1, moe_router_topk=1)
     segment = {
         "routed_experts_chunks": [
             {
                 "data": _encode_routed_experts([10, 11, 12, 13]),
-                "prefix_token_count": 3,
-                "output_token_count": 2,
-                "is_first_chunk": True,
+                "row_count": 4,
             },
             {
-                "data": _encode_routed_experts([20, 21, 22, 23, 24, 25]),
-                "prefix_token_count": 5,
-                "output_token_count": 2,
-                "is_first_chunk": False,
+                "data": _encode_routed_experts([24, 25]),
+                "row_count": 2,
             },
         ],
     }
@@ -629,41 +658,40 @@ def test_extract_routed_experts_combines_partial_last_step_chunks():
     assert routed.reshape(-1).tolist() == [10, 11, 12, 13, 24, 25]
 
 
-def test_extract_routed_experts_combines_partial_tito_parts():
+@pytest.mark.parametrize("dtype", ["uint8", "uint16", "int32"])
+def test_extract_routed_experts_decodes_recorded_dtype(dtype):
     args = SimpleNamespace(num_layers=1, moe_router_topk=1)
     segment = {
-        "routed_experts_parts": [
+        "routed_experts_chunks": [
             {
-                "prefix_token_count": 0,
-                "concat_token_count": 4,
-                "is_first_step": True,
-                "chunks": [
-                    {
-                        "data": _encode_routed_experts([1, 2]),
-                        "prefix_token_count": 2,
-                        "output_token_count": 1,
-                        "is_first_chunk": True,
-                    },
-                    {
-                        "data": _encode_routed_experts([90, 91, 3]),
-                        "prefix_token_count": 3,
-                        "output_token_count": 1,
-                        "is_first_chunk": False,
-                    },
-                ],
+                "data": _encode_routed_experts([10, 11], dtype=dtype),
+                "row_count": 2,
+                "dtype": dtype,
+            }
+        ],
+    }
+
+    routed = trajectory_sample.extract_routed_experts(
+        segment,
+        args,
+        expected_token_count=3,
+    )
+
+    assert routed.dtype.name == "int32"
+    assert routed.reshape(-1).tolist() == [10, 11]
+
+
+def test_extract_routed_experts_combines_incremental_tito_chunks():
+    args = SimpleNamespace(num_layers=1, moe_router_topk=1)
+    segment = {
+        "routed_experts_chunks": [
+            {
+                "data": _encode_routed_experts([1, 2, 3]),
+                "row_count": 3,
             },
             {
-                "prefix_token_count": 4,
-                "concat_token_count": 3,
-                "is_first_step": False,
-                "chunks": [
-                    {
-                        "data": _encode_routed_experts([10, 11, 12, 13, 14, 15]),
-                        "prefix_token_count": 6,
-                        "output_token_count": 1,
-                        "is_first_chunk": True,
-                    },
-                ],
+                "data": _encode_routed_experts([13, 14, 15]),
+                "row_count": 3,
             },
         ],
     }
@@ -676,6 +704,26 @@ def test_extract_routed_experts_combines_partial_tito_parts():
 
     assert routed.shape == (6, 1, 1)
     assert routed.reshape(-1).tolist() == [1, 2, 3, 13, 14, 15]
+
+
+def test_extract_routed_experts_truncates_canonical_chunks():
+    args = SimpleNamespace(num_layers=1, moe_router_topk=1)
+    segment = {
+        "routed_experts_chunks": [
+            {
+                "data": _encode_routed_experts([1, 2, 3, 4]),
+                "row_count": 4,
+            }
+        ],
+    }
+
+    routed = trajectory_sample.extract_routed_experts(
+        segment,
+        args,
+        expected_token_count=3,
+    )
+
+    assert routed.reshape(-1).tolist() == [1, 2]
 
 
 def _dynamic_backend_options(
@@ -1033,6 +1081,11 @@ async def _run_blackbox_dispatch_required_execute_cmd_failure_aborts(monkeypatch
     assert sample.metadata["execute_cmds"][0]["cmd_result"]["returncode"] == 2
     assert "required execute_cmd failed" in sample.metadata["blackbox_error"]
     assert not [call for call in paddock.calls if call[0] == "call_agent"]
+    assert not [
+        call
+        for call in generate_runtime._PROXY_CLIENT.calls
+        if call[0] == "discard"
+    ]
 
 
 def test_blackbox_dispatch_optional_execute_cmd_failure_continues(monkeypatch):

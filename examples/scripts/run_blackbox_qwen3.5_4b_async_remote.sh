@@ -82,6 +82,22 @@ export DRESSAGE_SANDBOX_DEFAULT_IMAGE DRESSAGE_E2B_API_KEY
 COMM_ARGS=(
    --rollout-temperature "${ROLLOUT_TEMPERATURE:-1.0}"
 )
+TQ_PROXY_ARGS=()
+TRAIN_ENTRY=(python3 train_async.py)
+if dressage_transfer_queue_enabled; then
+    NORMALIZED_TRANSFER_PARAMS="${DRESSAGE_TRANSFER_PARAMS//,/ }"
+    read -r -a TRANSFER_PARAMS <<< "${NORMALIZED_TRANSFER_PARAMS}"
+    TQ_PROXY_ARGS=(
+        --enable-transfer-queue
+        --transfer-queue-config "${DRESSAGE_TRANSFER_QUEUE_CONFIG}"
+        --transfer-queue-retention-seconds "${DRESSAGE_TRANSFER_QUEUE_RETENTION_SECONDS}"
+        --transfer-params "${TRANSFER_PARAMS[@]}"
+    )
+    if [[ " ${NORMALIZED_TRANSFER_PARAMS} " == *" routed_experts "* ]]; then
+        COMM_ARGS+=(--use-rollout-routing-replay)
+    fi
+    TRAIN_ENTRY=(python3 -m dressage.training.tq_train_async)
+fi
 
 PROXY_ARGS=(
    --tokenizer-path "${BASE_FOLDER}/Qwen3.5-4B"
@@ -90,6 +106,7 @@ PROXY_ARGS=(
    --token-build-mode "${TOKEN_BUILD_MODE}"
    --token-build-model "${TOKEN_BUILD_MODEL}"
    "${COMM_ARGS[@]}"
+   "${TQ_PROXY_ARGS[@]}"
    --context-window "${CONTEXT_WINDOW}"
    --record-token-versions
 )
@@ -274,7 +291,11 @@ RUNTIME_ENV_JSON=$(cat <<EOF_JSON
     "DRESSAGE_E2B_API_KEY": "${DRESSAGE_E2B_API_KEY}",
     "DRESSAGE_TRAJECTORY_PAYLOAD_LOG_DIR": "${DRESSAGE_TRAJECTORY_PAYLOAD_LOG_DIR}",
     "DRESSAGE_TRAJECTORY_ERROR_LOG_DIR": "${DRESSAGE_TRAJECTORY_ERROR_LOG_DIR}",
-    "DRESSAGE_REWARD_MODULES": "${DRESSAGE_REWARD_MODULES:-}"
+    "DRESSAGE_REWARD_MODULES": "${DRESSAGE_REWARD_MODULES:-}",
+    "DRESSAGE_ENABLE_TRANSFER_QUEUE": "${DRESSAGE_ENABLE_TRANSFER_QUEUE}",
+    "DRESSAGE_TRANSFER_QUEUE_CONFIG": "${DRESSAGE_TRANSFER_QUEUE_CONFIG}",
+    "DRESSAGE_TRANSFER_PARAMS": "${DRESSAGE_TRANSFER_PARAMS}",
+    "DRESSAGE_TRANSFER_QUEUE_STORE_ID": "${DRESSAGE_TRANSFER_QUEUE_STORE_ID}"
   }
 }
 EOF_JSON
@@ -282,7 +303,7 @@ EOF_JSON
 
 ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
-   -- python3 train_async.py \
+   -- "${TRAIN_ENTRY[@]}" \
    --actor-num-nodes "${ACTOR_NUM_NODES}" \
    --actor-num-gpus-per-node "${ACTOR_NUM_GPUS_PER_NODE}" \
    --rollout-num-gpus "${ROLLOUT_NUM_GPUS}" \

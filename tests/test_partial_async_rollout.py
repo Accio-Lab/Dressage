@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from dressage.rollout import partial_async_rollout
+from dressage.rollout.generate import runtime as generate_runtime
 
 
 @dataclass
@@ -54,6 +55,18 @@ def _samples(output):
 
 def teardown_function():
     partial_async_rollout.stop_global_partial_worker()
+
+
+@pytest.fixture(autouse=True)
+def group_cleanup_calls(monkeypatch):
+    calls = []
+
+    class FakeProxy:
+        async def discard_session(self, session_id):
+            calls.append(session_id)
+
+    monkeypatch.setattr(generate_runtime, "_PROXY_CLIENT", FakeProxy())
+    return calls
 
 
 def test_partial_async_rollout_returns_global_batch_sized_subset(monkeypatch):
@@ -147,7 +160,7 @@ def test_partial_async_rollout_does_not_drop_completed_leftovers(monkeypatch):
     assert [group[0].index for group in second] == [2, 3]
 
 
-def test_partial_async_rollout_retries_aborted_group(monkeypatch):
+def test_partial_async_rollout_retries_aborted_group(monkeypatch, group_cleanup_calls):
     attempts = {"count": 0}
 
     async def fake_generate_and_rm_group(args, group, sampling_params, evaluation=False):
@@ -156,6 +169,7 @@ def test_partial_async_rollout_retries_aborted_group(monkeypatch):
         if attempts["count"] == 1:
             group[0].status = SampleLike.Status.ABORTED
             group[0].metadata["blackbox_error"] = "duplicate session"
+            group[0].metadata["last_failed_session_id"] = "old-session"
             group[0].session_id = None
         else:
             group[0].status = SampleLike.Status.COMPLETED
@@ -178,6 +192,7 @@ def test_partial_async_rollout_retries_aborted_group(monkeypatch):
 
     assert attempts["count"] == 2
     assert len(data.requeued) == 1
+    assert group_cleanup_calls == ["old-session"]
     assert result[0][0].status == SampleLike.Status.COMPLETED
     assert result[0][0].session_id == "new-session"
 
@@ -326,7 +341,11 @@ def test_partial_async_rollout_drains_worker_after_final_rollout(monkeypatch):
     assert output.metrics["dressage/partial_rollout_drained_completed_groups"] == 0
 
 
-def test_partial_async_rollout_drops_stale_group_by_trajectory(monkeypatch):
+def test_partial_async_rollout_leaves_stale_tq_data_to_retention(
+    monkeypatch,
+    group_cleanup_calls,
+):
+
     async def fake_generate_and_rm_group(args, group, sampling_params, evaluation=False):
         del args, sampling_params, evaluation
         for sample in group:
@@ -362,6 +381,86 @@ def test_partial_async_rollout_drops_stale_group_by_trajectory(monkeypatch):
 
     assert all(isinstance(group, list) for group in result)
     assert [[sample.index for sample in group] for group in result] == [[1], [2]]
+    assert group_cleanup_calls == []
+
+
+@pytest.mark.asyncio
+async def test_partial_final_rollout_leaves_oversampled_tq_data_to_retention(
+    monkeypatch,
+    group_cleanup_calls,
+):
+    selected = SampleLike(
+        index=0,
+        metadata={"parent_traj_id": "traj-selected"},
+        status=SampleLike.Status.COMPLETED,
+        tokens=[1, 2],
+        response_length=1,
+        loss_mask=[1],
+    )
+    extra = SampleLike(
+        index=1,
+        metadata={"parent_traj_id": "traj-extra"},
+        status=SampleLike.Status.COMPLETED,
+        tokens=[1, 2],
+        response_length=1,
+        loss_mask=[1],
+    )
+    drained = SampleLike(
+        index=2,
+        metadata={"parent_traj_id": "traj-drained"},
+        status=SampleLike.Status.COMPLETED,
+        tokens=[1, 2],
+        response_length=1,
+        loss_mask=[1],
+    )
+    completed = [
+        partial_async_rollout.CompletedGroup(0, [selected], result=[selected]),
+        partial_async_rollout.CompletedGroup(1, [extra], result=[extra]),
+    ]
+
+    class Worker:
+        def __init__(self):
+            self.staleness = partial_async_rollout.StalenessTracker(
+                partial_async_rollout.config_from_args(SimpleNamespace())
+            )
+
+        def get_completed_groups(self):
+            nonlocal completed
+            result, completed = completed, []
+            return result
+
+        def queued_completed_count(self):
+            return 0
+
+    monkeypatch.setattr(
+        partial_async_rollout,
+        "get_global_partial_worker",
+        lambda args, data_buffer, rollout_id=None: Worker(),
+    )
+    monkeypatch.setattr(
+        partial_async_rollout,
+        "stop_global_partial_worker",
+        lambda: [
+            partial_async_rollout.CompletedGroup(2, [drained], result=[drained])
+        ],
+    )
+    monkeypatch.setattr(
+        partial_async_rollout,
+        "_should_drain_worker_on_rollout",
+        lambda args, rollout_id: True,
+    )
+    output = await partial_async_rollout.generate_rollout_partial_async_impl(
+        SimpleNamespace(
+            rollout_batch_size=2,
+            n_samples_per_prompt=1,
+            global_batch_size=1,
+        ),
+        0,
+        DataBuffer([]),
+    )
+
+    assert _samples(output) == [[selected]]
+    assert group_cleanup_calls == []
 
 
 def test_partial_async_rollout_returns_staleness_metrics(monkeypatch):
