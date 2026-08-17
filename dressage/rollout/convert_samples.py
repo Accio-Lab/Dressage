@@ -248,13 +248,6 @@ def convert_samples_to_train_data(args: Any, samples: list) -> dict:
     if tq_remote_fields:
         train_data["prompt"] = tq_layouts
     elif config_path:
-        if (
-            not bool(getattr(args, "use_opd", False))
-            or getattr(args, "opd_type", None) != "megatron"
-        ):
-            raise ValueError(
-                "MOPD train conversion requires --use-opd --opd-type megatron"
-            )
         from dressage.rollout.mopd import (
             collect_mopd_teacher_ids,
             load_mopd_config,

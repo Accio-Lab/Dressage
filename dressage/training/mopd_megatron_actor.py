@@ -1,13 +1,17 @@
-"""Dressage-owned multi-teacher extension for slime's Megatron OPD actor.
+"""Dressage-owned routed-teacher scorer for paper-standard MOPD.
 
 The upstream actor already knows how to load a Megatron teacher, switch model
-weights, compute response-token log-probabilities, and apply the OPD loss.  This
-subclass only adds the missing multi-teacher policy:
+weights and compute response-token log-probabilities. This subclass adds the
+missing multi-teacher policy:
 
 * load the configured frozen teachers into the existing pinned-CPU weight backuper;
 * partition each local DP batch by its routed teacher;
 * score only that teacher's samples; and
 * scatter the response-aligned log-probabilities back to batch order.
+
+The pure MOPD advantage and direct policy loss live in
+``dressage.training.mopd_loss``. Slime's additive ``--use-opd`` path is
+intentionally disabled.
 
 Keeping this class in Dressage prevents slime from depending on Dressage's
 configuration schema or hard-coding MOPD route names.
@@ -132,7 +136,7 @@ def build_teacher_subset(
 
 
 class MOPDMegatronTrainRayActor(MegatronTrainRayActor):
-    """Megatron actor that extends stock single-teacher OPD to routed teachers."""
+    """Megatron actor that scores every sample with its routed frozen teacher."""
 
     def init(
         self,
@@ -149,11 +153,11 @@ class MOPDMegatronTrainRayActor(MegatronTrainRayActor):
             with_ref=with_ref,
             with_opd_teacher=False,
         )
-        if args.debug_rollout_only or role != "actor" or not with_opd_teacher:
+        if args.debug_rollout_only or role != "actor":
             return start_rollout_id
 
-        # Slime invokes this hook after OPD advantages are available and before
-        # its normal rollout-data logging. Chain any caller-provided hook.
+        # Slime invokes this hook after the custom MOPD advantages are available
+        # and before its normal rollout-data logging. Chain any caller hook.
         self._base_rollout_data_postprocess = self.rollout_data_postprocess
         self.rollout_data_postprocess = self._postprocess_mopd_metrics
         self._active_mopd_teacher_ids: list[str] | None = None

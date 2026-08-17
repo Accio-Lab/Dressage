@@ -1,8 +1,9 @@
 """Slime train loop using its native ``actor_cls`` factory hook for MOPD.
 
-The loop intentionally mirrors upstream ``slime/train.py``. The only semantic
-delta is passing ``MOPDMegatronTrainRayActor`` to
-``create_training_models(..., actor_cls=...)``. No Slime module is patched.
+The loop intentionally mirrors upstream ``slime/train.py``. The semantic
+deltas are selecting and validating the pure-MOPD objective, then passing
+``MOPDMegatronTrainRayActor`` to ``create_training_models(..., actor_cls=...)``.
+No Slime module is patched.
 """
 
 from __future__ import annotations
@@ -19,9 +20,40 @@ from slime.utils.logging_utils import configure_logger, finish_tracking, init_tr
 from slime.utils.misc import should_run_periodic_action
 
 from dressage.training.mopd_megatron_actor import MOPDMegatronTrainRayActor
+from dressage.training.mopd_loss import validate_pure_mopd_args
+
+
+def add_mopd_arguments(parser):
+    """Add Dressage-owned pure-MOPD options to Slime's parser."""
+    parser.add_argument(
+        "--mopd-advantage-clip",
+        type=float,
+        default=5.0,
+        help="Symmetric token-advantage clip for pure MOPD. Default: 5.0.",
+    )
+    return parser
+
+
+def parse_mopd_args():
+    """Parse Slime arguments and assign the dedicated MOPD identity.
+
+    Slime validates the parser's built-in estimator choices before invoking a
+    custom-advantage hook. The MOPD entrypoint keeps that parser contract, then
+    assigns ``mopd`` before rollout conversion and training. The custom hook
+    handles the objective before built-in estimator dispatch.
+    """
+    args = parse_args(add_mopd_arguments)
+    if args.advantage_estimator != "grpo":
+        raise ValueError(
+            "dressage.training.mopd_train owns the estimator; do not pass "
+            "--advantage-estimator"
+        )
+    args.advantage_estimator = "mopd"
+    return args
 
 
 def train(args) -> None:
+    validate_pure_mopd_args(args)
     configure_logger()
     release_train = args.release_train
 
@@ -117,7 +149,7 @@ def train(args) -> None:
 
 
 def main() -> None:
-    train(parse_args())
+    train(parse_mopd_args())
 
 
 if __name__ == "__main__":

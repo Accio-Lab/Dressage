@@ -1,4 +1,4 @@
-# Metadata-routed multi-teacher OPD
+# Metadata-routed multi-teacher MOPD
 
 Dressage MOPD trains one Megatron student from multiple frozen Megatron
 teachers on the same actor GPUs. Every teacher and the student must have the
@@ -11,11 +11,34 @@ checkpoint is loaded once and copied into Slime's existing pinned-CPU
 that teacher's subset, and then restores the student before training. GPU model
 memory is reused; CPU memory grows with the number of teachers.
 
+## Objective
+
+For each response token sampled on-policy from the student, Dressage computes
+the stopped-gradient advantage
+
+```text
+A_t = clip(log pi_teacher(y_t) - log pi_student_old(y_t), -5, 5)
+```
+
+and minimizes the direct policy-gradient loss
+
+```text
+L = -mean(A_t * log pi_student_current(y_t)).
+```
+
+This is the paper-standard MOPD objective. Environment reward remains
+available for monitoring, but is not read by the advantage or loss. There is
+no GRPO return, PPO ratio/clipping, value target, entropy bonus, or additive
+AT-KL/OPD term. The public launcher fails closed on N greater than one and on
+options that are incompatible with the dedicated MOPD objective.
+
 ## Experiment snapshot
 
-The figure below shows a 20-step MOPD run on ALFWorld and HotpotQA with seed
-1234. Dark lines are centered five-step rolling means, and light lines are raw
-step values.
+The figure below is a historical 20-step run on ALFWorld and HotpotQA with seed
+1234. It is retained as a routing and systems snapshot; its objective metrics
+are not directly comparable with the dedicated MOPD path documented below.
+Dark lines are centered five-step rolling means, and light lines are raw step
+values.
 
 ![MOPD open training dynamics](../assets/mopd_open_dynamics_8panel.png)
 
@@ -41,7 +64,7 @@ The implementation uses:
 - upstream `create_training_models(..., actor_cls=...)` to install the
   Dressage-owned rotating actor without monkey-patching a Slime module;
 - Slime's `TensorBackuper`, checkpoint loader, `compute_log_prob`, DP
-  partitioning, and OPD loss.
+  partitioning, and custom advantage/loss hooks.
 
 The small `dressage.training.mopd_train` driver mirrors upstream `train.py`
 because upstream exposes `actor_cls` at the model factory but not yet on the
@@ -79,20 +102,22 @@ For every DP-local batch:
 3. Restore that teacher from pinned CPU memory to the shared model buffers.
 4. Compute response-token log-probabilities only for its routed samples.
 5. Repeat for other distinct teachers and scatter results to original order.
-6. Restore the student/old actor.
-7. Let stock Slime compute student log-probs, OPD advantages, backward, and the
-   optimizer step.
+6. Restore the student/old actor and compute its response-token log-probability.
+7. Compute the stopped teacher-minus-old-student advantage and apply the direct
+   `-A_t * log pi_student_current` loss.
 
-The launcher intentionally uses:
+The launcher intentionally uses Dressage's custom objective hooks:
 
 ```text
---use-opd --opd-type megatron --opd-teacher-load <first-teacher>
+--loss-type custom_loss
+--custom-advantage-function-path dressage.training.mopd_loss.compute_mopd_advantages
+--custom-loss-function-path dressage.training.mopd_loss.mopd_policy_loss
 ```
 
-The first teacher path satisfies Slime's stock argument validation and tells
-the actor factory that an OPD teacher is needed. `MOPDMegatronTrainRayActor`
-suppresses the stock single-teacher load and loads all configured named
-teachers instead.
+`MOPDMegatronTrainRayActor` loads all configured named teachers independently
+of Slime's generic `--use-opd` switch. The MOPD entrypoint labels the running
+estimator `mopd` after upstream argument parsing; no Slime source patch is
+required.
 
 ## Launch
 
@@ -102,8 +127,8 @@ export DRESSAGE_MOPD_TEACHER_CONFIG=/path/to/mopd.json
 TP_SIZE=4 \
 CP_SIZE=1 \
 ROLLOUT_BATCH_SIZE=16 \
-N_SAMPLES_PER_PROMPT=8 \
-GLOBAL_BATCH_SIZE=128 \
+N_SAMPLES_PER_PROMPT=1 \
+GLOBAL_BATCH_SIZE=16 \
 bash examples/scripts/run_mopd_qwen3.5_sync.sh
 ```
 
@@ -116,8 +141,10 @@ WANDB_GROUP=mopd-alfworld-hotpotqa \
 bash examples/scripts/run_mopd_qwen3.5_sync.sh
 ```
 
-In addition to Slime's global training metrics, Dressage logs per-teacher
-trainable-trajectory reward and sampled-token reverse-KL curves under
+In addition to Slime's global training metrics, Dressage logs the direct loss,
+sampled-token reverse-KL estimate, advantage statistics, and within-update KL
+under `train/mopd_*`. It also logs per-teacher trainable-trajectory reward and
+sampled-token reverse-KL curves under
 `rollout/mopd/raw_reward_trainable_trajectory_mean/<teacher_id>` and
 `rollout/mopd/opd_reverse_kl_train_aggregation_mean/<teacher_id>`.
 `SEED` and `ROLLOUT_SEED` are forwarded explicitly by the launcher.
