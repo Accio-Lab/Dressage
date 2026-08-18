@@ -118,6 +118,7 @@ class BindingInfo(BaseModel):
     router_api_path: str
     bound_session_id: str
     bound_instance_id: str
+    bound_sandbox_id: str | None = None
     system_prompt: RuntimeSystemPrompt | None = None
     runtime_dir: str
     registered_at: datetime
@@ -170,6 +171,7 @@ class RegisterRequest(BaseModel):
     router_api_path: str = "/v1"
     bound_session_id: str | None = None
     bound_instance_id: str | None = None
+    bound_sandbox_id: str | None = None
     system_prompt_file: str | None = None
     backend_options: dict[str, Any] = Field(default_factory=dict)
     server_config: ServerConfigOverride | None = None

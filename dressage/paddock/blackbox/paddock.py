@@ -178,6 +178,7 @@ class BlackboxAgentPaddock(BlackboxPaddock):
             server_config=_server_config_for_provider(self._provider.name, blackbox_type),
             router_api_path=router_api_path,
             system_prompt_file=system_prompt_file,
+            sandbox_id=state.sandbox_id,
         )
 
     async def call_agent(

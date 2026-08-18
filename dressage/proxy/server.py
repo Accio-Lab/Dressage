@@ -14,7 +14,7 @@ import uuid
 from contextlib import asynccontextmanager
 
 import httpx
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
@@ -55,6 +55,14 @@ from .reasoning_parser import ProxyReasoningParser, canonicalize_reasoning_conte
 from .routed_experts import canonicalize_routed_experts
 from .session_manager import Route, Session, SessionFinalizedError, SessionManager, StepRecord
 from .sglang_client import SGLangRouterClient
+from .tool_call_hooks import (
+    ToolCallContext,
+    ToolCallHookChain,
+    ToolCallHookError,
+    build_tool_call_idempotency_key,
+    build_tool_call_hook_chain,
+    load_tool_call_hooks,
+)
 from .tool_call_parser import (
     ModelToolCallParserRegistry,
     ProxyToolCallParser,
@@ -131,36 +139,51 @@ def _consume_task_exception(task: asyncio.Task[Any]) -> None:
         task.exception()
 
 
-def _positive_int(value: str) -> int:
-    try:
-        parsed = int(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("must be an integer") from exc
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("must be greater than 0")
-    return parsed
+def _bounded_number(
+    *,
+    kind: type[int] | type[float],
+    minimum: float,
+    exclusive: bool,
+) -> Callable[[str], int | float]:
+    """Build an argparse ``type=`` parser for a numeric CLI argument.
+
+    The four call sites below previously repeated the same parse / range /
+    error-message boilerplate; this factory keeps their behavior (and the
+    exact error strings) identical while collapsing them into one place.
+    """
+
+    kind_name = "an integer" if kind is int else "a number"
+    if exclusive:
+        bound = "greater than"
+        threshold = minimum
+    else:
+        bound = "greater than or equal to"
+        threshold = minimum
+    finite = kind is float
+    range_message = (
+        f"must be a finite number {bound} {threshold:g}"
+        if finite
+        else f"must be {bound} {threshold:g}"
+    )
+
+    def parse(value: str) -> int | float:
+        try:
+            parsed = kind(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"must be {kind_name}") from exc
+        if finite and not math.isfinite(parsed):
+            raise argparse.ArgumentTypeError(range_message)
+        if parsed < threshold or (exclusive and parsed == threshold):
+            raise argparse.ArgumentTypeError(range_message)
+        return parsed
+
+    return parse
 
 
-def _non_negative_int(value: str) -> int:
-    try:
-        parsed = int(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("must be an integer") from exc
-    if parsed < 0:
-        raise argparse.ArgumentTypeError("must be greater than or equal to 0")
-    return parsed
-
-
-def _non_negative_finite_float(value: str) -> float:
-    try:
-        parsed = float(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("must be a number") from exc
-    if not math.isfinite(parsed) or parsed < 0:
-        raise argparse.ArgumentTypeError(
-            "must be a finite number greater than or equal to 0"
-        )
-    return parsed
+_positive_int = _bounded_number(kind=int, minimum=0, exclusive=True)
+_non_negative_int = _bounded_number(kind=int, minimum=0, exclusive=False)
+_non_negative_finite_float = _bounded_number(kind=float, minimum=0, exclusive=False)
+_positive_float = _bounded_number(kind=float, minimum=0, exclusive=True)
 
 
 def _real_token_version(value: Any) -> str | None:
@@ -482,6 +505,15 @@ def _runtime_ids_from_request(
     return session_id, instance_id, turn_id
 
 
+def _sandbox_id_from_request(request: Request, body: dict[str, Any]) -> str | None:
+    """Provider-native sandbox id forwarded by the in-sandbox rollout proxy."""
+
+    return (
+        request.headers.get("X-Dressage-Sandbox-Id")
+        or body.get("sandbox_id")
+    )
+
+
 def _assistant_message(
     content: str | None,
     tool_calls: list[dict] | None,
@@ -652,6 +684,9 @@ def create_app(
     transfer_params: tuple[str, ...] | list[str] | str | None = None,
     transfer_queue_store_id: str | None = None,
     transfer_queue_runtime: TransferQueueRuntime | None = None,
+    tool_call_hooks: str | tuple[str, ...] | list[str] | None = None,
+    tool_call_hook_chain: ToolCallHookChain | None = None,
+    tool_call_hook_before_timeout: float | None = None,
 ) -> FastAPI:
     """Create the Dressage proxy FastAPI app."""
 
@@ -724,6 +759,17 @@ def create_app(
             "local reasoning parser only supports qwen3/qwen3_5, "
             f"got {model_reasoning_type!r}"
         )
+    if tool_call_hook_chain is not None and tool_call_hooks:
+        raise ValueError(
+            "tool_call_hook_chain and tool_call_hooks are mutually exclusive"
+        )
+    if (
+        tool_call_hook_before_timeout is not None
+        and tool_call_hook_before_timeout <= 0
+    ):
+        raise ValueError(
+            "tool_call_hook_before_timeout must be greater than 0 when provided"
+        )
 
     build_defaults = token_build_defaults(
         token_build_mode=token_build_mode,
@@ -756,6 +802,10 @@ def create_app(
 
     trajectory_store = trajectory_store or TrajectoryStore()
     session_manager = session_manager or SessionManager()
+    tool_call_hook_chain = tool_call_hook_chain or build_tool_call_hook_chain(
+        load_tool_call_hooks(tool_call_hooks),
+        before_timeout=tool_call_hook_before_timeout,
+    )
     sglang_client = sglang_client or SGLangRouterClient(
         sglang_router_url,
         return_routed_experts=use_rollout_routing_replay,
@@ -995,6 +1045,117 @@ def create_app(
                 )
             raise
 
+    async def _dispatch_tool_call_hooks(
+        *,
+        stage: str,
+        session_id: str,
+        sandbox_id: str | None,
+        instance_id: str | None,
+        turn_id: str | None,
+        step_index: int,
+        metadata: dict[str, Any],
+        tool_calls: list[dict] | None = None,
+    ) -> None:
+        """Dispatch one tool-call hook stage; no-op without a chain.
+
+        Required-hook failures surface as HTTP 502 so the blackbox agent
+        aborts the rollout instead of executing tools against an
+        unprepared sandbox.
+        """
+
+        if tool_call_hook_chain is None:
+            return
+        if not sandbox_id:
+            logger.warning(
+                "tool-call hooks are configured but the request carries no "
+                "sandbox id; skipping %s dispatch: session_id=%s",
+                stage,
+                session_id,
+            )
+            return
+        ctx = ToolCallContext(
+            instance_id=instance_id,
+            session_id=session_id,
+            turn_id=turn_id,
+            step_index=step_index,
+            sandbox_id=sandbox_id,
+            tool_calls=tool_calls,
+            idempotency_key=build_tool_call_idempotency_key(
+                session_id=session_id,
+                turn_id=turn_id,
+                step_index=step_index,
+                stage=stage,
+            ),
+            stage_metadata=metadata,
+        )
+        try:
+            if stage == "before":
+                await tool_call_hook_chain.run_before(ctx)
+            else:
+                await tool_call_hook_chain.run_after(ctx)
+        except ToolCallHookError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": "tool_call_hook_failed",
+                    "stage": stage,
+                    "message": str(exc),
+                    "session_id": session_id,
+                    "instance_id": instance_id,
+                },
+            ) from exc
+
+    async def _dispatch_after_tool_call_hooks(
+        *,
+        session_id: str,
+        sandbox_id: str | None,
+        instance_id: str | None,
+        turn_id: str | None,
+        step_index: int,
+        normalized_request_messages: list[dict],
+        metadata: dict[str, Any],
+    ) -> None:
+        """after_tool_call: the request tail is a tool result message."""
+
+        if tool_call_hook_chain is None:
+            return
+        if not normalized_request_messages:
+            return
+        if normalized_request_messages[-1].get("role") != "tool":
+            return
+        await _dispatch_tool_call_hooks(
+            stage="after",
+            session_id=session_id,
+            sandbox_id=sandbox_id,
+            instance_id=instance_id,
+            turn_id=turn_id,
+            step_index=step_index,
+            metadata=metadata,
+        )
+
+    async def _dispatch_before_tool_call_hooks(
+        *,
+        session_id: str,
+        sandbox_id: str | None,
+        instance_id: str | None,
+        turn_id: str | None,
+        step_index: int,
+        tool_calls: list[dict],
+        metadata: dict[str, Any],
+    ) -> None:
+        """before_tool_call: parsed tool_calls are about to execute."""
+
+        await _dispatch_tool_call_hooks(
+            stage="before",
+            session_id=session_id,
+            sandbox_id=sandbox_id,
+            instance_id=instance_id,
+            turn_id=turn_id,
+            step_index=step_index,
+            metadata=metadata,
+            tool_calls=tool_calls,
+        )
+
     def _step_routed_experts_row_count(step: StepRecord) -> int:
         if token_build_mode == "snapshot":
             return max(0, len(step.all_token_ids) - 1)
@@ -1186,6 +1347,8 @@ def create_app(
             extra_info["snapshot_logprobs_invalid"] = True
         if mask_nonlast_version_tokens:
             extra_info["mask_nonlast_version_tokens"] = True
+        if step.tool_call_hook_metadata:
+            extra_info["tool_call_hooks"] = dict(step.tool_call_hook_metadata)
 
         record = {
             "uid": str(uuid.uuid4()),
@@ -1295,6 +1458,12 @@ def create_app(
             extra_info["tito_incremental_tokenization_failed"] = True
         if mask_nonlast_version_tokens:
             extra_info["mask_nonlast_version_tokens"] = True
+        hook_metadata: dict[str, Any] = {}
+        for step in steps:
+            for key, value in step.tool_call_hook_metadata.items():
+                hook_metadata.setdefault(key, []).append(value)
+        if hook_metadata:
+            extra_info["tool_call_hooks"] = hook_metadata
 
         response_logprobs = build_concatenated_logprobs(
             step_logprobs,
@@ -1661,6 +1830,7 @@ def create_app(
         include_usage = stream_options.get("include_usage", True) is not False
 
         session_id, instance_id, turn_id = _runtime_ids_from_request(request, body)
+        sandbox_id = _sandbox_id_from_request(request, body)
         try:
             session, _ = session_manager.get_or_create_session(
                 session_id, messages, instance_id=instance_id
@@ -1691,6 +1861,16 @@ def create_app(
                 partial_rollout=partial_rollout,
             )
             normalized_request_messages = mask_builder.normalize_template_messages(messages)
+            tool_call_hook_metadata: dict[str, Any] = {}
+            await _dispatch_after_tool_call_hooks(
+                session_id=session_id,
+                sandbox_id=sandbox_id,
+                instance_id=instance_id,
+                turn_id=effective_turn_id,
+                step_index=len(session.steps),
+                normalized_request_messages=normalized_request_messages,
+                metadata=tool_call_hook_metadata,
+            )
             current_tools_hash = _tools_hash(
                 tools,
                 none_equals_empty=none_equals_empty_tools,
@@ -2014,6 +2194,15 @@ def create_app(
                 content = _strip_public_stop_markers(content)
                 if tool_calls:
                     finish_reason = "tool_calls"
+                    await _dispatch_before_tool_call_hooks(
+                        session_id=session_id,
+                        sandbox_id=sandbox_id,
+                        instance_id=instance_id,
+                        turn_id=effective_turn_id,
+                        step_index=len(session.steps),
+                        tool_calls=tool_calls,
+                        metadata=tool_call_hook_metadata,
+                    )
 
             full_messages = messages + [
                 _assistant_message(
@@ -2155,6 +2344,7 @@ def create_app(
                 finish_reason=finish_reason,
                 request_version=str(request_version),
                 response_version=str(response_version),
+                tool_call_hook_metadata=tool_call_hook_metadata,
             )
 
             if output_overflow:
@@ -2309,6 +2499,11 @@ def create_app(
         _check_auth(request)
         body = await request.json()
         session_id = str(body["session_id"])
+        purged_hook_keys = (
+            tool_call_hook_chain.purge_session(session_id)
+            if tool_call_hook_chain is not None
+            else 0
+        )
 
         if not enable_transfer_queue:
             session_removed = session_manager.discard_session(session_id)
@@ -2318,6 +2513,7 @@ def create_app(
                 "session_id": session_id,
                 "session_removed": session_removed,
                 "segments_removed": len(removed_segments),
+                "tool_call_hook_keys_purged": purged_hook_keys,
             }
 
         async def _discard_state(active_session: Session | None) -> dict[str, Any]:
@@ -2356,6 +2552,7 @@ def create_app(
                 "session_id": session_id,
                 "session_removed": session_removed,
                 "segments_removed": len(removed_segments),
+                "tool_call_hook_keys_purged": purged_hook_keys,
             }
 
         active_session = session_manager.get_session(session_id)
@@ -2500,6 +2697,11 @@ def create_app(
             )
             if finalized is not session:  # defensive; request_lock owns finalize
                 raise RuntimeError("session changed during atomic finalization")
+
+        if tool_call_hook_chain is not None:
+            purged = tool_call_hook_chain.purge_session(session_id)
+            if purged:
+                finalization_result["tool_call_hook_keys_purged"] = purged
 
         return finalization_result
 
@@ -2830,6 +3032,22 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Trajectory fields to offload: logprobs routed_experts.",
     )
+    parser.add_argument(
+        "--tool-call-hooks",
+        nargs="+",
+        default=None,
+        help=(
+            "Pluggable tool-call side-effect hooks (run-level). Each entry is "
+            "a registered hook name or 'module:ClassName' / file path that "
+            "self-registers on import."
+        ),
+    )
+    parser.add_argument(
+        "--tool-call-hook-before-timeout",
+        type=_positive_float,
+        default=None,
+        help="Per-hook timeout in seconds for before_tool_call dispatches.",
+    )
     args = parser.parse_args()
     if not args.enable_transfer_queue:
         args.transfer_queue_config = None
@@ -2896,6 +3114,8 @@ def main() -> None:
         transfer_queue_config=args.transfer_queue_config,
         transfer_queue_retention_seconds=args.transfer_queue_retention_seconds,
         transfer_params=args.transfer_params,
+        tool_call_hooks=args.tool_call_hooks,
+        tool_call_hook_before_timeout=args.tool_call_hook_before_timeout,
     )
     uvicorn.run(app, host=args.host, port=args.port)
 
