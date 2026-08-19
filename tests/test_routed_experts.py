@@ -18,10 +18,9 @@ def _encode(values: list[int]) -> str:
 def _decode(chunks: list[dict]) -> list[int]:
     values: list[int] = []
     for chunk in chunks:
-        decoded = np.frombuffer(
-            base64.b64decode(chunk["data"]),
-            dtype=np.dtype(chunk.get("dtype", "int32")),
-        )
+        decoded = np.asarray(chunk["data"])
+        if decoded.dtype != np.dtype(chunk.get("dtype", "int32")):
+            raise AssertionError("stored dtype does not match the chunk dtype")
         values.extend(decoded.tolist())
     return values
 
@@ -114,7 +113,8 @@ def test_canonicalize_routed_experts_converts_expert_id_dtype(
     )
 
     assert chunks[0]["dtype"] == expert_id_dtype
-    assert len(base64.b64decode(chunks[0]["data"])) == expected_bytes
+    assert isinstance(chunks[0]["data"], np.ndarray)
+    assert chunks[0]["data"].nbytes == expected_bytes
     assert _decode(chunks) == [1, 2, 3, 4, 5, 6]
 
 

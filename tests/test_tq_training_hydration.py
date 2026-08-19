@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 from types import SimpleNamespace
 
 import numpy as np
@@ -91,9 +90,7 @@ def _routed_experts_chunks(
 ) -> list[dict]:
     return [
         {
-            "data": base64.b64encode(
-                values.astype(dtype, copy=False).tobytes()
-            ).decode("ascii"),
+            "data": np.ascontiguousarray(values.astype(dtype, copy=False)),
             "row_count": values.shape[0],
             "dtype": dtype,
         }

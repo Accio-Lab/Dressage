@@ -70,11 +70,17 @@ def canonicalize_routed_experts(
                 raise ValueError(
                     f"routed-expert id does not fit in {expert_id_dtype}"
                 )
-            selected = selected_values.astype(storage_dtype).tobytes()
+            stored = selected_values.astype(storage_dtype)
+        else:
+            stored = selected_values
         selected_rows = overlap_end - overlap_start
         result.append(
             {
-                "data": _base64.b64encode(selected).decode("ascii"),
+                # Store routed-expert ids as a numpy array (not base64 ASCII).
+                # TransferQueue's msgpack codec serializes ndarrays zero-copy
+                # (CUSTOM_TYPE_NUMPY), dropping the +33% base64 inflation that
+                # dominated the StorageUnit footprint (R3 ids ~92% of payload).
+                "data": np.ascontiguousarray(stored),
                 "row_count": selected_rows,
                 "dtype": expert_id_dtype,
             }
