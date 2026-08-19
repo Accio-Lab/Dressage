@@ -7,6 +7,7 @@ fallback, plus end-to-end ``convert_samples_to_train_data``.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from enum import Enum
 from types import SimpleNamespace
@@ -349,6 +350,24 @@ def test_convert_samples_trajectory_equal_when_non_grpo_estimator():
     train_data = cs.convert_samples_to_train_data(args, [s1, s2])
     # trajectory-equal: rollout 7 total mask = 2+1 = 3
     assert train_data["rollout_mask_sums"] == [3, 3]
+
+
+def test_convert_samples_routes_pure_mopd_without_additive_opd(tmp_path):
+    config_path = tmp_path / "mopd.json"
+    config_path.write_text(
+        json.dumps({"teachers": {"a": {"load": "/checkpoint/a"}}}),
+        encoding="utf-8",
+    )
+    args = _traj_equal_args()
+    args.advantage_estimator = "mopd"
+    args.n_samples_per_prompt = 1
+    args.mopd_teacher_config = str(config_path)
+    sample = _real_seg(ptid="t1", instance_id="p1", mask=[1, 1], index=0, rollout_id=7)
+    sample.metadata["teacher_id"] = "a"
+
+    train_data = cs.convert_samples_to_train_data(args, [sample])
+
+    assert train_data["prompt"] == ["a"]
 
 
 def test_aborted_no_grad_sample_passes_convert_samples():

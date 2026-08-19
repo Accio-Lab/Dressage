@@ -1,5 +1,5 @@
 #!/bin/bash
-# Same-base multi-teacher OPD with mixed blackbox/whitebox rollouts.
+# Paper-standard multi-teacher on-policy distillation (MOPD).
 #
 # Dataset routes, teacher checkpoints, reward modules, and task worker env keys
 # come from DRESSAGE_MOPD_TEACHER_CONFIG. Platform setup and credentials remain
@@ -173,19 +173,47 @@ export DRESSAGE_ALLOW_EMPTY_TRAIN_BATCH="${DRESSAGE_ALLOW_EMPTY_TRAIN_BATCH:-0}"
 export DRESSAGE_SYNC_FAILED_GROUP_REPLACEMENT_MULTIPLIER="${DRESSAGE_SYNC_FAILED_GROUP_REPLACEMENT_MULTIPLIER:-2}"
 : "${DRESSAGE_REWARD_MODULES:?MOPD config must declare reward_modules or set DRESSAGE_REWARD_MODULES}"
 
-MOPD_ARGS=(
-  --use-opd
-  --opd-type megatron
-  --opd-kl-coef "${OPD_KL_COEF:-0.1}"
-  --opd-teacher-load "${MOPD_LAUNCH_CONFIG[5]}"
-)
-if [[ -n "${MOPD_LAUNCH_CONFIG[6]:-}" ]]; then
-  MOPD_ARGS+=(--opd-teacher-ckpt-step "${MOPD_LAUNCH_CONFIG[6]}")
+N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-1}"
+NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-1}"
+ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-16}"
+GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-${ROLLOUT_BATCH_SIZE}}"
+MOPD_ADVANTAGE_CLIP="${MOPD_ADVANTAGE_CLIP:-5.0}"
+if [[ "${N_SAMPLES_PER_PROMPT}" != "1" ]]; then
+  echo "Paper-standard MOPD requires N_SAMPLES_PER_PROMPT=1; got ${N_SAMPLES_PER_PROMPT}." >&2
+  exit 1
 fi
+if [[ "${NUM_STEPS_PER_ROLLOUT}" != "1" ]]; then
+  echo "Paper-standard MOPD requires NUM_STEPS_PER_ROLLOUT=1; got ${NUM_STEPS_PER_ROLLOUT}." >&2
+  exit 1
+fi
+if [[ "${GLOBAL_BATCH_SIZE}" != "${ROLLOUT_BATCH_SIZE}" ]]; then
+  echo "Paper-standard MOPD requires GLOBAL_BATCH_SIZE=ROLLOUT_BATCH_SIZE; got ${GLOBAL_BATCH_SIZE} != ${ROLLOUT_BATCH_SIZE}." >&2
+  exit 1
+fi
+if [[ -n "${OPD_KL_COEF:-}" ]]; then
+  echo "OPD_KL_COEF is not used by the dedicated MOPD objective; unset it." >&2
+  exit 1
+fi
+if [[ "${NORMALIZE_ADVANTAGES:-0}" == "1" || "${USE_TIS:-0}" == "1" || "${USE_KL_LOSS:-0}" == "1" ]]; then
+  echo "Pure MOPD forbids advantage normalization, TIS, and auxiliary KL loss." >&2
+  exit 1
+fi
+if [[ "${ENTROPY_COEF:-0.0}" != "0" && "${ENTROPY_COEF:-0.0}" != "0.0" ]]; then
+  echo "Pure MOPD requires ENTROPY_COEF=0; got ${ENTROPY_COEF}." >&2
+  exit 1
+fi
+
+PURE_MOPD_ARGS=(
+  --mopd-advantage-clip "${MOPD_ADVANTAGE_CLIP}"
+  --loss-type custom_loss
+  --custom-advantage-function-path dressage.training.mopd_loss.compute_mopd_advantages
+  --custom-loss-function-path dressage.training.mopd_loss.mopd_policy_loss
+  --disable-rewards-normalization
+)
 
 echo "effective_parallelism: total_actor_gpus=${TOTAL_ACTOR_GPUS} TP_SIZE=${TP_SIZE} CP_SIZE=${CP_SIZE} DP_SIZE=${DP_SIZE} CONTEXT_WINDOW=${CONTEXT_WINDOW} ROLLOUT_MAX_CONTEXT_LEN=${ROLLOUT_MAX_CONTEXT_LEN}"
 echo "effective_blackbox: provider=${DRESSAGE_SANDBOX_PROVIDER} proxy=${DRESSAGE_PROXY_URL} backend_timeout=${DRESSAGE_BLACKBOX_BACKEND_TIMEOUT} max_steps=${DRESSAGE_BLACKBOX_MAX_STEPS} compact_threshold=${DRESSAGE_BLACKBOX_COMPACT_THRESHOLD}"
-echo "effective_mopd: teacher_config=${DRESSAGE_MOPD_TEACHER_CONFIG} modes=${MOPD_LAUNCH_CONFIG[1]:-legacy} opd_kl_coef=${OPD_KL_COEF:-0.1}"
+echo "effective_mopd: objective=pure teacher_config=${DRESSAGE_MOPD_TEACHER_CONFIG} modes=${MOPD_LAUNCH_CONFIG[1]:-legacy} advantage=clip(teacher_logp-student_old_logp,+/-${MOPD_ADVANTAGE_CLIP}) loss=-advantage*student_current_logp env_reward=monitor_only"
 
 TOKENIZER_PATH="${TOKENIZER_PATH:-${MODEL_ROOT}/${MODEL_NAME}}"
 PROXY_ARGS=(
@@ -231,14 +259,14 @@ ROLLOUT_ARGS=(
   --metadata-key metadata
   --rollout-shuffle
   --num-rollout "${NUM_ROLLOUT:-500}"
-  --rollout-batch-size "${ROLLOUT_BATCH_SIZE:-16}"
-  --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT:-8}"
+  --rollout-batch-size "${ROLLOUT_BATCH_SIZE}"
+  --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT}"
   --rollout-max-response-len "${ROLLOUT_MAX_RESPONSE_LEN}"
   --rollout-max-context-len "${ROLLOUT_MAX_CONTEXT_LEN}"
   --rollout-temperature "${ROLLOUT_TEMPERATURE:-1.0}"
   --rollout-seed "${ROLLOUT_SEED:-42}"
-  --num-steps-per-rollout "${NUM_STEPS_PER_ROLLOUT:-1}"
-  --global-batch-size "${GLOBAL_BATCH_SIZE:-128}"
+  --num-steps-per-rollout "${NUM_STEPS_PER_ROLLOUT}"
+  --global-batch-size "${GLOBAL_BATCH_SIZE}"
   --balance-data
   --rollout-global-dataset
 )
@@ -257,26 +285,6 @@ PERF_ARGS=(
   --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
   --log-probs-chunk-size "${LOG_PROBS_CHUNK_SIZE:-1024}"
 )
-
-GRPO_ARGS=(
-  --advantage-estimator grpo
-  --entropy-coef "${ENTROPY_COEF:-0.0}"
-  --eps-clip "${EPS_CLIP:-0.2}"
-  --eps-clip-high "${EPS_CLIP_HIGH:-0.28}"
-)
-if [[ "${NORMALIZE_ADVANTAGES:-0}" == "1" ]]; then
-  GRPO_ARGS+=(--normalize-advantages)
-fi
-if [[ "${USE_TIS:-0}" == "1" ]]; then
-  GRPO_ARGS+=(--use-tis)
-fi
-if [[ "${USE_KL_LOSS:-0}" == "1" ]]; then
-  GRPO_ARGS+=(
-    --use-kl-loss
-    --kl-loss-coef "${KL_LOSS_COEF:-0.001}"
-    --kl-loss-type "${KL_LOSS_TYPE:-low_var_kl}"
-  )
-fi
 
 OPTIMIZER_ARGS=(
   --optimizer adam
@@ -344,6 +352,9 @@ if [[ "${MOPD_LAUNCH_DRY_RUN:-0}" == "1" ]]; then
   echo "effective_model=${MODEL_ROOT}/${MODEL_NAME} model_config=${MODEL_CONFIG}"
   echo "effective_runtime_env_keys=${DRESSAGE_EXTRA_RUNTIME_ENV_KEYS:-none}"
   echo "effective_reward_modules=${DRESSAGE_REWARD_MODULES}"
+  printf 'effective_pure_mopd_args='
+  printf ' %q' "${PURE_MOPD_ARGS[@]}"
+  printf '\n'
   exit 0
 fi
 
@@ -487,9 +498,8 @@ ray job submit --address="http://127.0.0.1:${RAY_DASHBOARD_PORT}" \
   "${CKPT_ARGS[@]}" \
   "${ROLLOUT_ARGS[@]}" \
   "${OPTIMIZER_ARGS[@]}" \
-  "${GRPO_ARGS[@]}" \
+  "${PURE_MOPD_ARGS[@]}" \
   "${WANDB_ARGS[@]}" \
   "${PERF_ARGS[@]}" \
   "${SGLANG_ARGS[@]}" \
-  "${MOPD_ARGS[@]}" \
   "${MISC_ARGS[@]}"
