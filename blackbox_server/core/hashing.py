@@ -55,6 +55,7 @@ def binding_request_fingerprint(request: RegisterRequest, router_base_url: str) 
         "router_base_url": router_base_url,
         "bound_session_id": request.bound_session_id,
         "bound_instance_id": request.bound_instance_id,
+        "bound_sandbox_id": request.bound_sandbox_id,
         "system_prompt_file": system_prompt_file,
         "backend_options": request.backend_options,
         "server_config": server_config,

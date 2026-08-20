@@ -1311,6 +1311,7 @@ class BlackboxServer:
             router_api_path=router_api_path,
             bound_session_id=request.bound_session_id or "",
             bound_instance_id=request.bound_instance_id or "",
+            bound_sandbox_id=request.bound_sandbox_id or None,
             system_prompt=system_prompt,
             runtime_dir=runtime_dir,
             registered_at=utcnow(),

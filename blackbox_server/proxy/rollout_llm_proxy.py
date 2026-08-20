@@ -59,6 +59,7 @@ class RolloutLLMProxy:
         bound_session_id: str,
         bound_instance_id: str,
         sticky_header_name: str,
+        bound_sandbox_id: str | None = None,
         max_steps: int | None = DEFAULT_PROXY_MAX_STEPS,
         default_temperature: float | None = None,
         debug_log_dir: str | Path | None = None,
@@ -75,6 +76,7 @@ class RolloutLLMProxy:
         self.router_api_path = router_api_path.rstrip("/") or "/"
         self.bound_session_id = bound_session_id
         self.bound_instance_id = bound_instance_id
+        self.bound_sandbox_id = bound_sandbox_id
         self.sticky_header_name = sticky_header_name
         self.max_steps = max_steps
         self.default_temperature = default_temperature
@@ -683,6 +685,7 @@ class RolloutLLMProxy:
                     "x-turn-id",
                     "x-dressage-partial-rollout",
                     "x-dressage-expected-version",
+                    "x-dressage-sandbox-id",
                 }
             )
         if is_anthropic:
@@ -710,6 +713,8 @@ class RolloutLLMProxy:
             self._set_header(headers, "X-Instance-Id", self.bound_instance_id)
             if turn_id:
                 self._set_header(headers, "X-Turn-Id", turn_id)
+            if self.bound_sandbox_id:
+                self._set_header(headers, "X-Dressage-Sandbox-Id", self.bound_sandbox_id)
             self._set_header(headers, "X-Dressage-Partial-Rollout", "1")
             if self._current_version is not None:
                 self._set_header(headers, "X-Dressage-Expected-Version", str(self._current_version))

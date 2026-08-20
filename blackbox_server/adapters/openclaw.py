@@ -678,6 +678,7 @@ class OpenClawAdapter(BackendAdapter):
             router_api_path=binding_context.binding.router_api_path,
             bound_session_id=bound_session_id,
             bound_instance_id=bound_instance_id,
+            bound_sandbox_id=binding_context.binding.bound_sandbox_id,
             sticky_header_name=options.proxy.sticky_header_name,
             max_steps=options.proxy.max_steps,
             default_temperature=options.proxy.default_temperature,
