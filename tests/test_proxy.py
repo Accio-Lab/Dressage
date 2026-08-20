@@ -14,6 +14,7 @@ from typing import Any
 from fastapi.testclient import TestClient
 import httpx
 from jinja2 import Environment, StrictUndefined
+import numpy as np
 import pytest
 
 from dressage.proxy import StepRecord, TrajectoryItem, TrajectorySegment, TurnRecord
@@ -636,12 +637,17 @@ def encode_routed_experts(values: list[int]) -> str:
 def decode_routed_expert_chunks(chunks: list[dict]) -> list[int]:
     values: list[int] = []
     for chunk in chunks:
-        typecode = {"uint8": "B", "uint16": "H", "int32": "i"}[
-            chunk.get("dtype", "int32")
-        ]
-        decoded = array(typecode)
-        decoded.frombytes(base64.b64decode(chunk["data"]))
-        values.extend(decoded)
+        payload = chunk["data"]
+        if isinstance(payload, np.ndarray):
+            decoded = payload
+        else:
+            decoded = np.frombuffer(
+                base64.b64decode(payload),
+                dtype=np.dtype(chunk.get("dtype", "int32")),
+            )
+        if decoded.dtype != np.dtype(chunk.get("dtype", "int32")):
+            raise AssertionError("stored dtype does not match the chunk dtype")
+        values.extend(decoded.tolist())
     return values
 
 

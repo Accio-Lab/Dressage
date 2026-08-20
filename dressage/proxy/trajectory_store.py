@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import copy
 import threading
 import time
@@ -9,10 +10,34 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
+
 from dressage.transport import (
     TQFieldLayout,
     is_tq_field_layout_dict,
 )
+
+
+def _jsonable_routed_experts_chunks(chunks: Any) -> Any:
+    """Encode ndarray chunk payloads as base64 for JSON transport.
+
+    ``canonicalize_routed_experts`` stores expert ids as numpy arrays so
+    TransferQueue's msgpack codec can serialize them zero-copy. The local
+    (non-offloaded) path still crosses a JSON boundary at
+    ``/trajectory/read``, where ndarrays must use the base64 wire format.
+    """
+
+    if not isinstance(chunks, list):
+        return chunks
+    encoded: list[Any] = []
+    for chunk in chunks:
+        if isinstance(chunk, dict) and isinstance(chunk.get("data"), np.ndarray):
+            chunk = {
+                **chunk,
+                "data": base64.b64encode(chunk["data"].tobytes()).decode("ascii"),
+            }
+        encoded.append(chunk)
+    return encoded
 
 
 @dataclass
@@ -72,7 +97,7 @@ class TrajectorySegment:
             data["routed_experts_chunks"] = (
                 self.routed_experts_chunks.to_dict()
                 if isinstance(self.routed_experts_chunks, TQFieldLayout)
-                else self.routed_experts_chunks
+                else _jsonable_routed_experts_chunks(self.routed_experts_chunks)
             )
         return data
 

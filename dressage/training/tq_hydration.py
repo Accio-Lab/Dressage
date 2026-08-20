@@ -174,21 +174,15 @@ def _materialize_logprobs(
 
 
 def _decode_routed_experts_chunks(value: Any, width: int) -> torch.Tensor:
-    try:
-        import pybase64
-    except ImportError:
-        import base64 as pybase64
-
     arrays = []
     for chunk in value or []:
         row_count = int(chunk["row_count"])
         dtype_name = str(chunk.get("dtype", "int32"))
         if dtype_name not in {"uint8", "uint16", "int32"}:
             raise ValueError(f"unsupported routed experts dtype: {dtype_name}")
-        decoded = np.frombuffer(
-            pybase64.b64decode(str(chunk["data"]).encode("ascii")),
-            dtype=np.dtype(dtype_name),
-        ).astype(np.int32, copy=False)
+        # chunk["data"] is a numpy array stored zero-copy by TransferQueue
+        # (previously a base64 string); reinterpret to int32 for replay.
+        decoded = np.asarray(chunk["data"]).astype(np.int32, copy=False)
         if decoded.size != row_count * width:
             raise ValueError("TransferQueue routed experts chunk shape does not match")
         arrays.append(decoded.reshape(row_count, width).copy())
