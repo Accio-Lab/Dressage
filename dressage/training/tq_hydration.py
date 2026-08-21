@@ -145,6 +145,26 @@ def read_layout_values(
     return values
 
 
+def _coerce_float32_tensor(source: Any) -> torch.Tensor:
+    if isinstance(source, np.ndarray):
+        if source.dtype == np.float32:
+            return torch.from_numpy(source)
+        if source.dtype != object:
+            return torch.from_numpy(source.astype(np.float32, copy=False))
+    else:
+        try:
+            return torch.as_tensor(source, dtype=torch.float32)
+        except (TypeError, ValueError, RuntimeError):
+            pass
+    normalized = []
+    for value in source:
+        try:
+            normalized.append(float(value))
+        except (TypeError, ValueError):
+            normalized.append(0.0)
+    return torch.tensor(normalized, dtype=torch.float32)
+
+
 def _materialize_logprobs(
     layout: TQFieldLayout,
     values: Mapping[LayoutValueKey, Any],
@@ -157,19 +177,19 @@ def _materialize_logprobs(
 
     output = torch.zeros(token_count, dtype=torch.float32)
     for fragment in layout.fragments:
-        source = values[_value_key(fragment.ref)]
         source_start = int(fragment.source_start)
         target_start = int(fragment.target_start)
         length = int(fragment.length)
         copy_length = min(length, max(0, token_count - target_start))
-        for offset in range(copy_length):
-            source_index = source_start + offset
-            if source_index >= len(source):
-                break
-            try:
-                output[target_start + offset] = float(source[source_index])
-            except (TypeError, ValueError):
-                continue
+        if copy_length <= 0:
+            continue
+        source = _coerce_float32_tensor(
+            values[_value_key(fragment.ref)][
+                source_start : source_start + copy_length
+            ]
+        )
+        if source.numel() > 0:
+            output[target_start : target_start + source.numel()] = source
     return output
 
 
