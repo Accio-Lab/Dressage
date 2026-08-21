@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -537,4 +538,226 @@ def test_logprobs_preserve_proxy_padding_and_invalid_value_normalization():
     assert torch.equal(
         rollout_data["rollout_log_probs"][0],
         torch.tensor([-0.1, 0.0, 0.0], dtype=torch.float32),
+    )
+
+
+def test_logprobs_materialization_truncates_when_source_is_shorter_than_layout():
+    """A source column shorter than its fragment must truncate, not error.
+
+    This pins the legacy per-token loop behavior: it stopped copying at the
+    end of the source and left the remaining target positions at 0.0.
+    """
+
+    logprob_ref = _field_ref("step-0", "response_logprobs")
+    layout = _layout(
+        FULL_LOGPROBS_FIELD,
+        TQ_LOGPROBS_CODEC,
+        logprob_ref,
+        source_start=0,
+        target_start=1,
+        length=4,
+        token_count=5,
+        shape=(5,),
+    )
+    rollout_data = {
+        "total_lengths": [5],
+        "response_lengths": [4],
+    }
+
+    hydrate_training_layouts(
+        SimpleNamespace(use_rollout_routing_replay=False),
+        rollout_data,
+        [{FULL_LOGPROBS_FIELD: layout.to_dict()}],
+        remote_fields={FULL_LOGPROBS_FIELD},
+        batch_get=FakeBatchGet(
+            {("steps", "step-0", "response_logprobs"): [-0.1, -0.2]}
+        ),
+    )
+
+    assert torch.equal(
+        rollout_data["rollout_log_probs"][0],
+        torch.tensor([-0.1, -0.2, 0.0, 0.0], dtype=torch.float32),
+    )
+
+
+def test_logprobs_materialization_supports_numpy_and_non_numeric_values():
+    """numpy float32 columns hydrate zero-copy; junk values normalize to 0.0."""
+
+    logprob_ref = _field_ref("step-0", "response_logprobs")
+    layout = _layout(
+        FULL_LOGPROBS_FIELD,
+        TQ_LOGPROBS_CODEC,
+        logprob_ref,
+        source_start=0,
+        target_start=0,
+        length=4,
+        token_count=4,
+        shape=(4,),
+    )
+    rollout_data = {
+        "total_lengths": [4],
+        "response_lengths": [4],
+    }
+
+    hydrate_training_layouts(
+        SimpleNamespace(use_rollout_routing_replay=False),
+        rollout_data,
+        [{FULL_LOGPROBS_FIELD: layout.to_dict()}],
+        remote_fields={FULL_LOGPROBS_FIELD},
+        batch_get=FakeBatchGet(
+            {
+                ("steps", "step-0", "response_logprobs"): np.array(
+                    [-0.1, -0.2, -0.3, -0.4], dtype=np.float32
+                )
+            }
+        ),
+    )
+
+    assert torch.equal(
+        rollout_data["rollout_log_probs"][0],
+        torch.tensor([-0.1, -0.2, -0.3, -0.4], dtype=torch.float32),
+    )
+
+    junk_ref = _field_ref("step-1", "response_logprobs")
+    junk_layout = _layout(
+        FULL_LOGPROBS_FIELD,
+        TQ_LOGPROBS_CODEC,
+        junk_ref,
+        source_start=0,
+        target_start=0,
+        length=3,
+        token_count=3,
+        shape=(3,),
+    )
+    junk_rollout_data = {
+        "total_lengths": [3],
+        "response_lengths": [3],
+    }
+    hydrate_training_layouts(
+        SimpleNamespace(use_rollout_routing_replay=False),
+        junk_rollout_data,
+        [{FULL_LOGPROBS_FIELD: junk_layout.to_dict()}],
+        remote_fields={FULL_LOGPROBS_FIELD},
+        batch_get=FakeBatchGet(
+            {("steps", "step-1", "response_logprobs"): [-0.5, "oops", None]}
+        ),
+    )
+
+    assert torch.equal(
+        junk_rollout_data["rollout_log_probs"][0],
+        torch.tensor([-0.5, 0.0, 0.0], dtype=torch.float32),
+    )
+
+
+def test_logprobs_materialization_is_fast_for_large_samples():
+    token_count = 64 * 1024
+    expected = np.linspace(-1.0, 0.0, token_count, dtype=np.float32)
+    logprob_ref = _field_ref("step-0", "response_logprobs")
+    layout = _layout(
+        FULL_LOGPROBS_FIELD,
+        TQ_LOGPROBS_CODEC,
+        logprob_ref,
+        source_start=0,
+        target_start=0,
+        length=token_count,
+        token_count=token_count,
+        shape=(token_count,),
+    )
+    rollout_data = {
+        "total_lengths": [token_count],
+        "response_lengths": [token_count],
+    }
+
+    started_at = time.perf_counter()
+    hydrate_training_layouts(
+        SimpleNamespace(use_rollout_routing_replay=False),
+        rollout_data,
+        [{FULL_LOGPROBS_FIELD: layout.to_dict()}],
+        remote_fields={FULL_LOGPROBS_FIELD},
+        batch_get=FakeBatchGet(
+            {("steps", "step-0", "response_logprobs"): expected}
+        ),
+    )
+    elapsed = time.perf_counter() - started_at
+
+    assert torch.equal(
+        rollout_data["rollout_log_probs"][0],
+        torch.from_numpy(expected),
+    )
+    assert elapsed < 0.05, f"logprob hydration took {elapsed:.3f}s for 64K tokens"
+
+
+def test_logprobs_materialization_skips_fragments_beyond_truncated_sample():
+    huge_fragment_values = [-0.001 * (i + 1) for i in range(200_000)]
+    huge_ref = _field_ref("step-huge", "response_logprobs")
+    huge_layout = _layout(
+        FULL_LOGPROBS_FIELD,
+        TQ_LOGPROBS_CODEC,
+        huge_ref,
+        source_start=0,
+        target_start=1000,
+        length=len(huge_fragment_values),
+        token_count=1000 + len(huge_fragment_values),
+        shape=(1000 + len(huge_fragment_values),),
+    )
+    live_ref = _field_ref("step-live", "response_logprobs")
+    live_layout = _layout(
+        FULL_LOGPROBS_FIELD,
+        TQ_LOGPROBS_CODEC,
+        live_ref,
+        source_start=0,
+        target_start=0,
+        length=1000,
+        token_count=1000 + len(huge_fragment_values),
+        shape=(1000 + len(huge_fragment_values),),
+    )
+    layout = TQFieldLayout(
+        logical_field=FULL_LOGPROBS_FIELD,
+        codec=TQ_LOGPROBS_CODEC,
+        fragments=(*live_layout.fragments, *huge_layout.fragments),
+        token_count=1000 + len(huge_fragment_values),
+        shape=(1000 + len(huge_fragment_values),),
+    )
+    rollout_data = {
+        "total_lengths": [1000],
+        "response_lengths": [1000],
+    }
+
+    class TracingBatchGet(FakeBatchGet):
+        def __init__(self, values):
+            super().__init__(values)
+            self.touched_keys: set[str] = set()
+
+        def __call__(self, *, keys, partition_id, select_fields):
+            self.calls.append((tuple(keys), partition_id, select_fields))
+            self.touched_keys.update(keys)
+            return {
+                select_fields: [
+                    self.values[(partition_id, key, select_fields)] for key in keys
+                ]
+            }
+
+    batch_get = TracingBatchGet(
+        {
+            ("steps", "step-live", "response_logprobs"): [-0.5] * 1000,
+            ("steps", "step-huge", "response_logprobs"): huge_fragment_values,
+        }
+    )
+    started_at = time.perf_counter()
+    hydrate_training_layouts(
+        SimpleNamespace(use_rollout_routing_replay=False),
+        rollout_data,
+        [{FULL_LOGPROBS_FIELD: layout.to_dict()}],
+        remote_fields={FULL_LOGPROBS_FIELD},
+        batch_get=batch_get,
+    )
+    elapsed = time.perf_counter() - started_at
+
+    assert torch.equal(
+        rollout_data["rollout_log_probs"][0],
+        torch.full((1000,), -0.5, dtype=torch.float32),
+    )
+    assert batch_get.touched_keys == {"step-live", "step-huge"}
+    assert elapsed < 0.05, (
+        f"hydration of a fully truncated fragment took {elapsed:.3f}s"
     )
