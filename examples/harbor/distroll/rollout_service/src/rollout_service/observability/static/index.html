@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>CPU Rollout Dashboard</title>
+    <link rel="stylesheet" href="/dashboard.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">DRESSAGE · CPU OBSERVABILITY</p>
+        <h1>Rollout Service Dashboard</h1>
+      </div>
+      <div class="live-box">
+        <span id="live-dot" class="live-dot"></span>
+        <div><strong id="live-label">CONNECTING</strong><small id="last-refresh">等待首次快照</small></div>
+      </div>
+    </header>
+
+    <main>
+      <section id="kpis" class="kpi-grid" aria-label="集群摘要"></section>
+
+      <section class="overview-grid">
+        <article class="panel trend-panel">
+          <div class="panel-title"><div><p class="eyebrow">LAST 30 MINUTES</p><h2>Queue & Active</h2></div></div>
+          <svg id="trend-chart" viewBox="0 0 900 230" role="img" aria-label="排队和活动任务趋势"></svg>
+          <div class="legend"><span><i class="queue"></i>Queued</span><span><i class="active"></i>Active</span></div>
+        </article>
+        <article class="panel alert-panel">
+          <div class="panel-title"><div><p class="eyebrow">ATTENTION</p><h2>Cluster Alerts</h2></div><span id="alert-count" class="count-pill">0</span></div>
+          <div id="alerts" class="alerts"></div>
+        </article>
+      </section>
+
+      <section>
+        <div class="section-heading"><div><p class="eyebrow">WORKER FLEET</p><h2>Node Health & Capacity</h2></div></div>
+        <div id="workers" class="worker-grid"></div>
+      </section>
+
+      <section class="panel table-panel">
+        <div class="panel-title"><div><p class="eyebrow">LIVE OWNERSHIP</p><h2>Active Attempts</h2></div><span id="attempt-count" class="count-pill">0</span></div>
+        <div class="table-wrap"><table><thead><tr><th>Worker</th><th>State</th><th>Client Scope</th><th>Task</th><th>Execution</th><th>Age</th></tr></thead><tbody id="attempts"></tbody></table></div>
+      </section>
+
+      <section class="bottom-grid">
+        <article class="panel table-panel">
+          <div class="panel-title"><div><p class="eyebrow">LAST 15 MINUTES</p><h2>Failures & Cancellations</h2></div></div>
+          <div class="table-wrap"><table><thead><tr><th>Worker</th><th>State</th><th>Run</th><th>Task</th><th>原因 / 原始错误码</th><th>When</th></tr></thead><tbody id="failures"></tbody></table></div>
+        </article>
+        <article class="panel source-panel">
+          <div class="panel-title"><div><p class="eyebrow">FRESHNESS</p><h2>Data Sources</h2></div></div>
+          <div id="sources" class="sources"></div>
+        </article>
+      </section>
+    </main>
+
+    <footer>Read-only dashboard · Physical metrics never change Scheduler placement</footer>
+    <script src="/dashboard.js" defer></script>
+  </body>
+</html>

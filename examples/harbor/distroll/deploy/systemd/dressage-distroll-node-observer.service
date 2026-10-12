@@ -1,0 +1,32 @@
+[Unit]
+Description=Dressage CPU Rollout Node Observer
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+EnvironmentFile=/etc/dressage-distroll/worker.env
+Environment=ROLLOUT_OBSERVER_PORT=19191
+Environment=ROLLOUT_OBSERVER_INTERVAL_SEC=2
+WorkingDirectory=CPU_PROJECT_ROOT_PLACEHOLDER
+ExecStart=CPU_PROJECT_ROOT_PLACEHOLDER/.venv-cpu/bin/rollout-node-observer
+Restart=on-failure
+RestartSec=5
+Nice=10
+CPUWeight=10
+IOWeight=10
+MemoryMax=256M
+TasksMax=128
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

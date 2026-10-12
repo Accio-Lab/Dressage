@@ -1,0 +1,8 @@
+[Unit]
+Description=CPU and memory boundary for Harbor rollout workers
+Before=slices.target
+
+[Slice]
+CPUAccounting=true
+MemoryAccounting=true
+TasksAccounting=true

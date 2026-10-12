@@ -1,0 +1,18 @@
+[Unit]
+Description=Dressage DistRoll managed task-image cache cleaner
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/dressage-distroll/worker.env
+WorkingDirectory=CPU_PROJECT_ROOT_PLACEHOLDER
+ExecStart=CPU_PROJECT_ROOT_PLACEHOLDER/.venv-cpu/bin/rollout-image-cleaner
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=45
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

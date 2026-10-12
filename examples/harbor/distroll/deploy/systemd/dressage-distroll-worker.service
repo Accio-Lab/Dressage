@@ -1,0 +1,20 @@
+[Unit]
+Description=Dressage DistRoll Harbor Rollout Worker
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/dressage-distroll/worker.env
+WorkingDirectory=CPU_PROJECT_ROOT_PLACEHOLDER
+ExecStart=CPU_PROJECT_ROOT_PLACEHOLDER/.venv-cpu/bin/rollout-worker
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=330
+LimitNOFILE=1048576
+TasksMax=infinity
+Slice=dressage-distroll-rollout.slice
+
+[Install]
+WantedBy=multi-user.target

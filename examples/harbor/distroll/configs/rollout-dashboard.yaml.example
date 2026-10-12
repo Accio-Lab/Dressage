@@ -1,0 +1,27 @@
+schema_version: rollout-dashboard/v1
+listen_host: "" # Dashboard内网监听IP待确定；示例10.20.0.10
+listen_port: 19600
+refresh_interval_sec: 3
+history_interval_sec: 5
+history_retention_sec: 3600
+
+control_url: "" # CPU Head内网地址待确定；示例http://10.20.0.10:19443
+database_url: postgresql://rollout@127.0.0.1:15432/rollout
+database_pool_size: 2
+database_statement_timeout_ms: 1000
+node_timeout_sec: 2
+
+workers:
+  - worker_id: cpu-01
+    observer_url: "" # 待确定；示例http://10.20.0.10:19191
+  - worker_id: cpu-02
+    observer_url: "" # 待确定；示例http://10.20.0.11:19191
+
+alerts:
+  queue_oldest_sec: 120
+  cpu_used_percent: 90
+  memory_available_percent: 10
+  disk_free_bytes: 53687091200
+  stale_warning_sec: 10
+  stale_critical_sec: 30
+  ownership_mismatch_sec: 60

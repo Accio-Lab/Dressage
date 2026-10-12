@@ -1,0 +1,59 @@
+{
+  "schema_version": "dressage-distroll-gpu-runtime-lock/v1",
+  "official_image": {
+    "repository": "huang3eng/dressage",
+    "tag": "nightly-dev-20260827b",
+    "digest": "sha256:db8809be3e3164088208f1d2ad127f86ce2623702286b3d00080ae2bb17af058",
+    "reference": "huang3eng/dressage@sha256:db8809be3e3164088208f1d2ad127f86ce2623702286b3d00080ae2bb17af058",
+    "observed_at": "2026-08-28T00:00:00Z",
+    "platform": "linux/amd64"
+  },
+  "sources": {
+    "dressage": {
+      "revision": "3e3142fe8ea07e4504c3b20a936a4c201a3de44c",
+      "root": "/root/Dressage"
+    },
+    "slime": {
+      "revision": "ea9819f88caa5e043eb8aea992b0969ffe79aa8e",
+      "root": "/root/slime"
+    },
+    "megatron": {
+      "revision": "1dcf0dafa884ad52ffb243625717a3471643e087",
+      "root": "/root/Megatron-LM",
+      "patch_sha256": "976fd8bbe1f4e386be97e35353efdbfb592dacaea9797c5a81ea324d3c2c5b77"
+    },
+    "harbor": {
+      "version": "0.22.0",
+      "revision": "4407eb5227a2ff4f0d3f16b2eb48849382fdf276"
+    }
+  },
+  "packages": {
+    "dressage": "0.1.0",
+    "dressage-blackbox-server": "1.1.0",
+    "megatron-core": "0.16.0rc0",
+    "ray": "2.55.1",
+    "sglang": "0.5.15.post1",
+    "TransferQueue": "0.1.10.dev0",
+    "transformers": "5.12.1"
+  },
+  "source_hashes": {
+    "dressage": {
+      "pyproject.toml": "5e1076c1270f178c77c979f6c53cba57b4879e1ad4f9270c954548cfbd5b061d",
+      "dressage/proxy/proxy_client.py": "844ea40899d86fd924fe612d0b17ca756f7aa6a5c7e93eb7fb0f9eaa55c9becb",
+      "dressage/rollout/data_source.py": "c03195c5d15d72aa1690b624decd42190eb230800283fd8a7dd4756bdbe56db1",
+      "dressage/training/tq_hydration.py": "4cfe8bc3baafec9e450b1bdade6e16e3f3d79a5ff9c7d3d98add838797943ec7",
+      "dressage/training/tq_megatron_actor.py": "6b32a1fec55f900b2b514793d493cfdf79dbc7d6f9110f074fd4cd5357ea2702",
+      "dressage/integrations/harbor/gateway.py": "b8478c9f7647dd1f04722c3b74c4d65f6dd2672e49cbb526c53e43cf530903dc",
+      "examples/scripts/default/dressage_transfer_queue.yaml": "945fd810188e8521aeb05d1dd6111e6a1ad976bcf12ed00a5045d51e893edeec"
+    },
+    "slime": {
+      "slime/ray/rollout.py": "946cf4a8ccd4ab97b7f467be2b8c7b2d073d6ff7176e8020d152630c831d0cbb",
+      "slime/ray/placement_group.py": "84ccb5da5ce99ba5be83cceb8d6bfca43d6ad8ad85a81872fabf8391185159fc"
+    },
+    "megatron": {
+      "megatron/training/__init__.py": "50c69298d0670a40554aa5e2fc9227a757d7e4d64f2fabe88af1ff7f477cc822",
+      "megatron/training/checkpointing.py": "d06dca530713e7d34089ccf1c157fdcecc57d2a1e4cd683081c7a2b7c91e9e7a",
+      "megatron/training/arguments.py": "7c250b12e88123f12ab59dd2c54fe65bba9dc33f802adce8294999bb3717ddfb"
+    }
+  }
+}

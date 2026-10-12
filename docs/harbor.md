@@ -4,6 +4,11 @@ Harbor-managed agent rollouts and synchronous training through the Dressage Gate
 
 [Back to the main README](../README.md) · [Harbor examples](../examples/harbor)
 
+For a self-managed CPU worker pool independent of the GPU training cluster, see
+the [DistRoll example](../examples/harbor/distroll/README.md). It contains its own
+service packages, capacity admission, result delivery, sandbox protection and
+training runbook; it does not replace the E2B profiles described below.
+
 ## Terminal-Bench 2.0 results
 
 We evaluate Qwen3.6-35B-A3B with Harbor Terminus-2 agent through our Dressage–Harbor integration, using E2B sandboxes. The evaluation is configured to preserve the dataset’s original per-task Agent timeouts of 600–12,000 seconds with no timeout multiplier, while providing a 256K context window, up to 80K output tokens, and no Agent step limit. Each task runs five times, with Harbor configured for up to three retries (`n_attempts=5` and `max_retries=3`).

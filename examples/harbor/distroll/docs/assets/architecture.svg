@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1320" height="765" viewBox="0 0 1320 765">
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="context-stroke"/></marker></defs>
+<rect width="100%" height="100%" fill="#FAFCFF"/>
+<g font-family="DejaVu Sans, sans-serif">
+<text x="44" y="54" font-size="29" fill="#1C2D47" text-anchor="start">Dressage DistRoll</text>
+<text x="44" y="90" font-size="17" fill="#62738A" text-anchor="start">A self-managed CPU execution pool, separate from GPU inference and training</text>
+<rect x="40" y="125" width="500" height="510" rx="14" fill="#EFF4FF" stroke="#DCE5F0"/>
+<rect x="58" y="145" width="5" height="23" rx="2" fill="#3569C8"/>
+<text x="74" y="164" font-size="21" fill="#1C2D47" text-anchor="start">GPU cluster</text>
+<text x="64" y="198" font-size="16" fill="#62738A" text-anchor="start">Containerized training; no task Docker daemon</text>
+<rect x="780" y="125" width="500" height="510" rx="14" fill="#EDF8F4" stroke="#DCE5F0"/>
+<rect x="798" y="145" width="5" height="23" rx="2" fill="#188579"/>
+<text x="814" y="164" font-size="21" fill="#1C2D47" text-anchor="start">CPU rollout cluster</text>
+<text x="804" y="198" font-size="16" fill="#62738A" text-anchor="start">Harbor tasks on user-managed worker hosts</text>
+<rect x="64" y="232" width="452" height="180" rx="14" fill="white" stroke="#DCE5F0"/>
+<rect x="82" y="252" width="5" height="23" rx="2" fill="#3569C8"/>
+<text x="98" y="271" font-size="21" fill="#1C2D47" text-anchor="start">GPU Head</text>
+<text x="88" y="305" font-size="16" fill="#62738A" text-anchor="start">RL queue, group selection, early stop</text>
+<text x="88" y="334" font-size="16" fill="#62738A" text-anchor="start">Policy routes and request deduplication</text>
+<text x="88" y="363" font-size="16" fill="#62738A" text-anchor="start">Dressage Proxy: TITO and native TQ</text>
+<rect x="804" y="232" width="452" height="180" rx="14" fill="white" stroke="#DCE5F0"/>
+<rect x="822" y="252" width="5" height="23" rx="2" fill="#188579"/>
+<text x="838" y="271" font-size="21" fill="#1C2D47" text-anchor="start">CPU Head</text>
+<text x="828" y="305" font-size="16" fill="#62738A" text-anchor="start">Control: admission and execution state</text>
+<text x="828" y="334" font-size="16" fill="#62738A" text-anchor="start">Worker-facing Policy gateway</text>
+<text x="828" y="363" font-size="16" fill="#62738A" text-anchor="start">PostgreSQL and image Registry</text>
+<path d="M516,267 L804,267" stroke="#3569C8" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+<text x="660" y="251" font-size="17" fill="#3569C8" text-anchor="middle">Execution control</text>
+<text x="660" y="293" font-size="12" fill="#62738A" text-anchor="middle">reserve / query / cancel / ACK</text>
+<path d="M804,334 L516,334" stroke="#188579" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+<text x="660" y="317" font-size="17" fill="#188579" text-anchor="middle">Route lifecycle</text>
+<text x="660" y="360" font-size="12" fill="#62738A" text-anchor="middle">bind / open / seal / revoke</text>
+<path d="M804,400 L516,400" stroke="#188579" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+<text x="660" y="383" font-size="17" fill="#188579" text-anchor="middle">Model requests</text>
+<text x="660" y="427" font-size="12" fill="#62738A" text-anchor="middle">Complete responses return to CPU</text>
+<path d="M169,426 L169,468" stroke="#3569C8" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+<rect x="64" y="477" width="212" height="127" rx="14" fill="white" stroke="#DCE5F0"/>
+<rect x="82" y="497" width="5" height="23" rx="2" fill="#3569C8"/>
+<text x="98" y="516" font-size="21" fill="#1C2D47" text-anchor="start">Actor nodes</text>
+<text x="88" y="550" font-size="16" fill="#62738A" text-anchor="start">Loss and optimizer</text>
+<text x="88" y="579" font-size="16" fill="#62738A" text-anchor="start">Checkpoints</text>
+<path d="M409,426 L409,468" stroke="#3569C8" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+<rect x="304" y="477" width="212" height="127" rx="14" fill="white" stroke="#DCE5F0"/>
+<rect x="322" y="497" width="5" height="23" rx="2" fill="#3569C8"/>
+<text x="338" y="516" font-size="21" fill="#1C2D47" text-anchor="start">Inference</text>
+<text x="328" y="550" font-size="16" fill="#62738A" text-anchor="start">Model generation</text>
+<text x="328" y="579" font-size="16" fill="#62738A" text-anchor="start">Weight updates</text>
+<path d="M909,426 L909,468" stroke="#188579" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+<rect x="804" y="477" width="212" height="127" rx="14" fill="white" stroke="#DCE5F0"/>
+<rect x="822" y="497" width="5" height="23" rx="2" fill="#188579"/>
+<text x="838" y="516" font-size="21" fill="#1C2D47" text-anchor="start">Worker 1</text>
+<text x="828" y="550" font-size="16" fill="#62738A" text-anchor="start">Harbor / Agent</text>
+<text x="828" y="579" font-size="16" fill="#62738A" text-anchor="start">Verifier / sandbox</text>
+<path d="M1149,426 L1149,468" stroke="#188579" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+<rect x="1044" y="477" width="212" height="127" rx="14" fill="white" stroke="#DCE5F0"/>
+<rect x="1062" y="497" width="5" height="23" rx="2" fill="#188579"/>
+<text x="1078" y="516" font-size="21" fill="#1C2D47" text-anchor="start">Worker N</text>
+<text x="1068" y="550" font-size="16" fill="#62738A" text-anchor="start">Image cache</text>
+<text x="1068" y="579" font-size="16" fill="#62738A" text-anchor="start">Sandbox protection</text>
+<text x="44" y="686" font-size="18" fill="#62738A" text-anchor="start">Only the Heads cross the cluster boundary. Workers and ranks use internal networks.</text>
+<text x="44" y="724" font-size="18" fill="#62738A" text-anchor="start">The link is reachable but may stall or disconnect; application protocols handle bounded recovery.</text>
+</g></svg>

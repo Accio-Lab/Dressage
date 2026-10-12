@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1320" height="765" viewBox="0 0 1320 765">
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="context-stroke" /></marker></defs>
+<rect width="100%" height="100%" fill="#FAFCFF" />
+<g font-family="Noto Sans CJK SC, sans-serif">
+<text x="44" y="54" font-size="29" fill="#1C2D47" text-anchor="start">Dressage DistRoll</text>
+<text x="44" y="90" font-size="17" fill="#62738A" text-anchor="start">自主管理CPU执行池，与GPU推理及训练独立部署</text>
+<rect x="40" y="125" width="500" height="510" rx="14" fill="#EFF4FF" stroke="#DCE5F0" />
+<rect x="58" y="145" width="5" height="23" rx="2" fill="#3569C8" />
+<text x="74" y="164" font-size="21" fill="#1C2D47" text-anchor="start">GPU集群</text>
+<text x="64" y="198" font-size="16" fill="#62738A" text-anchor="start">容器化训练；不负责启动任务沙箱</text>
+<rect x="780" y="125" width="500" height="510" rx="14" fill="#EDF8F4" stroke="#DCE5F0" />
+<rect x="798" y="145" width="5" height="23" rx="2" fill="#188579" />
+<text x="814" y="164" font-size="21" fill="#1C2D47" text-anchor="start">CPU rollout集群</text>
+<text x="804" y="198" font-size="16" fill="#62738A" text-anchor="start">在自主管理的Worker上执行Harbor任务</text>
+<rect x="64" y="232" width="452" height="180" rx="14" fill="white" stroke="#DCE5F0" />
+<rect x="82" y="252" width="5" height="23" rx="2" fill="#3569C8" />
+<text x="98" y="271" font-size="21" fill="#1C2D47" text-anchor="start">GPU Head</text>
+<text x="88" y="305" font-size="16" fill="#62738A" text-anchor="start">RL排队、选组与early-stop</text>
+<text x="88" y="334" font-size="16" fill="#62738A" text-anchor="start">Policy路由及请求去重</text>
+<text x="88" y="363" font-size="16" fill="#62738A" text-anchor="start">Dressage Proxy：TITO与原生TQ</text>
+<rect x="804" y="232" width="452" height="180" rx="14" fill="white" stroke="#DCE5F0" />
+<rect x="822" y="252" width="5" height="23" rx="2" fill="#188579" />
+<text x="838" y="271" font-size="21" fill="#1C2D47" text-anchor="start">CPU Head</text>
+<text x="828" y="305" font-size="16" fill="#62738A" text-anchor="start">Control：容量准入及执行状态</text>
+<text x="828" y="334" font-size="16" fill="#62738A" text-anchor="start">面向Worker的统一模型网关</text>
+<text x="828" y="363" font-size="16" fill="#62738A" text-anchor="start">PostgreSQL与镜像Registry</text>
+<path d="M516,267 L804,267" stroke="#3569C8" stroke-width="2.5" fill="none" marker-end="url(#arrow)" />
+<text x="660" y="251" font-size="17" fill="#3569C8" text-anchor="middle">任务控制</text>
+<text x="660" y="293" font-size="12" fill="#62738A" text-anchor="middle">reserve / query / cancel / ACK</text>
+<path d="M804,334 L516,334" stroke="#188579" stroke-width="2.5" fill="none" marker-end="url(#arrow)" />
+<text x="660" y="317" font-size="17" fill="#188579" text-anchor="middle">模型通道管理</text>
+<text x="660" y="360" font-size="12" fill="#62738A" text-anchor="middle">bind / open / seal / revoke</text>
+<path d="M804,400 L516,400" stroke="#188579" stroke-width="2.5" fill="none" marker-end="url(#arrow)" />
+<text x="660" y="383" font-size="17" fill="#188579" text-anchor="middle">模型请求</text>
+<text x="660" y="427" font-size="12" fill="#62738A" text-anchor="middle">完整响应返回CPU侧</text>
+<path d="M169,426 L169,468" stroke="#3569C8" stroke-width="2.5" fill="none" marker-end="url(#arrow)" />
+<rect x="64" y="477" width="212" height="127" rx="14" fill="white" stroke="#DCE5F0" />
+<rect x="82" y="497" width="5" height="23" rx="2" fill="#3569C8" />
+<text x="98" y="516" font-size="21" fill="#1C2D47" text-anchor="start">训练节点</text>
+<text x="88" y="550" font-size="16" fill="#62738A" text-anchor="start">计算loss与参数更新</text>
+<text x="88" y="579" font-size="16" fill="#62738A" text-anchor="start">保存checkpoint</text>
+<path d="M409,426 L409,468" stroke="#3569C8" stroke-width="2.5" fill="none" marker-end="url(#arrow)" />
+<rect x="304" y="477" width="212" height="127" rx="14" fill="white" stroke="#DCE5F0" />
+<rect x="322" y="497" width="5" height="23" rx="2" fill="#3569C8" />
+<text x="338" y="516" font-size="21" fill="#1C2D47" text-anchor="start">推理节点</text>
+<text x="328" y="550" font-size="16" fill="#62738A" text-anchor="start">模型生成</text>
+<text x="328" y="579" font-size="16" fill="#62738A" text-anchor="start">接收新权重</text>
+<path d="M909,426 L909,468" stroke="#188579" stroke-width="2.5" fill="none" marker-end="url(#arrow)" />
+<rect x="804" y="477" width="212" height="127" rx="14" fill="white" stroke="#DCE5F0" />
+<rect x="822" y="497" width="5" height="23" rx="2" fill="#188579" />
+<text x="838" y="516" font-size="21" fill="#1C2D47" text-anchor="start">Worker 1</text>
+<text x="828" y="550" font-size="16" fill="#62738A" text-anchor="start">Harbor / Agent</text>
+<text x="828" y="579" font-size="16" fill="#62738A" text-anchor="start">验证器与沙箱</text>
+<path d="M1149,426 L1149,468" stroke="#188579" stroke-width="2.5" fill="none" marker-end="url(#arrow)" />
+<rect x="1044" y="477" width="212" height="127" rx="14" fill="white" stroke="#DCE5F0" />
+<rect x="1062" y="497" width="5" height="23" rx="2" fill="#188579" />
+<text x="1078" y="516" font-size="21" fill="#1C2D47" text-anchor="start">Worker N</text>
+<text x="1068" y="550" font-size="16" fill="#62738A" text-anchor="start">镜像缓存</text>
+<text x="1068" y="579" font-size="16" fill="#62738A" text-anchor="start">沙箱资源保护</text>
+<text x="44" y="686" font-size="18" fill="#62738A" text-anchor="start">仅两个Head跨集群通信；Worker与训练rank分别使用各自内网。</text>
+<text x="44" y="724" font-size="18" fill="#62738A" text-anchor="start">链路可达但可能抖动或中断；业务协议提供有界恢复。</text>
+</g></svg>

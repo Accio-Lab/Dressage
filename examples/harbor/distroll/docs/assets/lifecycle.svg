@@ -1,0 +1,105 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1320" height="1320" viewBox="0 0 1320 1320">
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="context-stroke"/></marker></defs>
+<rect width="100%" height="100%" fill="#FAFCFF"/>
+<g font-family="DejaVu Sans, sans-serif">
+<text x="44" y="54" font-size="29" fill="#1C2D47" text-anchor="start">From one rollout slot to a training update</text>
+<text x="44" y="90" font-size="17" fill="#62738A" text-anchor="start">Reserve CPU capacity first. Bind model access only after a Worker creates a real trial.</text>
+<rect x="44" y="231" width="1232" height="272" rx="16" fill="#F0F5FE"/>
+<text x="59" y="254" font-size="11" fill="#3569C8" text-anchor="start">ADMIT</text>
+<rect x="44" y="511" width="1232" height="202" rx="16" fill="#EDF7F4"/>
+<text x="59" y="534" font-size="11" fill="#188579" text-anchor="start">EXECUTE</text>
+<rect x="44" y="721" width="1232" height="272" rx="16" fill="#F0F5FE"/>
+<text x="59" y="744" font-size="11" fill="#3569C8" text-anchor="start">DELIVER</text>
+<path d="M190,211 L190,979" stroke="#C7D5E5" stroke-width="1.6" stroke-dasharray="4 7"/>
+<rect x="60" y="132" width="260" height="78" rx="13" fill="#E5ECF5" opacity="0.55"/>
+<rect x="60" y="128" width="260" height="78" rx="13" fill="white" stroke="#D9E3EE"/>
+<rect x="60" y="144" width="4" height="46" rx="2" fill="#3569C8"/>
+<text x="190" y="159" font-size="20" fill="#1C2D47" text-anchor="middle">RL queue</text>
+<text x="190" y="186" font-size="13" fill="#62738A" text-anchor="middle">Candidates &amp; groups</text>
+<path d="M503,211 L503,979" stroke="#C7D5E5" stroke-width="1.6" stroke-dasharray="4 7"/>
+<rect x="373" y="132" width="260" height="78" rx="13" fill="#E5ECF5" opacity="0.55"/>
+<rect x="373" y="128" width="260" height="78" rx="13" fill="white" stroke="#D9E3EE"/>
+<rect x="373" y="144" width="4" height="46" rx="2" fill="#188579"/>
+<text x="503" y="159" font-size="20" fill="#1C2D47" text-anchor="middle">CPU Control</text>
+<text x="503" y="186" font-size="13" fill="#62738A" text-anchor="middle">Capacity &amp; results</text>
+<path d="M816,211 L816,979" stroke="#C7D5E5" stroke-width="1.6" stroke-dasharray="4 7"/>
+<rect x="686" y="132" width="260" height="78" rx="13" fill="#E5ECF5" opacity="0.55"/>
+<rect x="686" y="128" width="260" height="78" rx="13" fill="white" stroke="#D9E3EE"/>
+<rect x="686" y="144" width="4" height="46" rx="2" fill="#188579"/>
+<text x="816" y="159" font-size="20" fill="#1C2D47" text-anchor="middle">CPU Worker</text>
+<text x="816" y="186" font-size="13" fill="#62738A" text-anchor="middle">Harbor execution</text>
+<path d="M1129,211 L1129,979" stroke="#C7D5E5" stroke-width="1.6" stroke-dasharray="4 7"/>
+<rect x="999" y="132" width="260" height="78" rx="13" fill="#E5ECF5" opacity="0.55"/>
+<rect x="999" y="128" width="260" height="78" rx="13" fill="white" stroke="#D9E3EE"/>
+<rect x="999" y="144" width="4" height="46" rx="2" fill="#3569C8"/>
+<text x="1129" y="159" font-size="20" fill="#1C2D47" text-anchor="middle">GPU Policy / Proxy</text>
+<text x="1129" y="186" font-size="13" fill="#62738A" text-anchor="middle">Routes &amp; trajectories</text>
+<path d="M190,274 L503,274" stroke="#3569C8" stroke-width="2.6" fill="none" marker-end="url(#arrow)"/>
+<circle cx="190" cy="274" r="3.7" fill="#3569C8"/>
+<text x="346.5" y="261" font-size="16" fill="#3569C8" text-anchor="middle">01  Reserve capacity</text>
+<text x="346.5" y="296" font-size="12" fill="#62738A" text-anchor="middle">Atomic admission</text>
+<path d="M190,342 L1129,342" stroke="#3569C8" stroke-width="2.6" fill="none" marker-end="url(#arrow)"/>
+<circle cx="190" cy="342" r="3.7" fill="#3569C8"/>
+<text x="659.5" y="329" font-size="16" fill="#3569C8" text-anchor="middle">02  Prepare model context</text>
+<text x="659.5" y="364" font-size="12" fill="#62738A" text-anchor="middle">Only after reservation succeeds</text>
+<path d="M190,410 L503,410" stroke="#3569C8" stroke-width="2.6" fill="none" marker-end="url(#arrow)"/>
+<circle cx="190" cy="410" r="3.7" fill="#3569C8"/>
+<text x="346.5" y="397" font-size="16" fill="#3569C8" text-anchor="middle">03  Activate execution</text>
+<text x="346.5" y="432" font-size="12" fill="#62738A" text-anchor="middle">Hand off the admitted task</text>
+<path d="M816,478 L503,478" stroke="#188579" stroke-width="2.6" fill="none" marker-end="url(#arrow)"/>
+<circle cx="816" cy="478" r="3.7" fill="#188579"/>
+<text x="659.5" y="465" font-size="16" fill="#188579" text-anchor="middle">04  Claim execution</text>
+<text x="659.5" y="500" font-size="12" fill="#62738A" text-anchor="middle">Check ownership and configuration</text>
+<path d="M816,546 L1129,546" stroke="#188579" stroke-width="2.6" fill="none" marker-end="url(#arrow)"/>
+<circle cx="816" cy="546" r="3.7" fill="#188579"/>
+<text x="972.5" y="533" font-size="16" fill="#188579" text-anchor="middle">05  Bind / open route</text>
+<text x="972.5" y="568" font-size="12" fill="#62738A" text-anchor="middle">After creating the Harbor trial</text>
+<path d="M816,614 L1129,614" stroke="#188579" stroke-width="2.6" fill="none" marker-end="url(#arrow)"/>
+<circle cx="816" cy="614" r="3.7" fill="#188579"/>
+<text x="972.5" y="601" font-size="16" fill="#188579" text-anchor="middle">06  Model requests</text>
+<text x="972.5" y="636" font-size="12" fill="#62738A" text-anchor="middle">Tools run in the CPU sandbox</text>
+<path d="M816,682 L503,682" stroke="#188579" stroke-width="2.6" fill="none" marker-end="url(#arrow)"/>
+<circle cx="816" cy="682" r="3.7" fill="#188579"/>
+<text x="659.5" y="669" font-size="16" fill="#188579" text-anchor="middle">07  Report verified result</text>
+<text x="659.5" y="704" font-size="12" fill="#62738A" text-anchor="middle">Persist in outbox before delivery</text>
+<path d="M503,750 L190,750" stroke="#188579" stroke-width="2.6" fill="none" stroke-dasharray="6 4" marker-end="url(#arrow)"/>
+<circle cx="503" cy="750" r="3.7" fill="#188579"/>
+<text x="346.5" y="737" font-size="16" fill="#188579" text-anchor="middle">08  Return queried result</text>
+<text x="346.5" y="772" font-size="12" fill="#62738A" text-anchor="middle">Response to RL polling</text>
+<path d="M190,818 L1129,818" stroke="#3569C8" stroke-width="2.6" fill="none" marker-end="url(#arrow)"/>
+<circle cx="190" cy="818" r="3.7" fill="#3569C8"/>
+<text x="659.5" y="805" font-size="16" fill="#3569C8" text-anchor="middle">09  Finalize and read trajectory references</text>
+<text x="659.5" y="840" font-size="12" fill="#62738A" text-anchor="middle">Validate identity, tokens, loss masks and weight version</text>
+<path d="M190,886 L503,886" stroke="#3569C8" stroke-width="2.6" fill="none" marker-end="url(#arrow)"/>
+<circle cx="190" cy="886" r="3.7" fill="#3569C8"/>
+<text x="346.5" y="873" font-size="16" fill="#3569C8" text-anchor="middle">10  ACK result</text>
+<text x="346.5" y="908" font-size="12" fill="#62738A" text-anchor="middle">Acknowledge receipt, not training</text>
+<path d="M190,954 L1129,954" stroke="#3569C8" stroke-width="2.6" fill="none" marker-end="url(#arrow)"/>
+<circle cx="190" cy="954" r="3.7" fill="#3569C8"/>
+<text x="659.5" y="941" font-size="16" fill="#3569C8" text-anchor="middle">11  Detach model route</text>
+<text x="659.5" y="976" font-size="12" fill="#62738A" text-anchor="middle">Generation ends; selected source TQ remains available</text>
+<rect x="60" y="1014" width="1200" height="80" rx="14" fill="#FFF6E5" stroke="#F0DCB5"/>
+<text x="84" y="1045" font-size="21" fill="#92631D" text-anchor="start">Cleanup barrier &amp; group selection</text>
+<text x="84" y="1073" font-size="16" fill="#846E49" text-anchor="start">Verify CPU cleanup and idle GPU generations. Early stop must settle surplus executions too.</text>
+<rect x="60" y="1130" width="260" height="106" rx="14" fill="#EFF4FF" stroke="#DCE5F0"/>
+<rect x="78" y="1150" width="5" height="23" rx="2" fill="#3569C8"/>
+<text x="94" y="1169" font-size="21" fill="#1C2D47" text-anchor="start">Read native TQ</text>
+<text x="84" y="1203" font-size="16" fill="#62738A" text-anchor="start">All selected training ranks</text>
+<path d="M327,1183 L365,1183" stroke="#3569C8" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+<rect x="373" y="1130" width="260" height="106" rx="14" fill="#EFF4FF" stroke="#DCE5F0"/>
+<rect x="391" y="1150" width="5" height="23" rx="2" fill="#3569C8"/>
+<text x="407" y="1169" font-size="21" fill="#1C2D47" text-anchor="start">Update model</text>
+<text x="397" y="1203" font-size="16" fill="#62738A" text-anchor="start">Loss / backward / optimizer</text>
+<path d="M640,1183 L678,1183" stroke="#3569C8" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+<rect x="686" y="1130" width="260" height="106" rx="14" fill="#EFF4FF" stroke="#DCE5F0"/>
+<rect x="704" y="1150" width="5" height="23" rx="2" fill="#3569C8"/>
+<text x="720" y="1169" font-size="21" fill="#1C2D47" text-anchor="start">Release source keys</text>
+<text x="710" y="1203" font-size="16" fill="#62738A" text-anchor="start">After every rank finishes</text>
+<path d="M953,1183 L991,1183" stroke="#3569C8" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+<rect x="999" y="1130" width="260" height="106" rx="14" fill="#EFF4FF" stroke="#DCE5F0"/>
+<rect x="1017" y="1150" width="5" height="23" rx="2" fill="#3569C8"/>
+<text x="1033" y="1169" font-size="21" fill="#1C2D47" text-anchor="start">Publish weights</text>
+<text x="1023" y="1203" font-size="16" fill="#62738A" text-anchor="start">Checkpoint when due</text>
+<text x="60" y="1270" font-size="15" fill="#62738A" text-anchor="start">No capacity: wait in the RL queue. Result ACK, batch delivery and optimizer completion are distinct.</text>
+<text x="60" y="1298" font-size="13" fill="#62738A" text-anchor="start">Logical service calls shown; CPU Head forwards Worker traffic across clusters. Most response arrows are omitted.</text>
+</g></svg>

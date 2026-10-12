@@ -1,0 +1,33 @@
+[Unit]
+Description=Dressage DistRoll process-scoped CPU/GPU TCP gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+Environment=ROLLOUT_NETWORK_GATEWAY_CONFIG=/etc/dressage-distroll/network-gateway.yaml
+WorkingDirectory=CPU_PROJECT_ROOT_PLACEHOLDER
+ExecStart=CPU_PROJECT_ROOT_PLACEHOLDER/.venv-cpu/bin/rollout-network-gateway
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=30
+LimitNOFILE=1048576
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_DAC_READ_SEARCH
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+PrivateDevices=true
+PrivateTmp=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

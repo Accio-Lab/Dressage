@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1320" height="1140" viewBox="0 0 1320 1140">
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="context-stroke"/></marker></defs>
+<rect width="100%" height="100%" fill="#FAFCFF"/>
+<g font-family="DejaVu Sans, sans-serif">
+<text x="44" y="54" font-size="29" fill="#1C2D47" text-anchor="start">Two request paths, two deduplication mechanisms</text>
+<text x="44" y="90" font-size="17" fill="#62738A" text-anchor="start">Retries preserve identity: no duplicate task launch or extra generation from response replay</text>
+<rect x="40" y="135" width="595" height="750" rx="14" fill="#EFF4FF" stroke="#DCE5F0"/>
+<rect x="58" y="155" width="5" height="23" rx="2" fill="#3569C8"/>
+<text x="74" y="174" font-size="21" fill="#1C2D47" text-anchor="start">GPU → CPU: execution control</text>
+<rect x="65" y="215" width="545" height="165" rx="14" fill="white" stroke="#DCE5F0"/>
+<rect x="83" y="235" width="5" height="23" rx="2" fill="#3569C8"/>
+<text x="99" y="254" font-size="21" fill="#1C2D47" text-anchor="start">1  RL freezes execution identity</text>
+<text x="89" y="294" font-size="16" fill="#62738A" text-anchor="start">execution ID + reservation request ID + content</text>
+<text x="89" y="325" font-size="16" fill="#62738A" text-anchor="start">Lost reply: retry or query with the same identity</text>
+<text x="89" y="356" font-size="16" fill="#62738A" text-anchor="start">A transport retry does not create a new execution</text>
+<path d="M337,392 L337,426" stroke="#3569C8" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+<rect x="65" y="440" width="545" height="165" rx="14" fill="white" stroke="#DCE5F0"/>
+<rect x="83" y="460" width="5" height="23" rx="2" fill="#3569C8"/>
+<text x="99" y="479" font-size="21" fill="#1C2D47" text-anchor="start">2  Control handles requests atomically</text>
+<text x="89" y="519" font-size="16" fill="#62738A" text-anchor="start">Same identity and content: reuse reservation / state</text>
+<text x="89" y="550" font-size="16" fill="#62738A" text-anchor="start">Same identity, different content: reject</text>
+<text x="89" y="581" font-size="16" fill="#62738A" text-anchor="start">No capacity: return 429; wait in the RL queue</text>
+<path d="M337,617 L337,651" stroke="#3569C8" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+<rect x="65" y="665" width="545" height="165" rx="14" fill="white" stroke="#DCE5F0"/>
+<rect x="83" y="685" width="5" height="23" rx="2" fill="#3569C8"/>
+<text x="99" y="704" font-size="21" fill="#1C2D47" text-anchor="start">3  Durable result outbox and ACK</text>
+<text x="89" y="744" font-size="16" fill="#62738A" text-anchor="start">Worker persists the result, then delivers to Control</text>
+<text x="89" y="775" font-size="16" fill="#62738A" text-anchor="start">Deduplicate by execution identity and result digest</text>
+<text x="89" y="806" font-size="16" fill="#62738A" text-anchor="start">RL acknowledges receipt; the Agent is not rerun</text>
+<rect x="685" y="135" width="595" height="750" rx="14" fill="#EDF8F4" stroke="#DCE5F0"/>
+<rect x="703" y="155" width="5" height="23" rx="2" fill="#188579"/>
+<text x="719" y="174" font-size="21" fill="#1C2D47" text-anchor="start">CPU → GPU: model calls</text>
+<rect x="710" y="215" width="545" height="165" rx="14" fill="white" stroke="#DCE5F0"/>
+<rect x="728" y="235" width="5" height="23" rx="2" fill="#188579"/>
+<text x="744" y="254" font-size="21" fill="#1C2D47" text-anchor="start">1  Worker Relay freezes each call</text>
+<text x="734" y="294" font-size="16" fill="#62738A" text-anchor="start">request ID + original request bytes + digest</text>
+<text x="734" y="325" font-size="16" fill="#62738A" text-anchor="start">CPU Head forwards; transport retries retain identity</text>
+<text x="734" y="356" font-size="16" fill="#62738A" text-anchor="start">An independent call gets a new request ID</text>
+<path d="M982,392 L982,426" stroke="#188579" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+<rect x="710" y="440" width="545" height="165" rx="14" fill="white" stroke="#DCE5F0"/>
+<rect x="728" y="460" width="5" height="23" rx="2" fill="#188579"/>
+<text x="744" y="479" font-size="21" fill="#1C2D47" text-anchor="start">2  GPU Policy request ledger</text>
+<text x="734" y="519" font-size="16" fill="#62738A" text-anchor="start">Key: route ID + request ID</text>
+<text x="734" y="550" font-size="16" fill="#62738A" text-anchor="start">Matching retry: share generation / complete response</text>
+<text x="734" y="581" font-size="16" fill="#62738A" text-anchor="start">Same identity, different content: reject</text>
+<path d="M982,617 L982,651" stroke="#188579" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+<rect x="710" y="665" width="545" height="165" rx="14" fill="white" stroke="#DCE5F0"/>
+<rect x="728" y="685" width="5" height="23" rx="2" fill="#188579"/>
+<text x="744" y="704" font-size="21" fill="#1C2D47" text-anchor="start">3  Return one complete response</text>
+<text x="734" y="744" font-size="16" fill="#62738A" text-anchor="start">Lost reply: replay the original response bytes</text>
+<text x="734" y="775" font-size="16" fill="#62738A" text-anchor="start">No extra generation or mixed response fragments</text>
+<text x="734" y="806" font-size="16" fill="#62738A" text-anchor="start">Distinct response: new message ID; replay: same ID</text>
+<rect x="40" y="915" width="1240" height="135" rx="14" fill="#EFF4FF" stroke="#DCE5F0"/>
+<rect x="58" y="935" width="5" height="23" rx="2" fill="#3569C8"/>
+<text x="74" y="954" font-size="21" fill="#1C2D47" text-anchor="start">Both paths meet at the training-delivery boundary</text>
+<text x="64" y="994" font-size="16" fill="#62738A" text-anchor="start">Verify CPU cleanup, idle GPU generations, trajectory identity, tokens, loss masks and weight version.</text>
+<text x="64" y="1025" font-size="16" fill="#62738A" text-anchor="start">Select groups → native TQ references → release selected source keys only after all training ranks finish.</text>
+<text x="48" y="1085" font-size="15" fill="#62738A" text-anchor="start">Recovery is bounded. Exhaustion or unverified cleanup fails; uncertain trajectories cannot train.</text>
+<text x="48" y="1117" font-size="15" fill="#62738A" text-anchor="start">Bounded in-memory model ledger; equal content is not equal identity. ACK is not an optimizer update.</text>
+</g></svg>

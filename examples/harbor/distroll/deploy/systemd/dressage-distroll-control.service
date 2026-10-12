@@ -1,0 +1,20 @@
+[Unit]
+Description=Dressage DistRoll CPU Rollout Control Plane
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+EnvironmentFile=/etc/dressage-distroll/control.env
+WorkingDirectory=CPU_PROJECT_ROOT_PLACEHOLDER
+ExecStart=CPU_PROJECT_ROOT_PLACEHOLDER/.venv-cpu/bin/rollout-control-plane
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=90
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

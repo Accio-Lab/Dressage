@@ -204,6 +204,7 @@ End-to-end whitebox and blackbox RL recipes for SWE-Gym, Dressage Claw, ALFWorld
 - **[Rollout](docs/rollout.md)** — Generate hooks, async modes, reward registry, slime wiring
 - **[Training](docs/training.md)** — Multi-segment, TITO, prompt-equal aggregation, partial rollout
 - **[Harbor Integration](docs/harbor.md)** — Harbor rollouts, trainable trajectory capture, and synchronous slime training
+- **[DistRoll example](examples/harbor/distroll/README.md)** — Synchronous training with a self-managed CPU worker pool, bounded cross-cluster recovery and managed sandbox images
 - **[Quick Start](docs/quickstart.md)** — Step-by-step setup, configuration reference, troubleshooting
 - **[Recipes](docs/recipes.md)** — End-to-end whitebox and blackbox training recipes for SWE-Gym, Dressage Claw, ALFWorld, and HotpotQA, with quickstarts, experiment reports, and a build-your-own guide.
     - **SWE-Gym + Claude Code** — [Quickstart](docs/swegym-claude-code-quickstart-en.md) ([中文](docs/swegym-claude-code-quickstart-zh.md)) and [experiment report](docs/blackbox-swegym-claude-code-experiment-en.md) ([中文](docs/blackbox-swegym-claude-code-experiment-zh.md))

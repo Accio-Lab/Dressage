@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1320" height="1140" viewBox="0 0 1320 1140">
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="context-stroke"/></marker></defs>
+<rect width="100%" height="100%" fill="#FAFCFF"/>
+<g font-family="Noto Sans CJK SC, sans-serif">
+<text x="44" y="54" font-size="29" fill="#1C2D47" text-anchor="start">两种请求，两套去重机制</text>
+<text x="44" y="90" font-size="17" fill="#62738A" text-anchor="start">传输重试保持业务身份；不重复启动任务，不把响应重放变成另一次生成</text>
+<rect x="40" y="135" width="595" height="750" rx="14" fill="#EFF4FF" stroke="#DCE5F0"/>
+<rect x="58" y="155" width="5" height="23" rx="2" fill="#3569C8"/>
+<text x="74" y="174" font-size="21" fill="#1C2D47" text-anchor="start">GPU → CPU：任务控制</text>
+<rect x="65" y="215" width="545" height="165" rx="14" fill="white" stroke="#DCE5F0"/>
+<rect x="83" y="235" width="5" height="23" rx="2" fill="#3569C8"/>
+<text x="99" y="254" font-size="21" fill="#1C2D47" text-anchor="start">1  RL固定执行与预留请求身份</text>
+<text x="89" y="294" font-size="18" fill="#62738A" text-anchor="start">execution ID + 预留请求身份 + 请求内容</text>
+<text x="89" y="325" font-size="18" fill="#62738A" text-anchor="start">回复丢失：用原身份重试或回查</text>
+<text x="89" y="356" font-size="18" fill="#62738A" text-anchor="start">不为传输重试另建execution</text>
+<path d="M337,392 L337,426" stroke="#3569C8" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+<rect x="65" y="440" width="545" height="165" rx="14" fill="white" stroke="#DCE5F0"/>
+<rect x="83" y="460" width="5" height="23" rx="2" fill="#3569C8"/>
+<text x="99" y="479" font-size="21" fill="#1C2D47" text-anchor="start">2  Control数据库原子处理</text>
+<text x="89" y="519" font-size="18" fill="#62738A" text-anchor="start">同身份同内容：复用预留 / 当前状态</text>
+<text x="89" y="550" font-size="18" fill="#62738A" text-anchor="start">同身份内容冲突：拒绝</text>
+<text x="89" y="581" font-size="18" fill="#62738A" text-anchor="start">容量不足：429，继续在RL侧等待</text>
+<path d="M337,617 L337,651" stroke="#3569C8" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+<rect x="65" y="665" width="545" height="165" rx="14" fill="white" stroke="#DCE5F0"/>
+<rect x="83" y="685" width="5" height="23" rx="2" fill="#3569C8"/>
+<text x="99" y="704" font-size="21" fill="#1C2D47" text-anchor="start">3  持久结果outbox与ACK</text>
+<text x="89" y="744" font-size="18" fill="#62738A" text-anchor="start">Worker先落结果，再交付Control</text>
+<text x="89" y="775" font-size="18" fill="#62738A" text-anchor="start">同execution / digest重发可去重</text>
+<text x="89" y="806" font-size="18" fill="#62738A" text-anchor="start">RL接收后ACK，不重跑Agent</text>
+<rect x="685" y="135" width="595" height="750" rx="14" fill="#EDF8F4" stroke="#DCE5F0"/>
+<rect x="703" y="155" width="5" height="23" rx="2" fill="#188579"/>
+<text x="719" y="174" font-size="21" fill="#1C2D47" text-anchor="start">CPU → GPU：模型调用</text>
+<rect x="710" y="215" width="545" height="165" rx="14" fill="white" stroke="#DCE5F0"/>
+<rect x="728" y="235" width="5" height="23" rx="2" fill="#188579"/>
+<text x="744" y="254" font-size="21" fill="#1C2D47" text-anchor="start">1  Worker本地Relay固定调用身份</text>
+<text x="734" y="294" font-size="18" fill="#62738A" text-anchor="start">request ID + 原请求字节 + digest</text>
+<text x="734" y="325" font-size="18" fill="#62738A" text-anchor="start">经CPU Head转发；传输重试不换身份</text>
+<text x="734" y="356" font-size="18" fill="#62738A" text-anchor="start">另一独立调用使用新的request ID</text>
+<path d="M982,392 L982,426" stroke="#188579" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+<rect x="710" y="440" width="545" height="165" rx="14" fill="white" stroke="#DCE5F0"/>
+<rect x="728" y="460" width="5" height="23" rx="2" fill="#188579"/>
+<text x="744" y="479" font-size="21" fill="#1C2D47" text-anchor="start">2  GPU Policy请求账本</text>
+<text x="734" y="519" font-size="18" fill="#62738A" text-anchor="start">键：route ID + request ID</text>
+<text x="734" y="550" font-size="18" fill="#62738A" text-anchor="start">同身份同内容：共享在途生成 / 完整响应</text>
+<text x="734" y="581" font-size="18" fill="#62738A" text-anchor="start">同身份内容冲突：拒绝</text>
+<path d="M982,617 L982,651" stroke="#188579" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+<rect x="710" y="665" width="545" height="165" rx="14" fill="white" stroke="#DCE5F0"/>
+<rect x="728" y="685" width="5" height="23" rx="2" fill="#188579"/>
+<text x="744" y="704" font-size="21" fill="#1C2D47" text-anchor="start">3  完整响应返回Agent</text>
+<text x="734" y="744" font-size="18" fill="#62738A" text-anchor="start">回复丢失：同一请求取回原响应字节</text>
+<text x="734" y="775" font-size="18" fill="#62738A" text-anchor="start">重放不重复生成，也不拼接不同响应</text>
+<text x="734" y="806" font-size="18" fill="#62738A" text-anchor="start">独立响应独立message ID，重放不变</text>
+<rect x="40" y="915" width="1240" height="135" rx="14" fill="#EFF4FF" stroke="#DCE5F0"/>
+<rect x="58" y="935" width="5" height="23" rx="2" fill="#3569C8"/>
+<text x="74" y="954" font-size="21" fill="#1C2D47" text-anchor="start">两条通道汇合到训练交付边界</text>
+<text x="64" y="994" font-size="18" fill="#62738A" text-anchor="start">CPU清理证明 + GPU旧generation关闭 + 轨迹身份 / token / mask / 权重版本检查</text>
+<text x="64" y="1025" font-size="18" fill="#62738A" text-anchor="start">RL选组 → 原生TQ交付训练rank；全部rank消费后才释放入选源key</text>
+<text x="48" y="1085" font-size="17" fill="#62738A" text-anchor="start">传输恢复有预算；耗尽或清理无法证实则明确失败，不使用不确定轨迹训练。</text>
+<text x="48" y="1117" font-size="17" fill="#62738A" text-anchor="start">模型账本有界且在进程内；相同内容不等于同一次调用，ACK不等于optimizer完成。</text>
+</g></svg>

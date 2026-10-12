@@ -1,0 +1,13 @@
+schema_version: rollout-network-gateway/v0
+relays:
+  - name: cpu-workers-to-gpu-policy
+    listen_host: ""  # CPU Head内网IP待确定；示例10.20.0.10
+    listen_port: 18443
+    upstream_host: ""  # GPU Head 公网IP待确定；启动前填写
+    upstream_port: 18443
+    max_connections: 4096
+    connect_timeout_sec: 15
+    buffer_bytes: 262144
+    tcp_keepalive_idle_sec: 60
+    tcp_keepalive_interval_sec: 15
+    tcp_keepalive_count: 4

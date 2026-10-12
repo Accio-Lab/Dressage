@@ -1,0 +1,75 @@
+schema_version: rollout-cluster/v2
+cluster_id: dressage-distroll
+execution_timeout_sec: 3900
+settlement_timeout_sec: 3900
+heartbeat_interval_sec: 30
+heartbeat_timeout_sec: 90
+assignment_ttl_sec: 300
+
+policy:
+  url: ""  # CPU Head内网Policy入口待确定；示例http://10.20.0.10:18443
+
+task_resources:
+  index_path: CPU_PROJECT_ROOT_PLACEHOLDER/configs/task-resource-index-v2.json
+  defaults:
+    cpus: 1
+    memory_mb: 4096
+
+workers:
+  - worker_id: cpu-01
+    address: ""  # Worker 1内网地址待确定；示例10.20.0.10:19090
+    relay_base_url: ""  # 待确定；示例http://10.20.0.10:19090
+    labels: {pool: rollout-64, rack: rack-a, runtime: docker}
+    virtual_capacity: {cpu_units: 64, memory_mb: 196608}
+    runtime_safety:
+      cgroup_parent: dressage-distroll-rollout.slice
+      pids_per_sandbox: 2048
+      storage_mb_per_sandbox: 10240
+      storage_size_enforced: true
+    image_cache:
+      enabled: true
+      cache_root: /var/lib/dressage-distroll-worker/image-cache
+      docker_root: /var/lib/docker
+      pull_timeout_sec: 900
+      pull_max_attempts: 3
+      max_concurrent_pulls: 2
+      min_free_bytes_before_pull: 53687091200
+      cleaner_enabled: true
+      cleaner_scan_interval_sec: 60
+      idle_ttl_sec: 3600
+      high_used_percent: 75
+      low_used_percent: 70
+      pressure_min_idle_sec: 300
+      max_delete_per_scan: 50
+      max_scan_seconds: 30
+    task_catalog_root: CPU_PROJECT_ROOT_PLACEHOLDER/tasks
+    state_dir: /var/lib/dressage-distroll-worker
+
+  - worker_id: cpu-02
+    address: ""  # Worker 2内网地址待确定；示例10.20.0.11:19090
+    relay_base_url: ""  # 待确定；示例http://10.20.0.11:19090
+    labels: {pool: rollout-64, rack: rack-b, runtime: docker}
+    virtual_capacity: {cpu_units: 64, memory_mb: 196608}
+    runtime_safety:
+      cgroup_parent: dressage-distroll-rollout.slice
+      pids_per_sandbox: 2048
+      storage_mb_per_sandbox: 10240
+      storage_size_enforced: true
+    image_cache:
+      enabled: true
+      cache_root: /var/lib/dressage-distroll-worker/image-cache
+      docker_root: /var/lib/docker
+      pull_timeout_sec: 900
+      pull_max_attempts: 3
+      max_concurrent_pulls: 2
+      min_free_bytes_before_pull: 53687091200
+      cleaner_enabled: true
+      cleaner_scan_interval_sec: 60
+      idle_ttl_sec: 3600
+      high_used_percent: 75
+      low_used_percent: 70
+      pressure_min_idle_sec: 300
+      max_delete_per_scan: 50
+      max_scan_seconds: 30
+    task_catalog_root: CPU_PROJECT_ROOT_PLACEHOLDER/tasks
+    state_dir: /var/lib/dressage-distroll-worker
