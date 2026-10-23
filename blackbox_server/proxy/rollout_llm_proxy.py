@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -3131,6 +3132,9 @@ def _payloads_from_sse_event(raw_event: str) -> list[str]:
 class _AnthropicStreamState:
     def __init__(self) -> None:
         self.model = "proxy-model"
+        # One id for every event of this response. A new stream state gets a new id,
+        # so separate /v1/messages responses are not collapsed into one assistant turn.
+        self.message_id = f"msg_{uuid.uuid4().hex}"
         self._active_block_type: str | None = None
         self._active_block_index: int | None = None
         self._next_index = 0
@@ -3144,7 +3148,7 @@ class _AnthropicStreamState:
             {
                 "type": "message_start",
                 "message": {
-                    "id": "msg_proxy_stream",
+                    "id": self.message_id,
                     "type": "message",
                     "role": "assistant",
                     "model": self.model,

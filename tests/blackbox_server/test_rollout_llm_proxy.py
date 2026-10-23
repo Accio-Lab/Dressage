@@ -2844,6 +2844,15 @@ def test_prelude_returns_synthetic_stream_for_late_rollout_invalidation():
     assert invalidated is not None
 
 
+def _anthropic_message_id(events: list[tuple[str | None, dict[str, Any]]]) -> str:
+    starts = [payload for name, payload in events if name == "message_start"]
+    assert len(starts) == 1
+    message_id = starts[0]["message"]["id"]
+    assert isinstance(message_id, str) and message_id.startswith("msg_")
+    assert message_id != "msg_proxy_stream"
+    return message_id
+
+
 def test_prelude_converts_heartbeated_anthropic_success_stream():
     proxy = _make_proxy()
 
@@ -2863,6 +2872,23 @@ def test_prelude_converts_heartbeated_anthropic_success_stream():
     assert b"dressage-heartbeat" not in body
     assert [name for name, _ in events][0] == "message_start"
     assert "message_stop" in [name for name, _ in events]
+    _anthropic_message_id(events)
+
+
+def test_anthropic_stream_message_id_is_stable_within_a_response_and_unique_across_responses():
+    """Claude Code merges turns that reuse the same message id. Each /v1/messages
+    stream must keep one id for that response and use a different id next time.
+    """
+    chunks = [
+        _sse_event({"model": "proxy-model", "choices": [{"delta": {"content": "hi"}}]}),
+        _sse_event({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+        b"data: [DONE]\n\n",
+    ]
+    first = _sse_events_from_body(_stream_through_proxy(_make_proxy(), "/v1/messages", chunks)[1])
+    second = _sse_events_from_body(_stream_through_proxy(_make_proxy(), "/v1/messages", chunks)[1])
+    first_id = _anthropic_message_id(first)
+    second_id = _anthropic_message_id(second)
+    assert first_id != second_id
 
 
 def test_prelude_converts_heartbeated_openai_responses_stream():
