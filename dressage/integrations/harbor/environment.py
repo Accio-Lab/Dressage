@@ -403,6 +403,13 @@ class DressageEnvironment(BaseEnvironment):
                 host_path.mkdir(parents=True, exist_ok=True)
         for target in self._harbor_mounts:
             _rootfs_path(self._rootfs, target).mkdir(parents=True, exist_ok=True)
+        # Prepare the sandbox-owned output paths while constructing its filesystem.
+        for value in self._mount_targets(writable_only=True):
+            target = _environment_path(value)
+            if not _is_within(target, _LOGS):
+                raise ValueError("Dressage bwrap only accepts Harbor /logs mounts")
+            if not any(_is_within(target, mount) for mount in self._harbor_mounts):
+                _rootfs_path(self._rootfs, target).mkdir(parents=True, exist_ok=True)
         _rootfs_path(self._rootfs, _GATEWAY_SOCKET_DIR).mkdir(
             parents=True, exist_ok=True
         )

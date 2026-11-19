@@ -330,6 +330,46 @@ echo '{"reward": 1}' > /logs/verifier/reward.json
         trial._close_logger_handler()
 
 
+@pytest.mark.usefixtures("bwrap_network_namespace")
+@pytest.mark.asyncio
+async def test_oracle_trial_delivers_logs_with_default_mounts(monkeypatch, tmp_path):
+    _configure_bwrap(monkeypatch, tmp_path)
+    task = tmp_path / "task"
+    for name in ("environment", "solution", "tests"):
+        (task / name).mkdir(parents=True)
+    (task / "instruction.md").write_text("Write 4 to /app/answer.txt.")
+    (task / "task.toml").write_text(
+        'schema_version = "1.3"\n[environment]\ngpus = 0\nnetwork_mode = "no-network"\n'
+    )
+    (task / "solution/solve.sh").write_text(
+        "#!/bin/sh\nset -eu\ntest -d /logs/artifacts\necho 4 > /app/answer.txt\necho solved\n"
+    )
+    (task / "tests/test.sh").write_text(
+        """#!/bin/sh
+set -eu
+test "$(cat /app/answer.txt)" = 4
+echo '{"reward": 1}' > /logs/verifier/reward.json
+"""
+    )
+    config = TrialConfig.model_validate(
+        {
+            "task": {"path": task},
+            "agent": {"name": "oracle"},
+            "environment": {
+                "import_path": "dressage.integrations.harbor.environment:DressageEnvironment"
+            },
+            "trial_name": "oracle-logs",
+            "trials_dir": tmp_path / "trials",
+        }
+    )
+    trial = await Trial.create(config)
+    result = await trial.run()
+
+    assert "solved" in (trial.paths.agent_dir / "oracle.txt").read_text().splitlines()
+    assert result.verifier_result is not None
+    assert result.verifier_result.rewards == {"reward": 1}
+
+
 def test_harbor_preflight_signature():
     # Flag changes to the Harbor hook separately from the factory behavior tests.
     parameters = inspect.signature(BaseEnvironment.preflight).parameters.values()
