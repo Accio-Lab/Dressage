@@ -5,7 +5,7 @@ import json
 import shutil
 import subprocess
 import sys
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -15,7 +15,9 @@ pytest.importorskip("harbor")
 from harbor.environments.base import BaseEnvironment
 from harbor.environments.factory import EnvironmentFactory
 from harbor.models.task.config import EnvironmentConfig, NetworkMode, NetworkPolicy
+from harbor.models.trial.config import TrialConfig
 from harbor.models.trial.paths import TrialPaths
+from harbor.trial.trial import Trial
 
 from dressage.integrations.harbor import environment as environment_module
 
@@ -27,7 +29,7 @@ def _contains(command, values):
     )
 
 
-def _environment(monkeypatch, tmp_path, session_id, mode, *, workdir="/app"):
+def _configure_bwrap(monkeypatch, tmp_path):
     config = tmp_path / "integration.json"
     config.write_text(
         json.dumps(
@@ -45,6 +47,10 @@ def _environment(monkeypatch, tmp_path, session_id, mode, *, workdir="/app"):
     monkeypatch.setattr(
         environment_module, "_required_binary", lambda name: f"/usr/bin/{name}"
     )
+
+
+def _environment(monkeypatch, tmp_path, session_id, mode, *, workdir="/app"):
+    _configure_bwrap(monkeypatch, tmp_path)
     verifier = "__verifier__" in session_id and not session_id.endswith("__env")
     environment_dir = tmp_path / "task" / ("tests" if verifier else "environment")
     environment_dir.mkdir(parents=True, exist_ok=True)
@@ -157,6 +163,65 @@ async def test_paths_mounts_and_arbitrary_artifacts_remain_safe(monkeypatch, tmp
         assert rootfs.joinpath(*link.parts[1:]).is_symlink()
     finally:
         await environment.stop(True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("auto_mounting", "external_mount", "expected_downloads"),
+    [(True, False, 0), (False, False, 1), (False, True, 1)],
+    ids=["automatic", "sandbox-only", "explicit-external"],
+)
+async def test_trial_recovers_agent_logs(
+    monkeypatch, tmp_path, auto_mounting, external_mount, expected_downloads
+):
+    _configure_bwrap(monkeypatch, tmp_path)
+    task = tmp_path / "task"
+    for name in ("environment", "solution", "tests"):
+        (task / name).mkdir(parents=True)
+    (task / "task.toml").write_text('schema_version = "1.3"\n[environment]\ngpus = 0\n')
+    (task / "instruction.md").write_text("Write a log.")
+    (task / "solution/solve.sh").write_text("#!/bin/sh\nexit 0\n")
+    (task / "tests/test.sh").write_text("#!/bin/sh\nexit 0\n")
+
+    external = tmp_path / "external-agent-logs"
+    backend = {
+        "import_path": "dressage.integrations.harbor.environment:DressageEnvironment",
+        "kwargs": {"auto_mounting": auto_mounting},
+    }
+    if external_mount:
+        backend["mounts"] = [
+            {"type": "bind", "source": str(external), "target": "/logs/agent"}
+        ]
+    config = TrialConfig.model_validate(
+        {
+            "task": {"path": task},
+            "agent": {"name": "oracle"},
+            "environment": backend,
+            "trial_name": "logs",
+            "trials_dir": tmp_path / "trials",
+        }
+    )
+    trial = await Trial.create(config)
+    env = trial.agent_environment
+    try:
+        await env.start(False)
+        payload = tmp_path / "probe.log"
+        payload.write_bytes(b"one log entry\n")
+        await env.upload_file(payload, "/logs/agent/probe.log")
+        target = trial.paths.agent_dir / "probe.log"
+        assert target.exists() == auto_mounting
+        if external_mount:
+            assert (external / "probe.log").read_bytes() == payload.read_bytes()
+
+        download = AsyncMock(wraps=env.download_dir)
+        monkeypatch.setattr(env, "download_dir", download)
+        await trial._download_agent_logs()
+        assert download.await_count == expected_downloads
+        assert target.read_bytes() == payload.read_bytes()
+        assert "Failed to download logs" not in trial.paths.log_path.read_text()
+    finally:
+        await env.stop(delete=True)
+        trial._close_logger_handler()
 
 
 def test_harbor_preflight_signature():

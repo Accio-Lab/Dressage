@@ -537,7 +537,7 @@ class DressageEnvironment(BaseEnvironment):
 
     def _build_harbor_mounts(self) -> dict[PurePosixPath, tuple[Path, bool]]:
         mounts: dict[PurePosixPath, tuple[Path, bool]] = {}
-        for mount in self._mounts:
+        for mount in self._host_mounts:
             if mount.get("type") != "bind":
                 raise ValueError("Dressage bwrap supports bind mounts only")
             target = _environment_path(mount["target"])
