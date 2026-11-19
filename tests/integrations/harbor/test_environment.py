@@ -56,13 +56,11 @@ def _environment(monkeypatch, tmp_path, session_id, mode, *, workdir="/app"):
     environment_dir.mkdir(parents=True, exist_ok=True)
     paths = TrialPaths(tmp_path / f"trial-{session_id}")
     paths.mkdir()
-    mounts = [
-        {
-            "type": "bind",
-            "source": str(paths.verifier_dir if verifier else paths.agent_dir),
-            "target": "/logs/verifier" if verifier else "/logs/agent",
-        }
-    ]
+    auto_mounts = None
+    if verifier:
+        auto_mounts = [
+            {"type": "bind", "source": str(paths.verifier_dir), "target": "/logs/verifier"}
+        ]
     policy = NetworkPolicy(
         network_mode=mode,
         allowed_hosts=["127.0.0.1"] if mode == NetworkMode.ALLOWLIST else [],
@@ -79,7 +77,7 @@ def _environment(monkeypatch, tmp_path, session_id, mode, *, workdir="/app"):
             workdir=workdir,
         ),
         network_policy=policy,
-        mounts=mounts,
+        auto_mounts=auto_mounts,
     )
 
 
@@ -91,6 +89,12 @@ async def test_agent_and_verifier_are_network_and_filesystem_isolated(
     verifier = _environment(
         monkeypatch, tmp_path, "trial__verifier__trial", NetworkMode.PUBLIC
     )
+    assert {mount["target"] for mount in agent._mounts} == {
+        "/logs/agent",
+        "/logs/verifier",
+        "/logs/artifacts",
+    }
+    assert {mount["target"] for mount in verifier._mounts} == {"/logs/verifier"}
     (verifier.environment_dir / "test.sh").write_text("#!/bin/bash\nexit 0\n")
     await agent.start(False)
     await verifier.start(False)
