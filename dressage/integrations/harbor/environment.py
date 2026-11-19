@@ -299,7 +299,8 @@ class DressageEnvironment(BaseEnvironment):
         )
 
     @classmethod
-    def preflight(cls) -> None:
+    def preflight(cls, kwargs: dict[str, Any] | None = None) -> None:
+        super().preflight(kwargs)
         if sys.platform != "linux":
             raise RuntimeError("Dressage bwrap requires Linux")
         _load_bwrap_integration_config()

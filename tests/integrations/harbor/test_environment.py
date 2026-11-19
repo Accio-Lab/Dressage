@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import inspect
 import json
 import shutil
 import subprocess
 import sys
+from unittest.mock import Mock
 
 import pytest
 
 
 pytest.importorskip("harbor")
 
+from harbor.environments.base import BaseEnvironment
+from harbor.environments.factory import EnvironmentFactory
 from harbor.models.task.config import EnvironmentConfig, NetworkMode, NetworkPolicy
 from harbor.models.trial.paths import TrialPaths
 
@@ -155,6 +159,14 @@ async def test_paths_mounts_and_arbitrary_artifacts_remain_safe(monkeypatch, tmp
         await environment.stop(True)
 
 
+def test_harbor_preflight_signature():
+    # Flag changes to the Harbor hook separately from the factory behavior tests.
+    parameters = inspect.signature(BaseEnvironment.preflight).parameters.values()
+    assert [(param.name, param.kind, param.default) for param in parameters] == [
+        ("kwargs", inspect.Parameter.POSITIONAL_OR_KEYWORD, None),
+    ]
+
+
 def test_preflight_uses_container_compatible_proc(monkeypatch, tmp_path):
     config = tmp_path / "integration.json"
     config.write_text(
@@ -186,6 +198,38 @@ def test_preflight_uses_container_compatible_proc(monkeypatch, tmp_path):
     assert "--unshare-pid" in commands[0]
     assert _contains(commands[0], ["--ro-bind", "/proc", "/proc"])
     assert "--proc" not in commands[0]
+
+
+@pytest.mark.parametrize(
+    "factory_arguments",
+    [
+        {},
+        {"kwargs": None},
+        {"kwargs": {}},
+        {"kwargs": {"test_marker": "keep"}},
+    ],
+    ids=["default", "explicit-none", "empty-options", "nonempty-options"],
+)
+def test_preflight_through_harbor_factory(factory_arguments, monkeypatch):
+    class BackendCheckReached(Exception):
+        """Stop at the first bwrap config lookup."""
+
+    backend = environment_module.DressageEnvironment
+    parse_options = Mock(wraps=backend.parse_options)
+    backend_check = Mock(side_effect=BackendCheckReached)
+    monkeypatch.setattr(backend, "parse_options", parse_options)
+    monkeypatch.setattr(environment_module.sys, "platform", "linux")
+    monkeypatch.setattr(environment_module, "_load_bwrap_integration_config", backend_check)
+
+    with pytest.raises(BackendCheckReached):
+        EnvironmentFactory.run_preflight(
+            type=None,
+            import_path="dressage.integrations.harbor.environment:DressageEnvironment",
+            **factory_arguments,
+        )
+
+    parse_options.assert_called_once_with(factory_arguments.get("kwargs"))
+    backend_check.assert_called_once_with()
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="bubblewrap requires Linux")
