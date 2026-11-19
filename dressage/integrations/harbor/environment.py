@@ -407,16 +407,6 @@ class DressageEnvironment(BaseEnvironment):
             parents=True, exist_ok=True
         )
         _rootfs_path(self._rootfs, PurePosixPath("/run/dressage-relay.py")).touch()
-        if self._separate_verifier:
-            if not self.environment_dir.is_dir():
-                raise NotADirectoryError(self.environment_dir)
-            await asyncio.to_thread(
-                shutil.copytree,
-                self.environment_dir,
-                _rootfs_path(self._rootfs, PurePosixPath("/tests")),
-                dirs_exist_ok=True,
-                symlinks=True,
-            )
         relay_path = self._session_root / "relay.py"
         relay_path.write_text(_RELAY_SOURCE, encoding="utf-8")
         relay_path.chmod(0o500)
