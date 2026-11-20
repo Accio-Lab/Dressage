@@ -22,7 +22,7 @@ For context, the public Terminal-Bench 2.0 leaderboard reports a verified little
 
 ## How it works
 
-Harbor owns Dataset resolution, Environments, Agents, Verifiers, trial retries, and rewards. Dressage routes every model request through its Gateway and Proxy, records trainable token-level data, and combines it with Harbor's verifier result. slime can consume the resulting trajectories to update the model.
+Harbor owns Dataset resolution, Environments, Agents, Verifiers, trial retries, and rewards. For supported Agent configurations, Dressage routes every model request through its Gateway and Proxy, records trainable token-level data, and combines it with Harbor's verifier result. slime can consume the resulting trajectories to update the model.
 
 ### Rollout
 
@@ -87,6 +87,8 @@ The top-level Integration Config modules have the following roles:
 | `artifacts` | Storage mode, location, durability, and permissions. |
 | `agent_protocol_overrides` | Per-Agent OpenAI/Anthropic protocol override. |
 | `training` | Reward, sampling, failure, and weight-version rules. |
+
+On Harbor `0.26.0`, `nemo-agent` is unsupported for Dressage rollouts and training. The supplied profiles leave it disabled. An explicit protocol override can still allow it to start. An external NeMo workflow YAML can retain its own inference endpoint, and with a generated workflow the trial route token can appear in Harbor DEBUG command logs.
 
 Within `gateway`, `listen_host` and `listen_port` are the local bind address. `advertise_url` is the address injected into the Harbor Agent. The latter must be reachable from the Agent; changing it does not create a listener, TLS certificate, reverse proxy, firewall rule, or tunnel.
 

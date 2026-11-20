@@ -18,6 +18,7 @@ import json
 import logging
 import os
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import ModuleType
 from typing import Any, Awaitable, Callable, Mapping, Protocol
 from urllib.parse import urlparse
@@ -213,6 +214,7 @@ class DressageHarborPlugin:
         self._results: dict[tuple[str, str], HarborTrajectoryBundle] = {}
         self._network_audits: dict[str, str] = {}
         self._task_dir_audits: dict[Path, tuple[str, str]] = {}
+        self._codex_config_dir: TemporaryDirectory[str] | None = None
         self._started = False
         self._closed = False
         self._close_lock = asyncio.Lock()
@@ -332,6 +334,7 @@ class DressageHarborPlugin:
         except Exception:
             await self.aclose()
             raise
+        prepared_agents: list[tuple[Any, Any]] = []
         seen_names: set[str] = set()
         for trial_config in pending:
             trial_name = str(getattr(trial_config, "trial_name"))
@@ -372,6 +375,7 @@ class DressageHarborPlugin:
                 slot_id.encode()
             ).hexdigest()[:24].upper()
             try:
+                self._snapshot_codex_config_file(agent)
                 token = registry.create(
                     job_id=self._job_id,
                     slot_id=slot_id,
@@ -381,8 +385,6 @@ class DressageHarborPlugin:
                     raise TypeError("SecretSlotRegistry.create must be synchronous")
                 token = registry.current(slot_id)
                 os.environ[env_name] = token
-                _inject_agent_routing(agent, self.config, env_name, gateway_url)
-                trial_config.agent = agent
                 self._slots[trial_name] = SlotRecord(
                     slot_id=slot_id,
                     env_name=env_name,
@@ -398,6 +400,8 @@ class DressageHarborPlugin:
                         binding.expected_weight_version if binding is not None else None
                     ),
                 )
+                _inject_agent_routing(agent, self.config, env_name, gateway_url)
+                prepared_agents.append((trial_config, agent))
             except Exception:
                 await self.aclose()
                 raise
@@ -415,6 +419,9 @@ class DressageHarborPlugin:
         except Exception:
             await self.aclose()
             raise
+        # Publish trial copies only after startup can keep their snapshots and slots.
+        for trial_config, agent in prepared_agents:
+            trial_config.agent = agent
         self._started = True
 
     async def on_job_end(self, job_result: Any) -> None:
@@ -438,6 +445,23 @@ class DressageHarborPlugin:
                 )
         finally:
             await self.aclose()
+
+    def _snapshot_codex_config_file(self, agent: Any) -> None:
+        source = (getattr(agent, "kwargs", {}) or {}).get("config")
+        if not isinstance(source, (str, Path)):
+            return
+        from harbor.agents.factory import AgentFactory
+
+        if AgentFactory.get_agent_class_from_config(agent).name() != "codex":
+            return
+        # Harbor reads this TOML again at agent construction, including on retries.
+        content = Path(source).read_bytes()
+        if self._codex_config_dir is None:
+            self._codex_config_dir = TemporaryDirectory(prefix="dressage-codex-config-")
+        snapshot = Path(self._codex_config_dir.name) / (hashlib.sha256(content).hexdigest() + ".toml")
+        if not snapshot.exists():
+            snapshot.write_bytes(content)
+        agent.kwargs["config"] = str(snapshot)
 
     async def aclose(self) -> None:
         """Idempotently close routes, secrets, clients, and the Gateway lease."""
@@ -599,6 +623,8 @@ class DressageHarborPlugin:
             for task in pending_final:
                 self._track_background_close(task, "resource release")
         finally:
+            if self._codex_config_dir is not None:
+                self._codex_config_dir.cleanup()
             self._closed = True
 
     def _safe(
@@ -1028,6 +1054,90 @@ def _default_route_spec_factory() -> Callable[..., Any]:
     return RouteSpec
 
 
+def _opencode_uses_versioned_base_url(agent: Any, connection: Any, config_key: str) -> bool:
+    from harbor.agents.installed.opencode import opencode_native_model_parts
+    from harbor.models.model_api_format import ModelApiFormat
+
+    if connection.model_api_format is not None:
+        return connection.model_api_format in (
+            ModelApiFormat.ANTHROPIC_MESSAGES,
+            ModelApiFormat.OPENAI_CHAT_COMPLETIONS,
+        )
+
+    # Harbor leaves the format unset for the built-in Anthropic provider.
+    config = agent.kwargs.get(config_key) or {}
+    provider = connection.provider
+    if agent.skip_model_parsing or provider is None:
+        provider, _ = opencode_native_model_parts(agent.model_name or "", config)
+    package = (config.get("provider") or {}).get(provider, {}).get("npm")
+    return package in ("@ai-sdk/anthropic", "@ai-sdk/openai-compatible") or (
+        package is None and provider == "anthropic"
+    )
+
+
+def _bind_trial_model_connection(
+    agent: Any, protocol: str, gateway_url: str, env_name: str
+) -> None:
+    from harbor.agents.agent_auth_resolution import resolve_agent_model_connection
+    from harbor.agents.factory import AgentFactory
+    from harbor.models.model_api_format import ModelApiFormat
+    from harbor.utils.env import is_sensitive_env_key
+
+    agent_class = AgentFactory.get_agent_class_from_config(agent)
+    if agent_class.MODEL_CONNECTION is None:
+        return
+
+    agent_name = agent_class.name()
+    versioned_url = f"{gateway_url}/v1"
+    target_url = versioned_url if protocol == "openai" else gateway_url
+    if protocol == "both":
+        agent.base_url = None
+        agent.model_api_key_name = None
+        native = resolve_agent_model_connection(agent)
+        target_url = native.execution_base_url
+        if target_url not in (gateway_url, versioned_url):
+            raise RoutingPolicyError(
+                "Cannot determine the Gateway endpoint for this agent; "
+                "select openai or anthropic in agent_protocol_overrides"
+            )
+        # The model provider prefix does not change either client's OpenAI protocol.
+        if agent_name in ("codex", "qwen-coder"):
+            target_url = versioned_url
+        elif agent_name == "claude-code" and native.model_api_format == ModelApiFormat.ANTHROPIC_MESSAGES:
+            target_url = gateway_url  # Claude Code appends /v1/messages.
+
+    agent.base_url = target_url
+    agent.model_api_key_name = env_name
+    try:
+        connection = resolve_agent_model_connection(agent)
+    except ValueError:
+        # Some valid configurations (e.g. an OpenCode bare model) accept env only.
+        agent.base_url = None
+        agent.model_api_key_name = None
+        connection = resolve_agent_model_connection(agent)
+
+    sdk_config_key = {"opencode": "opencode_config", "mimo": "mimo_config"}.get(agent_name)
+    if (
+        sdk_config_key is not None
+        and target_url != versioned_url
+        and _opencode_uses_versioned_base_url(agent, connection, sdk_config_key)
+    ):
+        target_url = versioned_url
+        if agent.base_url is not None:
+            agent.base_url = target_url
+            connection = resolve_agent_model_connection(agent)
+
+    trial_token = os.environ[env_name]
+    if connection.execution_base_url != target_url or connection.api_key != trial_token:
+        raise RoutingPolicyError("Harbor did not resolve the Gateway URL and Trial credential together")
+    # Harbor's exec logger masks sensitive variable names and the current selector.
+    if any(
+        value == trial_token and key != agent.model_api_key_name and not is_sensitive_env_key(key)
+        for key, value in connection.env.items()
+    ):
+        raise RoutingPolicyError("Harbor cannot redact all Trial credential variables in its execution logs")
+
+
 def _inject_agent_routing(
     agent: Any,
     config: Any,
@@ -1038,6 +1148,11 @@ def _inject_agent_routing(
     advertise_url = advertise_url.rstrip("/")
     token_template = "${" + env_name + "}"
     protocol = _agent_protocol(agent, config)
+    # Remove an old literal before changing the selector that Harbor uses for redaction.
+    old_selector = getattr(agent, "model_api_key_name", None)
+    if old_selector:
+        env.pop(old_selector, None)
+    env.pop(env_name, None)
     if protocol in {"openai", "both"}:
         env.update({
             "OPENAI_API_KEY": token_template,
@@ -1062,6 +1177,8 @@ def _inject_agent_routing(
                 }
             )
     agent.env = env
+    if hasattr(agent, "model_api_key_name"):
+        _bind_trial_model_connection(agent, protocol, advertise_url, env_name)
     hostname = urlparse(advertise_url).hostname
     hosts = list(getattr(agent, "extra_allowed_hosts", None) or [])
     if hostname:

@@ -3,11 +3,17 @@ from __future__ import annotations
 import asyncio
 import copy
 from contextlib import asynccontextmanager
+from dataclasses import replace
 import json
+import logging
+import os
+from pathlib import Path
+import shlex
 import socket
 import tempfile
 import threading
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -58,6 +64,479 @@ def _restricted_task_audit(monkeypatch):
     monkeypatch.setattr(
         plugin_module, "_audit_task_network_file", lambda path: ("f" * 64, "restricted")
     )
+
+
+@pytest.mark.asyncio
+async def test_start_failure_preserves_pending_agent_configs(
+    tmp_path, monkeypatch, integration_config_factory, runtime_factory,
+    proxy_client_factory, trial_factory, job_factory,
+):
+    first, second = trial_factory("first"), trial_factory("second")
+    original_first, original_second = first.agent, second.agent
+    job = job_factory([first, second])
+    config = integration_config_factory()
+    runtime = runtime_factory()
+    create_slot = runtime.secret_slots.create
+
+    def fail_second_slot(**kwargs):
+        if kwargs["slot_id"] == "job-a:second":
+            raise RuntimeError("second slot allocation failed")
+        return create_slot(**kwargs)
+
+    monkeypatch.setattr(runtime.secret_slots, "create", fail_second_slot)
+    plugin = _plugin(tmp_path, config, runtime, proxy_client_factory())
+    with pytest.raises(RuntimeError, match="second slot allocation failed"):
+        await plugin.on_job_start(job)
+    assert first.agent is original_first
+    assert second.agent is original_second
+    assert not job.hooks
+
+    retry = _plugin(tmp_path, config, runtime_factory(), proxy_client_factory())
+    try:
+        await retry.on_job_start(job)
+        assert first.agent is not original_first
+        assert second.agent is not original_second
+    finally:
+        await retry.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("gateway", "old_url", "selector"),
+    [
+        ({}, None, None),
+        ({"advertise_url": "https://gateway.example"}, "https://gateway.example", None),
+        ({"advertise_url": "https://gateway.example"}, "https://previous.example/v1", "INFERENCE_PASS"),
+        ({}, "https://previous.example/v1", "INFERENCE_PASS"),
+    ],
+    ids=["omitted", "same-host", "other-key", "dynamic-gateway"],
+)
+@pytest.mark.parametrize(
+    ("name", "model", "key_variable"),
+    [
+        ("claude-code", "Qwen/Qwen3.5-4B", "ANTHROPIC_API_KEY"),
+        ("codex", "openai/gpt-4.1", "OPENAI_API_KEY"),
+        ("qwen-coder", "openai/gpt-4.1", "OPENAI_API_KEY"),
+        ("opencode", "openai/gpt-4.1", "OPENAI_API_KEY"),
+        ("openclaw", "openai/gpt-4.1", "OPENAI_API_KEY"),
+    ],
+)
+async def test_harness_uses_trial_gateway_and_credential(
+    gateway,
+    old_url,
+    selector,
+    name,
+    model,
+    key_variable,
+    monkeypatch,
+    tmp_path,
+    integration_config_factory,
+    proxy_client_factory,
+    runtime_factory,
+    trial_factory,
+    job_factory,
+):
+    pytest.importorskip("harbor")
+    from harbor.agents.factory import AgentFactory
+    from harbor.models.trial.config import AgentConfig, TaskConfig, TrialConfig
+
+    monkeypatch.setenv("DRESSAGE_PROXY_API_KEY", "test-backend")
+    task_path = trial_factory(agent_name=name).task.get_local_path()
+    user_env = {selector: "old-test-credential"} if selector else {}
+    user_agent = AgentConfig(
+        name=name, model_name=model, model_api_key_name=selector, base_url=old_url, env=user_env
+    )
+    trial = TrialConfig(trial_name="trial-a", task=TaskConfig(path=task_path), agent=user_agent)
+    runtime = runtime_factory()
+    overrides = {name: "openai"} if name in {"opencode", "openclaw"} else {}
+    config = integration_config_factory(gateway=gateway, agent_protocol_overrides=overrides)
+    plugin = _plugin(tmp_path, config, runtime, proxy_client_factory())
+    try:
+        await plugin.on_job_start(job_factory([trial]))
+        agent = AgentFactory.create_agent_from_config(trial.agent, logs_dir=tmp_path)
+        assert agent.model_connection.env[key_variable] == runtime.secret_slots.current(
+            "job-a:trial-a"
+        )
+        expected_url = gateway.get("advertise_url", runtime.lease.public_url)
+        if key_variable == "OPENAI_API_KEY":
+            expected_url += "/v1"
+        assert agent.model_connection.execution_base_url == expected_url
+        assert trial.agent.base_url == expected_url
+        if name == "claude-code":
+            assert agent._resolve_auth_env()["ANTHROPIC_BASE_URL"] == expected_url
+        if name == "codex":
+            effective_config = agent._build_effective_config(agent._resolved_base_url())
+            assert effective_config["openai_base_url"] == expected_url
+        saved = trial.model_dump_json(indent=4)  # Harbor writes this to the Trial's config.json.
+        assert "old-test-credential" not in saved
+        assert "INFERENCE_PASS" not in json.loads(saved)["agent"].get("env", {})
+        assert user_agent.env == user_env
+        assert user_agent.base_url == old_url
+        assert trial.agent.env[key_variable] == f"${{{trial.agent.model_api_key_name}}}"
+        assert user_agent.model_api_key_name == selector
+    finally:
+        await plugin.aclose()
+
+
+@pytest.mark.parametrize("initial_url", [None, "http://localhost/v1", "https://previous.example"])
+@pytest.mark.parametrize(
+    ("name", "model", "suffix", "key_variable"),
+    [
+        ("codex", "openai/gpt-4.1", "/v1", "OPENAI_API_KEY"),
+        ("codex", "anthropic/claude-sonnet-4-5", "/v1", "OPENAI_API_KEY"),
+        ("qwen-coder", "anthropic/claude-sonnet-4-5", "/v1", "OPENAI_API_KEY"),
+        ("claude-code", "Qwen/Qwen3.5-4B", "", "ANTHROPIC_API_KEY"),
+        ("claude-code", "openai/gpt-4.1", "", "ANTHROPIC_AUTH_TOKEN"),
+    ],
+)
+def test_both_protocols_select_the_harness_gateway(
+    name, model, suffix, key_variable, initial_url, monkeypatch, tmp_path
+):
+    pytest.importorskip("harbor")
+    from harbor.agents.factory import AgentFactory
+    from harbor.models.trial.config import AgentConfig
+
+    monkeypatch.setenv("DRESSAGE_HARBOR_ROUTE_TEST", "trial-credential")
+    config = {"agent_protocol_overrides": {name: "both"}}
+    agent_config = AgentConfig(name=name, model_name=model, base_url=initial_url)
+    plugin_module._inject_agent_routing(
+        agent_config, config, "DRESSAGE_HARBOR_ROUTE_TEST", "http://localhost"
+    )
+    agent = AgentFactory.create_agent_from_config(agent_config, logs_dir=tmp_path)
+    expected_url = "http://localhost" + suffix
+    if name == "codex":
+        settings = agent._build_effective_config(agent._resolved_base_url())
+        assert settings["openai_base_url"] == expected_url
+    elif name == "qwen-coder":
+        assert agent.model_connection.env["OPENAI_BASE_URL"] == expected_url
+    assert agent.model_connection.execution_base_url == expected_url
+    assert agent.model_connection.api_key == "trial-credential"
+    env = agent.extra_env
+    if name == "claude-code":
+        env = agent._resolve_auth_env()
+        assert env["ANTHROPIC_BASE_URL"] == expected_url
+    assert env[key_variable] == "trial-credential"
+
+
+@pytest.mark.parametrize("name", ["opencode", "mimo"])
+@pytest.mark.parametrize("initial_url", [None, "http://localhost/v1"], ids=["omitted", "versioned"])
+@pytest.mark.parametrize("protocol", ["anthropic", "both"])
+@pytest.mark.parametrize(
+    ("model", "provider", "package", "model_api_format", "skip_model_parsing", "suffix"),
+    [
+        ("anthropic/claude-sonnet-4-5", "anthropic", None, None, False, "/v1"),
+        ("team/sonnet", "team", "@ai-sdk/anthropic", None, True, "/v1"),
+        ("anthropic/claude-sonnet-4-5", "anthropic", "@ai-sdk/openai-compatible", None, False, "/v1"),
+        ("anthropic/claude-sonnet-4-5", "anthropic", "@ai-sdk/anthropic", "openai_chat_completions", False, "/v1"),
+        ("sonnet", "anthropic", None, None, True, "/v1"),
+        ("anthropic/claude-sonnet-4-5", "anthropic", "custom-native-sdk", None, False, ""),
+    ],
+    ids=["builtin", "native-sdk", "openai-compatible", "explicit-chat", "native-default-provider", "other-sdk"],
+)
+def test_opencode_and_mimo_provider_gateway_base_url(
+    name, initial_url, protocol, model, provider, package, model_api_format, skip_model_parsing, suffix,
+    monkeypatch, tmp_path
+):
+    pytest.importorskip("harbor")
+    from harbor.agents.factory import AgentFactory
+    from harbor.models.trial.config import AgentConfig
+
+    gateway = "http://localhost"
+    slot = "DRESSAGE_HARBOR_ROUTE_TEST"
+    monkeypatch.setenv(slot, "trial-credential")
+    native = {"provider": {provider: {"npm": package}}} if package else {}
+    if "/" not in model:
+        native["model"] = f"{provider}/{model}"
+    trial_agent = AgentConfig(
+        name=name, model_name=model, base_url=initial_url, model_api_format=model_api_format,
+        skip_model_parsing=skip_model_parsing, kwargs={f"{name}_config": native},
+    )
+    plugin_module._inject_agent_routing(
+        trial_agent, {"agent_protocol_overrides": {name: protocol}}, slot, gateway
+    )
+    agent = AgentFactory.create_agent_from_config(trial_agent, logs_dir=tmp_path)
+    command = shlex.split(agent._build_register_config_command())
+    settings = json.loads(command[command.index("echo") + 1])
+    entry = settings["provider"][provider]
+    assert entry["options"]["baseURL"] == gateway + suffix
+    expected_package = "@ai-sdk/openai-compatible" if model_api_format else package
+    assert entry.get("npm") == expected_package
+    key_variable = agent.model_connection.api_key_destination_name
+    assert entry["options"]["apiKey"] == f"{{env:{key_variable}}}"
+    assert agent.model_connection.env[key_variable] == "trial-credential"
+
+def test_mimo_anthropic_ignores_shadowed_base_url_kwarg(monkeypatch, tmp_path):
+    pytest.importorskip("harbor")
+    from harbor.agents.factory import AgentFactory
+    from harbor.models.trial.config import AgentConfig
+
+    slot = "DRESSAGE_HARBOR_ROUTE_TEST"
+    monkeypatch.setenv(slot, "trial-credential")
+    config = AgentConfig(
+        name="mimo", model_name="anthropic/claude-sonnet-4-5",
+        base_url="http://localhost/v1", kwargs={"base_url": ""},
+    )
+    plugin_module._inject_agent_routing(
+        config, {"agent_protocol_overrides": {"mimo": "anthropic"}}, slot, "http://localhost"
+    )
+    agent = AgentFactory.create_agent_from_config(config, logs_dir=tmp_path)
+    assert agent.model_connection.execution_base_url == "http://localhost/v1"
+    assert agent.model_connection.api_key == "trial-credential"
+
+
+def test_opencode_both_keeps_gateway_endpoint_check(monkeypatch):
+    pytest.importorskip("harbor")
+    from harbor.models.trial.config import AgentConfig
+
+    slot = "DRESSAGE_HARBOR_ROUTE_TEST"
+    monkeypatch.setenv(slot, "trial-credential")
+    trial_agent = AgentConfig(
+        name="opencode", model_name="anthropic/claude-sonnet-4-5",
+        kwargs={"base_url": "http://localhost:39001/v1"},
+    )
+    with pytest.raises(RoutingPolicyError, match="Cannot determine the Gateway endpoint"):
+        plugin_module._inject_agent_routing(
+            trial_agent, {"agent_protocol_overrides": {"opencode": "both"}}, slot, "http://localhost"
+        )
+
+
+def test_opencode_bare_model_uses_gateway_environment(monkeypatch, tmp_path):
+    pytest.importorskip("harbor")
+    from harbor.agents.factory import AgentFactory
+    from harbor.models.trial.config import AgentConfig
+
+    monkeypatch.setenv("DRESSAGE_HARBOR_ROUTE_TEST", "trial-credential")
+    agent_config = AgentConfig(name="opencode", model_name="gpt-4.1", skip_model_parsing=True)
+    config = {"agent_protocol_overrides": {"opencode": "openai"}}
+    plugin_module._inject_agent_routing(
+        agent_config, config, "DRESSAGE_HARBOR_ROUTE_TEST", "http://localhost"
+    )
+    agent = AgentFactory.create_agent_from_config(agent_config, logs_dir=tmp_path)
+    assert agent_config.base_url is None
+    assert agent_config.model_api_key_name is None
+    assert agent.model_connection.execution_base_url == "http://localhost/v1"
+    assert agent.model_connection.env["OPENAI_API_KEY"] == "trial-credential"
+
+
+def test_trial_selector_uses_host_slot_over_agent_environment(monkeypatch, tmp_path):
+    pytest.importorskip("harbor")
+    from harbor.agents.factory import AgentFactory
+    from harbor.models.trial.config import AgentConfig
+
+    monkeypatch.setenv("DRESSAGE_HARBOR_ROUTE_TEST", "trial-credential")
+    config = AgentConfig(
+        name="codex", model_name="openai/gpt-4.1",
+        env={"DRESSAGE_HARBOR_ROUTE_TEST": "stale-credential"},
+    )
+    plugin_module._inject_agent_routing(
+        config, {}, "DRESSAGE_HARBOR_ROUTE_TEST", "http://localhost"
+    )
+    agent = AgentFactory.create_agent_from_config(config, logs_dir=tmp_path)
+    assert agent.model_connection.env["OPENAI_API_KEY"] == "trial-credential"
+
+
+@pytest.mark.asyncio
+async def test_default_codex_exec_log_masks_the_trial_credential(monkeypatch, tmp_path, caplog):
+    pytest.importorskip("harbor")
+    from harbor.agents.factory import AgentFactory
+    from harbor.models.trial.config import AgentConfig
+    from harbor.utils.env import redact_sensitive_value
+
+    slot = "DRESSAGE_HARBOR_ROUTE_TEST"
+    destination = "OPENAI_API_KEY"
+    monkeypatch.setenv(slot, "first-test-credential")
+    monkeypatch.setenv(destination, "ambient-test-credential")
+    user_agent = AgentConfig(
+        name="codex", model_name="openai/gpt-4.1",
+        model_api_key_name="INFERENCE_PASS", env={"INFERENCE_PASS": "old-test-credential"},
+    )
+    config = user_agent.model_copy(deep=True)
+    plugin_module._inject_agent_routing(config, {}, slot, "http://localhost")
+    assert config.model_api_key_name == slot
+    assert "INFERENCE_PASS" not in config.env
+    assert user_agent.env == {"INFERENCE_PASS": "old-test-credential"}
+
+    logger = logging.getLogger("dressage.test.harbor.exec")
+    sandbox = SimpleNamespace(exec=AsyncMock(return_value=SimpleNamespace(
+        return_code=0, stdout="", stderr=""
+    )))
+    for token in ("first-test-credential", "retry-test-credential"):
+        monkeypatch.setenv(slot, token)
+        agent = AgentFactory.create_agent_from_config(config, logs_dir=tmp_path, logger=logger)
+        env = agent.model_connection.env
+        assert agent.model_connection.execution_base_url == "http://localhost/v1"
+        assert env[destination] == token
+        assert os.environ[destination] == "ambient-test-credential"
+        saved = config.model_dump_json()
+        assert token not in saved and "old-test-credential" not in saved
+
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger=logger.name):
+            await agent.exec_as_agent(sandbox, command="true", env=dict(env))
+        (record,) = [r for r in caplog.records if hasattr(r, "env")]
+        assert record.env[destination] == redact_sensitive_value(token)
+        assert token not in record.env.values()
+        assert sandbox.exec.call_args.kwargs["env"][destination] == token
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("old_selector", ["INFERENCE_PASS", "LEGACY_INPUT"])
+async def test_job_rejects_an_unmasked_codex_credential_destination(
+    old_selector, tmp_path, monkeypatch, integration_config_factory, runtime_factory,
+    proxy_client_factory, trial_factory, job_factory,
+):
+    pytest.importorskip("harbor")
+    from harbor.models.trial.config import AgentConfig
+
+    monkeypatch.setenv("DRESSAGE_PROXY_API_KEY", "test-backend")
+    native_config = {
+        "model_provider": "local",
+        "model_providers": {"local": {"env_key": "INFERENCE_PASS"}},
+    }
+    user_agent = AgentConfig(
+        name="codex", model_name="openai/gpt-4.1", kwargs={"config": native_config},
+        model_api_key_name=old_selector, env={old_selector: "old-test-credential"},
+    )
+    trial = trial_factory()
+    trial.agent = user_agent
+    job = job_factory([trial])
+    runtime = runtime_factory()
+    plugin = _plugin(tmp_path, integration_config_factory(), runtime, proxy_client_factory())
+    try:
+        with pytest.raises(RoutingPolicyError, match="cannot redact"):
+            await plugin.on_job_start(job)
+        assert trial.agent is user_agent
+        assert user_agent.env == {old_selector: "old-test-credential"}
+        assert not job.hooks
+        assert not runtime.lease.specs
+        assert runtime.secret_slots.closed_jobs == [job.id]
+        assert runtime.lease.release_calls == 1
+    finally:
+        await plugin.aclose()
+
+
+@pytest.mark.asyncio
+async def test_failed_job_start_preserves_trial_configs_for_reattach(
+    tmp_path, integration_config_factory, runtime_factory, proxy_client_factory,
+    trial_factory, job_factory,
+):
+    pytest.importorskip("harbor")
+    from harbor.models.trial.config import AgentConfig
+
+    source = tmp_path / "codex.toml"
+    source.write_text('model_provider = "openai"\n')
+    first = trial_factory("first")
+    second = trial_factory("second")
+    first.agent = AgentConfig(
+        name="codex", model_name="openai/gpt-4.1", kwargs={"config": str(source)}
+    )
+    invalid_config = {
+        "model_provider": "local",
+        "model_providers": {"local": {"env_key": "INFERENCE_PASS"}},
+    }
+    second.agent = AgentConfig(
+        name="codex", model_name="openai/gpt-4.1", kwargs={"config": invalid_config}
+    )
+    job = job_factory([first, second])
+    config = integration_config_factory()
+    plugin = _plugin(tmp_path, config, runtime_factory(), proxy_client_factory())
+    with pytest.raises(RoutingPolicyError, match="cannot redact"):
+        await plugin.on_job_start(job)
+
+    assert first.agent.kwargs["config"] == str(source)
+    assert first.agent.model_api_key_name is None
+    second.agent = AgentConfig(name="codex", model_name="openai/gpt-4.1")
+    retry = _plugin(tmp_path, config, runtime_factory(), proxy_client_factory())
+    try:
+        await retry.on_job_start(job)
+        snapshot = Path(first.agent.kwargs["config"])
+        assert snapshot != source
+        assert snapshot.read_bytes() == source.read_bytes()
+        assert "config" not in second.agent.kwargs
+    finally:
+        await retry.aclose()
+    assert source.is_file()
+    assert not snapshot.exists()
+
+
+@pytest.mark.asyncio
+async def test_codex_file_keeps_the_checked_credential_destination(
+    tmp_path, monkeypatch, integration_config_factory, runtime_factory,
+    proxy_client_factory, trial_factory, job_factory
+):
+    pytest.importorskip("harbor")
+    from harbor.agents.factory import AgentFactory
+    from harbor.models.trial.config import AgentConfig
+    import toml
+
+    monkeypatch.setenv("DRESSAGE_PROXY_API_KEY", "test-backend")
+    source = tmp_path / "codex.toml"
+    settings = {"model_provider": "local", "model_providers": {
+        "local": {"env_key": "PROVIDER_API_KEY", "base_url": "http://localhost:39001/v1"},
+    }}
+    source.write_text(toml.dumps(settings))
+    original = AgentConfig(name="codex", model_name="openai/gpt-4.1", kwargs={"config": str(source)})
+    trial = trial_factory()
+    trial.agent = original
+    runtime = runtime_factory()
+    plugin = _plugin(tmp_path, integration_config_factory(), runtime, proxy_client_factory())
+    try:
+        await plugin.on_job_start(job_factory([trial]))
+        snapshot = Path(trial.agent.kwargs["config"])
+        assert snapshot != source
+        assert original.kwargs["config"] == str(source)
+        settings["model_providers"]["local"]["env_key"] = "NEW_DESTINATION"
+        source.write_text(toml.dumps(settings))
+        agent = AgentFactory.create_agent_from_config(trial.agent, logs_dir=tmp_path)
+        assert agent.model_connection.api_key_destination_name == "PROVIDER_API_KEY"
+        assert agent.model_connection.env["PROVIDER_API_KEY"] == runtime.secret_slots.current("job-a:trial-a")
+    finally:
+        await plugin.aclose()
+    assert source.is_file()
+    assert not snapshot.exists()
+
+
+@pytest.mark.asyncio
+async def test_job_rejects_an_unmasked_extra_credential_projection(
+    monkeypatch, tmp_path, integration_config_factory, runtime_factory,
+    proxy_client_factory, trial_factory, job_factory
+):
+    pytest.importorskip("harbor")
+    from harbor.agents import agent_auth_resolution
+    from harbor.models.trial.config import AgentConfig
+
+    resolve = agent_auth_resolution.resolve_agent_model_connection
+
+    def resolve_with_extra_destination(config):
+        connection = resolve(config)
+        return replace(connection, env={**connection.env, "SECOND_INPUT": connection.api_key})
+
+    monkeypatch.setattr(agent_auth_resolution, "resolve_agent_model_connection", resolve_with_extra_destination)
+    monkeypatch.setenv("DRESSAGE_PROXY_API_KEY", "test-backend")
+    original = AgentConfig(name="codex", model_name="openai/gpt-4.1")
+    trial = trial_factory()
+    trial.agent = original
+    runtime = runtime_factory()
+    plugin = _plugin(tmp_path, integration_config_factory(), runtime, proxy_client_factory())
+    job = job_factory([trial])
+    with pytest.raises(RoutingPolicyError, match="cannot redact"):
+        await plugin.on_job_start(job)
+    assert trial.agent is original
+    assert not job.hooks
+    assert runtime.secret_slots.closed_jobs == [job.id]
+    assert runtime.lease.release_calls == 1
+
+
+def test_agent_without_model_connection_keeps_selector_unset():
+    pytest.importorskip("harbor")
+    from harbor.models.trial.config import AgentConfig
+
+    agent = AgentConfig(name="oracle")
+    config = {"agent_protocol_overrides": {"oracle": "openai"}}
+    plugin_module._inject_agent_routing(
+        agent, config, "DRESSAGE_HARBOR_ROUTE_TEST", "http://localhost"
+    )
+    assert agent.model_api_key_name is None
 
 
 @pytest.mark.asyncio
