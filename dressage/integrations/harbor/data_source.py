@@ -5,7 +5,7 @@ contains safe, opaque identifiers; resolved Harbor TaskConfig/AgentConfig
 objects (and especially agent environment variables) stay in the process-local
 registry and are looked up by :meth:`HarborDataSource.resolve_spec`.
 
-Harbor 0.18 requires Python 3.12, but Dressage itself supports Python 3.10.
+Harbor 0.26 requires Python 3.12, but Dressage itself supports Python 3.10.
 Consequently this module has no eager Harbor import and remains importable in a
 base Dressage environment.  Runtime compatibility is checked when the data
 source is instantiated.
@@ -541,7 +541,7 @@ def _harbor_job_config_type() -> type[Any]:
         ModuleNotFoundError,
     ) as exc:  # pragma: no cover - guarded by version check
         raise HarborDataSourceConfigurationError(
-            "Harbor 0.18 is installed but harbor.models.job.config.JobConfig is unavailable"
+            "Harbor 0.26 is installed but harbor.models.job.config.JobConfig is unavailable"
         ) from exc
     return JobConfig
 

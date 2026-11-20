@@ -608,7 +608,7 @@ def _assign_partition_trials(
     bindings: dict[str, TrialBinding] = {}
     for entry in plan:
         if entry.agent_index != 0 or entry.task_index >= len(partition):
-            raise HarborRolloutError("Harbor v0.18 trial plan no longer matches batching")
+            raise HarborRolloutError("Harbor v0.26 trial plan no longer matches batching")
         item = partition[entry.task_index]
         if entry.attempt_index >= len(item.templates):
             raise HarborRolloutError("Harbor trial attempt exceeds source group size")

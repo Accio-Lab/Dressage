@@ -48,13 +48,13 @@ This is a capability statement, not a claim that the integration continuously le
 
 All commands below assume the default Dressage image, whose working directory is `/root/Dressage` and whose Python version is already 3.12.
 
-- `harbor==0.18.0` and `dressage-blackbox-server==1.1.0`, installed by the Harbor extra.
+- `harbor==0.26.0` and `dressage-blackbox-server==1.1.0`, installed by the Harbor extra.
 - For E2B jobs: a valid `E2B_API_KEY`.
 - For bwrap jobs: Linux with `bwrap` and the local Agent dependencies.
 
 ```bash
 cd /root/Dressage
-python -m pip install -e '.[harbor]'
+python -m pip install ./blackbox_server -e '.[harbor]'
 harbor plugins list
 ```
 

@@ -1,4 +1,4 @@
-"""Minimal local bubblewrap environment for Harbor 0.18.
+"""Minimal local bubblewrap environment for Harbor 0.26.
 
 The agent and verifier receive separate filesystem roots.  Agent sandboxes use
 an isolated network namespace with a single loopback relay to the Dressage
@@ -239,7 +239,7 @@ def _is_separate_verifier_session(
     session_id: str,
     mounts: list[dict[str, Any]],
 ) -> bool:
-    """Recognize Harbor 0.18's separate-verifier constructor contract."""
+    """Recognize Harbor 0.26's separate-verifier constructor contract."""
 
     targets = {
         str(mount.get("target")) for mount in mounts if mount.get("type") == "bind"
