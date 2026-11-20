@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import os
@@ -264,6 +265,33 @@ def bwrap_network_namespace():
     if permission_denied or namespace_limit_exceeded:
         pytest.skip(f"bwrap cannot create an isolated network namespace: {error}")
     pytest.fail(f"bwrap network namespace probe exited {probe.returncode}: {error}")
+
+
+@pytest.mark.usefixtures("bwrap_network_namespace")
+@pytest.mark.asyncio
+async def test_allowlisted_bwrap_forwards_loopback_to_gateway(monkeypatch, tmp_path):
+    agent = _environment(monkeypatch, tmp_path, "trial__env", NetworkMode.ALLOWLIST)
+    monkeypatch.chdir(tmp_path)
+    socket_dir = tmp_path / "runtime" / "gateway"
+    socket_dir.mkdir(parents=True)
+
+    async def reply(reader, writer):
+        writer.write(b"gateway: " + await reader.readline())
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    async with await asyncio.start_unix_server(reply, "runtime/gateway/gateway.sock"):
+        await agent.start(False)
+        try:
+            result = await agent.exec(
+                "exec 3<>/dev/tcp/127.0.0.1/39100 && echo ping >&3 && head -n1 <&3",
+                timeout_sec=10,
+            )
+            assert result.return_code == 0, result.stderr
+            assert result.stdout == "gateway: ping\n"
+        finally:
+            await agent.stop(True)
 
 
 @pytest.mark.usefixtures("bwrap_network_namespace")

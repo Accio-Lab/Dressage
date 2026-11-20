@@ -73,6 +73,8 @@ def enable_loopback():
     interface = struct.pack("16sH", b"lo", 0)
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as control:
         flags = struct.unpack("16sH", fcntl.ioctl(control, 0x8913, interface))[1]
+        if flags & 0x1:  # IFF_UP: bwrap already enabled loopback.
+            return
         fcntl.ioctl(
             control,
             0x8914,
