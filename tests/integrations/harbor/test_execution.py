@@ -27,6 +27,7 @@ from dressage.integrations.harbor.gateway import (
     GatewayRuntime,
     RouteConflictError,
     RouteSpec,
+    _rewrite_payload,
 )
 from dressage.integrations.harbor.plugin import (
     AttemptPhase,
@@ -34,6 +35,7 @@ from dressage.integrations.harbor.plugin import (
     RoutingPolicyError,
     TrialBinding,
 )
+from dressage.proxy.server import _build_sampling_params
 
 
 class _Compat:
@@ -1064,6 +1066,133 @@ class _GatewayProxy:
 
     async def consume_max_steps_error(self):
         return self.errors["max_steps"]
+
+
+@pytest.mark.parametrize(
+    ("trial_id", "expected_seed"),
+    [
+        ("00000000-0000-4000-8000-000000000000", 1597775339045622846),
+        ("00000000-0000-4000-8000-000000000005", 496124699652228910),
+    ],
+)
+def test_gateway_training_seed_reaches_proxy(trial_id, expected_seed, monkeypatch):
+    monkeypatch.setenv("DRESSAGE_PROXY_API_KEY", "local-test-service")
+    profiles = Path(__file__).resolve().parents[3] / "examples/harbor/dressage_profiles"
+    plugin = DressageHarborPlugin(config_path=profiles / "training-bwrap.yaml")
+    route = plugin._make_route_spec(
+        instance_id="readiness-task",
+        trial_name="seed-test",
+        trial_id=trial_id,
+        token="route-token",
+    )
+    payload = json.loads(_rewrite_payload(b"{}", route, request_sequence=1))
+    params = _build_sampling_params(payload, max_output_tokens=None, rollout_temperature=1.0)
+    assert params["sampling_seed"] == expected_seed
+
+
+@pytest.mark.parametrize(
+    ("base", "sequence", "expected_seed"),
+    [
+        (-1, 0, -1),
+        (-(2**63), 0, -(2**63)),
+        (-(2**63) - 1, 1, -(2**63)),
+        (-(2**63) - 1, 0, 2**63 - 1),
+        (2**63 - 1, 1, 0),
+    ],
+)
+def test_gateway_wraps_only_out_of_range_request_seeds(base, sequence, expected_seed):
+    route = RouteSpec(
+        trial_name="seed-test",
+        trial_id="physical-1",
+        instance_id="logical-1",
+        token="route-token",
+        sampling_mode="force",
+        sampling_seed_base=base,
+    )
+    payload = json.loads(_rewrite_payload(b"{}", route, request_sequence=sequence))
+    params = _build_sampling_params(payload, max_output_tokens=None, rollout_temperature=1.0)
+    assert params["sampling_seed"] == expected_seed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        ("/v1/chat/completions", {"messages": []}),
+        ("/v1/messages", {"messages": [], "max_tokens": 8}),
+        ("/v1/responses", {"input": "hello"}),
+    ],
+)
+async def test_gateway_seed_survives_protocol_conversion(path, body):
+    pytest.importorskip("blackbox_server.proxy.rollout_llm_proxy")
+    route = RouteSpec(
+        trial_name="seed-test",
+        trial_id="physical-1",
+        instance_id="logical-1",
+        token="route-token",
+        sampling_mode="force",
+        sampling_seed_base=(1 << 63) - 1,
+    )
+    proxy = GatewayRuntime()._create_proxy(route)
+    seeds = []
+
+    def receive(request):
+        params = _build_sampling_params(json.loads(request.content), None, 1.0)
+        seeds.append(params["sampling_seed"])
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"role": "assistant", "content": "ok"}}]},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(receive)) as upstream:
+        proxy._client = upstream
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=proxy.app), base_url="http://proxy"
+        ) as client:
+            for sequence in (0, 1):
+                payload = _rewrite_payload(json.dumps(body).encode(), route, sequence)
+                response = await client.post(path, content=payload)
+                assert response.status_code == 200
+    assert seeds == [(1 << 63) - 1, 0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("list_models_first", [False, True], ids=["direct", "after-listing"])
+async def test_gateway_model_listing_preserves_generation_seeds(
+    integration_config_factory, list_models_first
+):
+    config = integration_config_factory(
+        gateway={"listen_port": 0}, security={"allow_model_listing": True}
+    )
+    lease = await GatewayRuntime(proxy_factory=_GatewayProxy).acquire(config)
+    try:
+        handle = await lease.register(
+            RouteSpec(
+                trial_name="seed-test",
+                trial_id="physical-1",
+                instance_id="logical-1",
+                token="route-token",
+                sampling_mode="force",
+                sampling_seed_base=100,
+            )
+        )
+        await handle.open_turn("turn-a")
+        async with httpx.AsyncClient(
+            base_url=lease.public_url,
+            headers={"Authorization": "Bearer route-token"},
+            trust_env=False,
+        ) as client:
+            if list_models_first:
+                listing = await client.get("/v1/models")
+                assert listing.status_code == 200
+            seeds = []
+            for _ in range(2):
+                response = await client.post("/v1/chat/completions", json={"messages": []})
+                assert response.status_code == 200
+                seeds.append(response.json()["payload"]["seed"])
+            assert seeds == [100, 101]
+    finally:
+        await lease.release()
 
 
 @pytest.mark.asyncio
