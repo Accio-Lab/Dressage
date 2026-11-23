@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -105,14 +106,14 @@ def _compat_job():
     )
 
 
-def test_harbor_018_runtime_and_trial_plan_contract(monkeypatch):
+def test_harbor_runtime_and_trial_plan_contract(monkeypatch):
     with pytest.raises(HarborCompatibilityError, match="Python >=3.12"):
         compat.require_harbor_runtime(
-            python_version=(3, 10, 18), harbor_version="0.18.0"
+            python_version=(3, 10, 18), harbor_version="0.26.0"
         )
     with pytest.raises(HarborCompatibilityError, match="expected exactly"):
         compat.require_harbor_runtime(
-            python_version=(3, 12, 0), harbor_version="0.18.1"
+            python_version=(3, 12, 0), harbor_version="0.25.0"
         )
 
     monkeypatch.setattr(compat, "require_harbor_runtime", lambda: None)
@@ -131,7 +132,7 @@ def test_harbor_018_runtime_and_trial_plan_contract(monkeypatch):
     assert len({item.trial_name for item in named}) == 8
 
 
-def test_harbor_018_task_resolver_boundary(monkeypatch):
+def test_harbor_task_resolver_boundary(monkeypatch):
     pytest.importorskip("harbor")
     monkeypatch.setattr(compat, "require_harbor_runtime", lambda: None)
     copied = object()
@@ -162,11 +163,20 @@ def test_profiles_are_valid_public_configs(name, execution, environment):
     )
 
 
-def test_official_jobs_validate_with_harbor_018():
+def test_installed_harbor_passes_both_runtime_checks():
+    pytest.importorskip("harbor")
+    assert compat.require_harbor_runtime().harbor_version == "0.26.0"
+    subprocess.run(
+        [sys.executable, EXAMPLES / "dataset_tools/dapo/prepare_dataset.py", "--check-runtime"],
+        check=True,
+    )
+
+
+def test_official_jobs_validate_with_harbor_026():
     pytest.importorskip("harbor")
     from harbor.models.job.config import JobConfig
 
-    assert importlib.metadata.version("harbor") == "0.18.0"
+    assert importlib.metadata.version("harbor") == "0.26.0"
     for name, dataset in {
         "terminal-bench-2-e2b.yaml": "terminal-bench/terminal-bench-2",
         "tau3-bench-e2b.yaml": "sierra-research/tau3-bench",

@@ -1,4 +1,4 @@
-"""Minimal local bubblewrap environment for Harbor 0.18.
+"""Minimal local bubblewrap environment for Harbor 0.26.
 
 The agent and verifier receive separate filesystem roots.  Agent sandboxes use
 an isolated network namespace with a single loopback relay to the Dressage
@@ -73,6 +73,8 @@ def enable_loopback():
     interface = struct.pack("16sH", b"lo", 0)
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as control:
         flags = struct.unpack("16sH", fcntl.ioctl(control, 0x8913, interface))[1]
+        if flags & 0x1:  # IFF_UP: bwrap already enabled loopback.
+            return
         fcntl.ioctl(
             control,
             0x8914,
@@ -239,7 +241,7 @@ def _is_separate_verifier_session(
     session_id: str,
     mounts: list[dict[str, Any]],
 ) -> bool:
-    """Recognize Harbor 0.18's separate-verifier constructor contract."""
+    """Recognize Harbor 0.26's separate-verifier constructor contract."""
 
     targets = {
         str(mount.get("target")) for mount in mounts if mount.get("type") == "bind"
@@ -299,7 +301,8 @@ class DressageEnvironment(BaseEnvironment):
         )
 
     @classmethod
-    def preflight(cls) -> None:
+    def preflight(cls, kwargs: dict[str, Any] | None = None) -> None:
+        super().preflight(kwargs)
         if sys.platform != "linux":
             raise RuntimeError("Dressage bwrap requires Linux")
         _load_bwrap_integration_config()
@@ -402,20 +405,17 @@ class DressageEnvironment(BaseEnvironment):
                 host_path.mkdir(parents=True, exist_ok=True)
         for target in self._harbor_mounts:
             _rootfs_path(self._rootfs, target).mkdir(parents=True, exist_ok=True)
+        # Prepare the sandbox-owned output paths while constructing its filesystem.
+        for value in self._mount_targets(writable_only=True):
+            target = _environment_path(value)
+            if not _is_within(target, _LOGS):
+                raise ValueError("Dressage bwrap only accepts Harbor /logs mounts")
+            if not any(_is_within(target, mount) for mount in self._harbor_mounts):
+                _rootfs_path(self._rootfs, target).mkdir(parents=True, exist_ok=True)
         _rootfs_path(self._rootfs, _GATEWAY_SOCKET_DIR).mkdir(
             parents=True, exist_ok=True
         )
         _rootfs_path(self._rootfs, PurePosixPath("/run/dressage-relay.py")).touch()
-        if self._separate_verifier:
-            if not self.environment_dir.is_dir():
-                raise NotADirectoryError(self.environment_dir)
-            await asyncio.to_thread(
-                shutil.copytree,
-                self.environment_dir,
-                _rootfs_path(self._rootfs, PurePosixPath("/tests")),
-                dirs_exist_ok=True,
-                symlinks=True,
-            )
         relay_path = self._session_root / "relay.py"
         relay_path.write_text(_RELAY_SOURCE, encoding="utf-8")
         relay_path.chmod(0o500)
@@ -536,7 +536,7 @@ class DressageEnvironment(BaseEnvironment):
 
     def _build_harbor_mounts(self) -> dict[PurePosixPath, tuple[Path, bool]]:
         mounts: dict[PurePosixPath, tuple[Path, bool]] = {}
-        for mount in self._mounts:
+        for mount in self._host_mounts:
             if mount.get("type") != "bind":
                 raise ValueError("Dressage bwrap supports bind mounts only")
             target = _environment_path(mount["target"])

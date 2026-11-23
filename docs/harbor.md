@@ -22,7 +22,7 @@ For context, the public Terminal-Bench 2.0 leaderboard reports a verified little
 
 ## How it works
 
-Harbor owns Dataset resolution, Environments, Agents, Verifiers, trial retries, and rewards. Dressage routes every model request through its Gateway and Proxy, records trainable token-level data, and combines it with Harbor's verifier result. slime can consume the resulting trajectories to update the model.
+Harbor owns Dataset resolution, Environments, Agents, Verifiers, trial retries, and rewards. For supported Agent configurations, Dressage routes every model request through its Gateway and Proxy, records trainable token-level data, and combines it with Harbor's verifier result. slime can consume the resulting trajectories to update the model.
 
 ### Rollout
 
@@ -48,13 +48,13 @@ This is a capability statement, not a claim that the integration continuously le
 
 All commands below assume the default Dressage image, whose working directory is `/root/Dressage` and whose Python version is already 3.12.
 
-- `harbor==0.18.0` and `dressage-blackbox-server==1.1.0`, installed by the Harbor extra.
+- `harbor==0.26.0` and `dressage-blackbox-server==1.1.0`, installed by the Harbor extra.
 - For E2B jobs: a valid `E2B_API_KEY`.
 - For bwrap jobs: Linux with `bwrap` and the local Agent dependencies.
 
 ```bash
 cd /root/Dressage
-python -m pip install -e '.[harbor]'
+python -m pip install ./blackbox_server -e '.[harbor]'
 harbor plugins list
 ```
 
@@ -88,7 +88,11 @@ The top-level Integration Config modules have the following roles:
 | `agent_protocol_overrides` | Per-Agent OpenAI/Anthropic protocol override. |
 | `training` | Reward, sampling, failure, and weight-version rules. |
 
+On Harbor `0.26.0`, `nemo-agent` is unsupported for Dressage rollouts and training. The supplied profiles leave it disabled. An explicit protocol override can still allow it to start. An external NeMo workflow YAML can retain its own inference endpoint, and with a generated workflow the trial route token can appear in Harbor DEBUG command logs.
+
 Within `gateway`, `listen_host` and `listen_port` are the local bind address. `advertise_url` is the address injected into the Harbor Agent. The latter must be reachable from the Agent; changing it does not create a listener, TLS certificate, reverse proxy, firewall rule, or tunnel.
+
+For `terminus-2` with the `both` protocol override, you can set `model_api_format: openai_chat_completions` on the Harbor agent or in its `kwargs`. In either case, when Dressage prepares the trial, it supplies LiteLLM with the Gateway's `/v1` base URL and the credential for that attempt.
 
 `security.routing_guarantee: configure_only` configures authenticated routing but permits public-network tasks with a warning. `enforced` rejects incompatible public Agent network policies before issuing route credentials. bwrap profiles always use `enforced`.
 

@@ -23,7 +23,7 @@ from typing import Sequence
 
 
 SCHEMA_VERSION = "dressage.harbor.dapo-dataset/v1"
-SUPPORTED_HARBOR_VERSION = "0.18.0"
+SUPPORTED_HARBOR_VERSION = "0.26.0"
 DEFAULT_MODEL = "Qwen/Qwen3.5-4B"
 DEFAULT_CACHE_ROOT = Path("/root/dressage-harbor/datasets")
 _SAFE_INSTANCE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")

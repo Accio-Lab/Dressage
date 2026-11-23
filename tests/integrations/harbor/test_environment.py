@@ -1,17 +1,25 @@
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
+import os
 import shutil
 import subprocess
 import sys
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 
 pytest.importorskip("harbor")
 
+from harbor.environments.base import BaseEnvironment
+from harbor.environments.factory import EnvironmentFactory
 from harbor.models.task.config import EnvironmentConfig, NetworkMode, NetworkPolicy
+from harbor.models.trial.config import TrialConfig
 from harbor.models.trial.paths import TrialPaths
+from harbor.trial.trial import Trial
 
 from dressage.integrations.harbor import environment as environment_module
 
@@ -23,7 +31,7 @@ def _contains(command, values):
     )
 
 
-def _environment(monkeypatch, tmp_path, session_id, mode, *, workdir="/app"):
+def _configure_bwrap(monkeypatch, tmp_path):
     config = tmp_path / "integration.json"
     config.write_text(
         json.dumps(
@@ -39,20 +47,22 @@ def _environment(monkeypatch, tmp_path, session_id, mode, *, workdir="/app"):
     )
     monkeypatch.setenv("DRESSAGE_HARBOR_INTEGRATION_CONFIG", str(config))
     monkeypatch.setattr(
-        environment_module, "_required_binary", lambda name: f"/usr/bin/{name}"
+        environment_module, "_required_binary", lambda name: shutil.which(name) or f"/usr/bin/{name}"
     )
+
+
+def _environment(monkeypatch, tmp_path, session_id, mode, *, workdir="/app"):
+    _configure_bwrap(monkeypatch, tmp_path)
     verifier = "__verifier__" in session_id and not session_id.endswith("__env")
-    environment_dir = tmp_path / "task" / ("tests" if verifier else "environment")
+    environment_dir = tmp_path / "task" / "environment"
     environment_dir.mkdir(parents=True, exist_ok=True)
     paths = TrialPaths(tmp_path / f"trial-{session_id}")
     paths.mkdir()
-    mounts = [
-        {
-            "type": "bind",
-            "source": str(paths.verifier_dir if verifier else paths.agent_dir),
-            "target": "/logs/verifier" if verifier else "/logs/agent",
-        }
-    ]
+    auto_mounts = None
+    if verifier:
+        auto_mounts = [
+            {"type": "bind", "source": str(paths.verifier_dir), "target": "/logs/verifier"}
+        ]
     policy = NetworkPolicy(
         network_mode=mode,
         allowed_hosts=["127.0.0.1"] if mode == NetworkMode.ALLOWLIST else [],
@@ -69,7 +79,7 @@ def _environment(monkeypatch, tmp_path, session_id, mode, *, workdir="/app"):
             workdir=workdir,
         ),
         network_policy=policy,
-        mounts=mounts,
+        auto_mounts=auto_mounts,
     )
 
 
@@ -81,7 +91,13 @@ async def test_agent_and_verifier_are_network_and_filesystem_isolated(
     verifier = _environment(
         monkeypatch, tmp_path, "trial__verifier__trial", NetworkMode.PUBLIC
     )
-    (verifier.environment_dir / "test.sh").write_text("#!/bin/bash\nexit 0\n")
+    assert {mount["target"] for mount in agent._mounts} == {
+        "/logs/agent",
+        "/logs/verifier",
+        "/logs/artifacts",
+    }
+    assert {mount["target"] for mount in verifier._mounts} == {"/logs/verifier"}
+    (verifier.environment_dir / "agent-input.txt").write_text("ordinary environment input\n")
     await agent.start(False)
     await verifier.start(False)
     try:
@@ -99,7 +115,12 @@ async def test_agent_and_verifier_are_network_and_filesystem_isolated(
         assert _contains(agent_command, ["--bind", str(agent._rootfs), "/"])
         assert not _contains(agent_command, ["--ro-bind", "/", "/"])
         assert list((agent._rootfs / "tests").iterdir()) == []
-        assert (verifier._rootfs / "tests/test.sh").is_file()
+        assert list((verifier._rootfs / "tests").iterdir()) == []
+        script = tmp_path / "test.sh"
+        script.write_bytes(b"#!/bin/sh\nexit 0\n")
+        await verifier.upload_file(script, "/tests/test.sh")
+        assert (verifier._rootfs / "tests/test.sh").read_bytes() == script.read_bytes()
+        assert list((agent._rootfs / "tests").iterdir()) == []
         artifact = agent._rootfs / "app/result.txt"
         artifact.write_text("result")
         exported = tmp_path / "result.txt"
@@ -155,6 +176,236 @@ async def test_paths_mounts_and_arbitrary_artifacts_remain_safe(monkeypatch, tmp
         await environment.stop(True)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("auto_mounting", "external_mount", "expected_downloads"),
+    [(True, False, 0), (False, False, 1), (False, True, 1)],
+    ids=["automatic", "sandbox-only", "explicit-external"],
+)
+async def test_trial_recovers_agent_logs(
+    monkeypatch, tmp_path, auto_mounting, external_mount, expected_downloads
+):
+    _configure_bwrap(monkeypatch, tmp_path)
+    task = tmp_path / "task"
+    for name in ("environment", "solution", "tests"):
+        (task / name).mkdir(parents=True)
+    (task / "task.toml").write_text('schema_version = "1.3"\n[environment]\ngpus = 0\n')
+    (task / "instruction.md").write_text("Write a log.")
+    (task / "solution/solve.sh").write_text("#!/bin/sh\nexit 0\n")
+    (task / "tests/test.sh").write_text("#!/bin/sh\nexit 0\n")
+
+    external = tmp_path / "external-agent-logs"
+    backend = {
+        "import_path": "dressage.integrations.harbor.environment:DressageEnvironment",
+        "kwargs": {"auto_mounting": auto_mounting},
+    }
+    if external_mount:
+        backend["mounts"] = [
+            {"type": "bind", "source": str(external), "target": "/logs/agent"}
+        ]
+    config = TrialConfig.model_validate(
+        {
+            "task": {"path": task},
+            "agent": {"name": "oracle"},
+            "environment": backend,
+            "trial_name": "logs",
+            "trials_dir": tmp_path / "trials",
+        }
+    )
+    trial = await Trial.create(config)
+    env = trial.agent_environment
+    try:
+        await env.start(False)
+        payload = tmp_path / "probe.log"
+        payload.write_bytes(b"one log entry\n")
+        await env.upload_file(payload, "/logs/agent/probe.log")
+        target = trial.paths.agent_dir / "probe.log"
+        assert target.exists() == auto_mounting
+        if external_mount:
+            assert (external / "probe.log").read_bytes() == payload.read_bytes()
+
+        download = AsyncMock(wraps=env.download_dir)
+        monkeypatch.setattr(env, "download_dir", download)
+        await trial._download_agent_logs()
+        assert download.await_count == expected_downloads
+        assert target.read_bytes() == payload.read_bytes()
+        assert "Failed to download logs" not in trial.paths.log_path.read_text()
+    finally:
+        await env.stop(delete=True)
+        trial._close_logger_handler()
+
+
+@pytest.fixture(scope="module")
+def bwrap_network_namespace():
+    bwrap = shutil.which("bwrap")
+    if sys.platform != "linux" or bwrap is None:
+        pytest.skip("requires Linux and bwrap")
+
+    # Exercise bwrap's loopback setup before running any Harbor or scoring code.
+    probe = subprocess.run(
+        [bwrap, "--die-with-parent", "--unshare-user", "--unshare-net",
+         "--ro-bind", "/", "/", "--", "/bin/true"],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "LC_ALL": "C"},
+        timeout=10,
+    )
+    if probe.returncode == 0:
+        return
+
+    error = probe.stderr.strip()
+    permission_denied = error.startswith("bwrap: No permissions to create new namespace") or (
+        error.startswith(("bwrap: Creating new namespace failed", "bwrap: loopback:"))
+        and error.endswith(("Operation not permitted", "Permission denied"))
+    )
+    namespace_limit_exceeded = error == (
+        "bwrap: Creating new namespace failed: nesting depth or "
+        "/proc/sys/user/max_*_namespaces exceeded (ENOSPC)"
+    )
+    if permission_denied or namespace_limit_exceeded:
+        pytest.skip(f"bwrap cannot create an isolated network namespace: {error}")
+    pytest.fail(f"bwrap network namespace probe exited {probe.returncode}: {error}")
+
+
+@pytest.mark.usefixtures("bwrap_network_namespace")
+@pytest.mark.asyncio
+async def test_allowlisted_bwrap_forwards_loopback_to_gateway(monkeypatch, tmp_path):
+    agent = _environment(monkeypatch, tmp_path, "trial__env", NetworkMode.ALLOWLIST)
+    monkeypatch.chdir(tmp_path)
+    socket_dir = tmp_path / "runtime" / "gateway"
+    socket_dir.mkdir(parents=True)
+
+    async def reply(reader, writer):
+        writer.write(b"gateway: " + await reader.readline())
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    async with await asyncio.start_unix_server(reply, "runtime/gateway/gateway.sock"):
+        await agent.start(False)
+        try:
+            result = await agent.exec(
+                "exec 3<>/dev/tcp/127.0.0.1/39100 && echo ping >&3 && head -n1 <&3",
+                timeout_sec=10,
+            )
+            assert result.return_code == 0, result.stderr
+            assert result.stdout == "gateway: ping\n"
+        finally:
+            await agent.stop(True)
+
+
+@pytest.mark.usefixtures("bwrap_network_namespace")
+@pytest.mark.asyncio
+@pytest.mark.parametrize("envdir", ["missing", "empty", "populated"])
+async def test_trial_uploads_host_tests_to_separate_verifier(
+    monkeypatch, tmp_path, envdir
+):
+    _configure_bwrap(monkeypatch, tmp_path)
+    task = tmp_path / "task"
+    tests_dir = task / "tests"
+    (tests_dir / "fixtures").mkdir(parents=True)
+    (task / "instruction.md").write_text("What is 2 + 2?")
+    (task / "task.toml").write_text(
+        'schema_version = "1.3"\n[environment]\ngpus = 0\n'
+        '[verifier]\nenvironment_mode = "separate"\n'
+        '[verifier.environment]\nnetwork_mode = "no-network"\ngpus = 0\n'
+    )
+    if envdir != "missing":
+        (task / "environment").mkdir()
+    if envdir == "populated":
+        (task / "environment/agent-input.txt").write_bytes(b"ordinary environment input\n")
+
+    (tests_dir / "fixtures/answer.txt").write_bytes(b"4\n")
+    (tests_dir / "test.sh").write_text(
+        """#!/bin/sh
+set -eu
+cp -R /tests /logs/verifier/received
+test "$(cat /tests/fixtures/answer.txt)" = 4
+echo '{"reward": 1}' > /logs/verifier/reward.json
+"""
+    )
+    config = TrialConfig.model_validate(
+        {
+            "task": {"path": task},
+            "agent": {"name": "oracle"},
+            "environment": {
+                "import_path": "dressage.integrations.harbor.environment:DressageEnvironment",
+                "kwargs": {"auto_mounting": True},
+            },
+            "trial_name": "grade",
+            "trials_dir": tmp_path / "trials",
+        }
+    )
+    trial = await Trial.create(config)
+    try:
+        result = await trial._run_separate_verifier(
+            key="verify", timeout_sec=15, user=None, artifacts_dir=trial.paths.artifacts_dir
+        )
+        # Compare the files seen by the running verifier with their host originals.
+        received = trial.paths.verifier_dir / "received"
+        actual_files = {
+            path.relative_to(received).as_posix(): path.read_bytes()
+            for path in received.rglob("*")
+            if path.is_file()
+        }
+        assert actual_files == {
+            "test.sh": (tests_dir / "test.sh").read_bytes(),
+            "fixtures/answer.txt": (tests_dir / "fixtures/answer.txt").read_bytes(),
+        }
+        assert json.loads(trial.paths.reward_json_path.read_text()) == {"reward": 1}
+        assert result.rewards == {"reward": 1}
+    finally:
+        trial._close_logger_handler()
+
+
+@pytest.mark.usefixtures("bwrap_network_namespace")
+@pytest.mark.asyncio
+async def test_oracle_trial_delivers_logs_with_default_mounts(monkeypatch, tmp_path):
+    _configure_bwrap(monkeypatch, tmp_path)
+    task = tmp_path / "task"
+    for name in ("environment", "solution", "tests"):
+        (task / name).mkdir(parents=True)
+    (task / "instruction.md").write_text("Write 4 to /app/answer.txt.")
+    (task / "task.toml").write_text(
+        'schema_version = "1.3"\n[environment]\ngpus = 0\nnetwork_mode = "no-network"\n'
+    )
+    (task / "solution/solve.sh").write_text(
+        "#!/bin/sh\nset -eu\ntest -d /logs/artifacts\necho 4 > /app/answer.txt\necho solved\n"
+    )
+    (task / "tests/test.sh").write_text(
+        """#!/bin/sh
+set -eu
+test "$(cat /app/answer.txt)" = 4
+echo '{"reward": 1}' > /logs/verifier/reward.json
+"""
+    )
+    config = TrialConfig.model_validate(
+        {
+            "task": {"path": task},
+            "agent": {"name": "oracle"},
+            "environment": {
+                "import_path": "dressage.integrations.harbor.environment:DressageEnvironment"
+            },
+            "trial_name": "oracle-logs",
+            "trials_dir": tmp_path / "trials",
+        }
+    )
+    trial = await Trial.create(config)
+    result = await trial.run()
+
+    assert "solved" in (trial.paths.agent_dir / "oracle.txt").read_text().splitlines()
+    assert result.verifier_result is not None
+    assert result.verifier_result.rewards == {"reward": 1}
+
+
+def test_harbor_preflight_signature():
+    # Flag changes to the Harbor hook separately from the factory behavior tests.
+    parameters = inspect.signature(BaseEnvironment.preflight).parameters.values()
+    assert [(param.name, param.kind, param.default) for param in parameters] == [
+        ("kwargs", inspect.Parameter.POSITIONAL_OR_KEYWORD, None),
+    ]
+
+
 def test_preflight_uses_container_compatible_proc(monkeypatch, tmp_path):
     config = tmp_path / "integration.json"
     config.write_text(
@@ -186,6 +437,38 @@ def test_preflight_uses_container_compatible_proc(monkeypatch, tmp_path):
     assert "--unshare-pid" in commands[0]
     assert _contains(commands[0], ["--ro-bind", "/proc", "/proc"])
     assert "--proc" not in commands[0]
+
+
+@pytest.mark.parametrize(
+    "factory_arguments",
+    [
+        {},
+        {"kwargs": None},
+        {"kwargs": {}},
+        {"kwargs": {"test_marker": "keep"}},
+    ],
+    ids=["default", "explicit-none", "empty-options", "nonempty-options"],
+)
+def test_preflight_through_harbor_factory(factory_arguments, monkeypatch):
+    class BackendCheckReached(Exception):
+        """Stop at the first bwrap config lookup."""
+
+    backend = environment_module.DressageEnvironment
+    parse_options = Mock(wraps=backend.parse_options)
+    backend_check = Mock(side_effect=BackendCheckReached)
+    monkeypatch.setattr(backend, "parse_options", parse_options)
+    monkeypatch.setattr(environment_module.sys, "platform", "linux")
+    monkeypatch.setattr(environment_module, "_load_bwrap_integration_config", backend_check)
+
+    with pytest.raises(BackendCheckReached):
+        EnvironmentFactory.run_preflight(
+            type=None,
+            import_path="dressage.integrations.harbor.environment:DressageEnvironment",
+            **factory_arguments,
+        )
+
+    parse_options.assert_called_once_with(factory_arguments.get("kwargs"))
+    backend_check.assert_called_once_with()
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="bubblewrap requires Linux")

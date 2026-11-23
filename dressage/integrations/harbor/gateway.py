@@ -703,6 +703,13 @@ class GatewayRuntime:
 
     @staticmethod
     def _default_proxy_factory(**kwargs: Any) -> Any:
+        if kwargs.get("sampling_mode") is not None and kwargs.get("sampling_seed_base") is not None:
+            from .model_proxy import GatewaySeedProxy
+
+            # The gateway owns the request sequence, including across protocol conversions.
+            kwargs["sampling_seed_base"] = None
+            return GatewaySeedProxy(**kwargs)
+
         from blackbox_server.proxy.rollout_llm_proxy import RolloutLLMProxy
 
         return RolloutLLMProxy(**kwargs)
@@ -868,10 +875,11 @@ class _GatewayASGI:
         runtime._cleanup_tombstones()
         method = str(scope.get("method", "GET")).upper()
         path = str(scope.get("path", "/")).rstrip("/") or "/"
-        allowed = (method, path) in _MODEL_PATHS
-        if method == "GET" and path == "/v1/models":
-            allowed = runtime.config.security.allow_model_listing
-        if not allowed:
+        is_generation_request = (method, path) in _MODEL_PATHS
+        model_listing_allowed = (
+            (method, path) == ("GET", "/v1/models") and runtime.config.security.allow_model_listing
+        )
+        if not (is_generation_request or model_listing_allowed):
             await _send_json(send, 404, {"error": "not_found"})
             return
 
@@ -927,14 +935,12 @@ class _GatewayASGI:
             if body is None:
                 await _send_json(send, 413, {"error": "request_body_too_large"})
                 return
-            request_sequence = binding.request_sequence
-            binding.request_sequence += 1
-            rewritten_body = _rewrite_payload(body, binding.spec, request_sequence)
+            if is_generation_request:
+                body = _rewrite_payload(body, binding.spec, binding.request_sequence)
+                binding.request_sequence += 1
             rewritten_scope = dict(scope)
-            rewritten_scope["headers"] = _rewrite_agent_headers(
-                headers, len(rewritten_body)
-            )
-            delegated_receive = _BufferedReceive(rewritten_body, receive)
+            rewritten_scope["headers"] = _rewrite_agent_headers(headers, len(body))
+            delegated_receive = _BufferedReceive(body, receive)
             tracked_send = _ActivitySend(send)
             try:
                 await _dispatch_with_idle_timeout(
@@ -1095,7 +1101,10 @@ def _rewrite_payload(body: bytes, spec: RouteSpec, request_sequence: int) -> byt
                 changed = True
     if spec.sampling_mode is not None and spec.sampling_seed_base is not None:
         if spec.sampling_mode == "force" or payload.get("seed") is None:
-            payload["seed"] = spec.sampling_seed_base + request_sequence
+            seed = spec.sampling_seed_base + request_sequence
+            if not -(2**63) <= seed < 2**63:
+                seed %= 2**63
+            payload["seed"] = seed
             changed = True
     if not changed:
         return body

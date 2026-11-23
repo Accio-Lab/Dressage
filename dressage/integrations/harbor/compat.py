@@ -1,4 +1,4 @@
-"""The only module allowed to depend on Harbor's private v0.18 contracts."""
+"""The only module allowed to depend on Harbor's private v0.26 contracts."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 
-SUPPORTED_HARBOR_VERSION = "0.18.0"
+SUPPORTED_HARBOR_VERSION = "0.26.0"
 MINIMUM_PYTHON = (3, 12)
 
 
@@ -65,17 +65,17 @@ def require_harbor_runtime(
 
 
 def pending_trial_configs(job: Any) -> tuple[Any, ...]:
-    """Return Harbor's pending TrialConfigs with strict v0.18 shape checks."""
+    """Return Harbor's pending TrialConfigs with strict v0.26 shape checks."""
 
     require_harbor_runtime()
     if not hasattr(job, "_remaining_trial_configs"):
         raise HarborCompatibilityError(
-            "Harbor Job no longer exposes _remaining_trial_configs; the v0.18 compat contract changed"
+            "Harbor Job no longer exposes _remaining_trial_configs; the v0.26 compat contract changed"
         )
     configs = job._remaining_trial_configs
     if not isinstance(configs, list):
         raise HarborCompatibilityError(
-            "Harbor Job._remaining_trial_configs must be a list under the v0.18 contract"
+            "Harbor Job._remaining_trial_configs must be a list under the v0.26 contract"
         )
     for index, config in enumerate(configs):
         if (
@@ -84,7 +84,7 @@ def pending_trial_configs(job: Any) -> tuple[Any, ...]:
             or not hasattr(config, "task")
         ):
             raise HarborCompatibilityError(
-                f"pending TrialConfig at position {index} does not match the Harbor v0.18 shape"
+                f"pending TrialConfig at position {index} does not match the Harbor v0.26 shape"
             )
     return tuple(configs)
 
@@ -92,7 +92,7 @@ def pending_trial_configs(job: Any) -> tuple[Any, ...]:
 def resolved_task_configs(job: Any) -> tuple[Any, ...]:
     if not hasattr(job, "_task_configs") or not isinstance(job._task_configs, list):
         raise HarborCompatibilityError(
-            "Harbor Job no longer exposes list _task_configs; the v0.18 compat contract changed"
+            "Harbor Job no longer exposes list _task_configs; the v0.26 compat contract changed"
         )
     return tuple(job._task_configs)
 
@@ -108,18 +108,18 @@ async def resolve_task_configs(job_config: Any) -> tuple[Any, ...]:
     resolver = getattr(Job, "_resolve_task_configs", None)
     if not callable(resolver):
         raise HarborCompatibilityError(
-            "Harbor Job._resolve_task_configs is unavailable; the v0.18 compat contract changed"
+            "Harbor Job._resolve_task_configs is unavailable; the v0.26 compat contract changed"
         )
     configs = await resolver(job_config)
     if not isinstance(configs, list) or not configs:
         raise HarborCompatibilityError(
-            "Harbor Job._resolve_task_configs must return a non-empty list under v0.18"
+            "Harbor Job._resolve_task_configs must return a non-empty list under v0.26"
         )
     return tuple(configs)
 
 
 def build_trial_plan(job: Any) -> tuple[TrialPlanEntry, ...]:
-    """Decode Harbor v0.18's attempt-major task-agent TrialConfig order."""
+    """Decode Harbor v0.26's attempt-major task-agent TrialConfig order."""
 
     if getattr(job, "is_resuming", False):
         raise HarborCompatibilityError(
@@ -157,11 +157,11 @@ def build_trial_plan(job: Any) -> tuple[TrialPlanEntry, ...]:
         agent_index = within_attempt % len(agents)
         if config.task is not tasks[task_index]:
             raise HarborCompatibilityError(
-                f"TrialConfig position {position} violates Harbor v0.18 task-major ordering"
+                f"TrialConfig position {position} violates Harbor v0.26 task-major ordering"
             )
         if config.agent is not agents[agent_index]:
             raise HarborCompatibilityError(
-                f"TrialConfig position {position} violates Harbor v0.18 agent-minor ordering"
+                f"TrialConfig position {position} violates Harbor v0.26 agent-minor ordering"
             )
         trial_name = str(config.trial_name)
         if not trial_name:
