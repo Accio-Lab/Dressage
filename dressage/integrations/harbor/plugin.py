@@ -1103,6 +1103,12 @@ def _bind_trial_model_connection(
         # The model provider prefix does not change either client's OpenAI protocol.
         if agent_name in ("codex", "qwen-coder"):
             target_url = versioned_url
+        elif (
+            agent_name == "terminus-2"
+            and native.model_api_format == ModelApiFormat.OPENAI_CHAT_COMPLETIONS
+        ):
+            # LiteLLM appends /chat/completions even for an anthropic/ model.
+            target_url = versioned_url
         elif agent_name == "claude-code" and native.model_api_format == ModelApiFormat.ANTHROPIC_MESSAGES:
             target_url = gateway_url  # Claude Code appends /v1/messages.
 

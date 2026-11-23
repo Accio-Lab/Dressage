@@ -218,6 +218,45 @@ def test_both_protocols_select_the_harness_gateway(
     assert env[key_variable] == "trial-credential"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "format_options",
+    [
+        {"model_api_format": "openai_chat_completions"},
+        {"kwargs": {"model_api_format": "openai_chat_completions"}},
+    ],
+    ids=["agent-field", "agent-kwarg"],
+)
+async def test_terminus_explicit_chat_format_uses_gateway_v1_in_both_mode(
+    format_options, monkeypatch, tmp_path
+):
+    pytest.importorskip("harbor")
+    import litellm
+    from harbor.agents.factory import AgentFactory
+    from harbor.models.trial.config import AgentConfig
+
+    gateway = "http://localhost"
+    slot = "DRESSAGE_HARBOR_ROUTE_TEST"
+    monkeypatch.setenv(slot, "trial-credential")
+    config = AgentConfig(
+        name="terminus-2", model_name="anthropic/claude-sonnet-4-5", **format_options
+    )
+    plugin_module._inject_agent_routing(
+        config, {"agent_protocol_overrides": {"terminus-2": "both"}}, slot, gateway
+    )
+    agent = AgentFactory.create_agent_from_config(config, logs_dir=tmp_path)
+
+    completion = AsyncMock(return_value={"choices": [{"message": {"content": "ok"}}]})
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    await agent._llm.call("hello")
+
+    completion.assert_awaited_once()
+    request = completion.await_args.kwargs
+    assert request["model"] == "openai/claude-sonnet-4-5"
+    assert request["api_key"] == "trial-credential"
+    assert request["api_base"] == gateway + "/v1"
+
+
 @pytest.mark.parametrize("name", ["opencode", "mimo"])
 @pytest.mark.parametrize("initial_url", [None, "http://localhost/v1"], ids=["omitted", "versioned"])
 @pytest.mark.parametrize("protocol", ["anthropic", "both"])
